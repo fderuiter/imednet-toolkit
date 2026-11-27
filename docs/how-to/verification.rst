@@ -11,7 +11,7 @@ Verification Loop
 
 Before proposing any code change, execute and pass all CI quality gates locally.
 
-1. Read ``.github/workflows/main.yml`` (the ``quality`` and ``pre-commit`` jobs) to identify the authoritative lint, format, and type-check commands.
+1. Read ``.github/workflows/main.yml`` (the ``pre-commit``, ``quality``, and ``test`` jobs) to identify the authoritative lint, format, type-check, and test commands.
 2. Run the full gate in order (contributors must execute ``uvx pre-commit run --all-files`` before opening pull requests):
 
    .. code-block:: bash
@@ -62,10 +62,15 @@ Install with ``uv sync --locked --all-packages --all-extras`` or the setup wizar
 no real credentials or live EDC access are required. Run pre-commit first and
 ``uvx hatch run quality:all`` as well for the full-workspace formatting, Ruff,
 non-mutating ``typos --force-exclude``, and ``detect-secrets`` checks alongside the package-scoped
-security, dead-code, and similarity gates. The ``global-lint`` job runs the
-same pinned Ruff and non-mutating ``typos --force-exclude .`` checks across the
-repository; package/Python matrix jobs supplement the full workspace gate. Duplicate global
-similarity execution is removed; the canonical ``lint:pylint-sim`` and
+security, dead-code, and similarity gates. In CI, the ``pre-commit`` job executes
+``ruff-check``, ``ruff-format``, non-mutating ``typos --force-exclude``, and
+``detect-secrets`` once per workflow run; after ``plan``, ``quality`` (``pip-audit``,
+``semgrep``, ``vulture``, ``pylint`` similarity/duplication, strict ``mypy``, and
+``ModelEngine`` stub parity; skipped only on ``docs/``, ``.agents/``, or ``*.md``
+diffs), ``build``, ``docs``, ``fuzzing``, and ``integration-sandbox`` run in
+parallel, followed by ``test`` package/Python matrix shards (covering all non-live
+``pytest`` items at ``>=90%`` coverage) and ``validate-package-consumption``, with
+``ci-gate`` summarizing upstream job results. The canonical ``lint:pylint-sim`` and
 ``duplication:check`` tasks retain their documented scopes and thresholds.
 
 Fuzzing and performance tracks require their pytest flags and write structured ``VerificationReport`` JSON files under gitignored ``reports/verification/`` (with mutable fuzz corpora under ``.cache/verification/``): run ``pytest tests/core/test_performance.py -m performance`` (pass ``--update-perf-baseline`` when intentionally refreshing ``tests/core/baselines/performance_baseline.json``), ``pytest tests/core/test_fuzz.py -m fuzzing`` (controlled by ``IMEDNET_FUZZ_RUNS``, defaulting to ``25000``), and ``python scripts/aggregate_verification.py --report-dir reports/verification --expect-track <track>`` (which exits ``1`` on missing tracks, malformed files, or ``status: "failed"``). Container integration

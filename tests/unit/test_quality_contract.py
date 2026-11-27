@@ -134,26 +134,18 @@ def _assert_guardrail_contract(
     ]
 
     jobs = pipeline["jobs"]
-    assert jobs["global-lint"]["name"] == "Global Code Quality Check"
+    assert "global-lint" not in jobs
+    assert "ci-gate" in jobs
     assert jobs["pre-commit"]["name"] == "Pre-commit Quality Checks"
     assert jobs["quality"]["name"] == "Workspace Quality & Security"
+    assert jobs["ci-gate"]["name"] == "CI Gate"
     assert jobs["deploy-docs"]["name"] == "Deploy to GH Pages"
 
-    for job_key in ("global-lint", "pre-commit", "quality"):
+    for job_key in ("pre-commit", "quality"):
         job_steps = jobs[job_key]["steps"]
         assert any(SHA_SETUP_UV_RE.match(str(s.get("uses", ""))) for s in job_steps)
         job_runs = [s.get("run", "") for s in job_steps if "run" in s]
         assert not any("pip install" in r for r in job_runs)
-
-    global_lint_runs = "\n".join(
-        s.get("run", "") for s in jobs["global-lint"]["steps"] if "run" in s
-    )
-    assert f'uvx --from "{ruff_pin}" ruff format --check .' in global_lint_runs
-    assert f'uvx --from "{ruff_pin}" ruff check .' in global_lint_runs
-    assert "--select" not in global_lint_runs
-    assert f'uvx --from "{typos_pin}" typos --force-exclude .' in global_lint_runs
-    assert "--diff" not in global_lint_runs
-    assert "--write-changes" not in global_lint_runs
 
     pre_commit_runs = "\n".join(s.get("run", "") for s in jobs["pre-commit"]["steps"] if "run" in s)
     assert re.search(
@@ -161,28 +153,78 @@ def _assert_guardrail_contract(
         pre_commit_runs,
     )
 
-    quality_needs = jobs["quality"].get("needs", [])
-    if isinstance(quality_needs, str):
-        quality_needs = [quality_needs]
-    assert "pre-commit" in set(quality_needs)
+    def _job_needs(job_key: str) -> list[str]:
+        raw = jobs[job_key].get("needs", [])
+        return [raw] if isinstance(raw, str) else list(raw)
+
+    for parallel_job in ("quality", "build", "docs", "fuzzing", "integration-sandbox"):
+        assert _job_needs(parallel_job) == ["plan"], f"{parallel_job} must depend only on plan"
+
+    assert jobs["quality"].get("if") == "needs.plan.outputs.run_quality == 'true'"
+    assert jobs["build"].get("if") == "needs.plan.outputs.build_matrix != '[]'"
+    assert (
+        jobs["fuzzing"].get("if")
+        == "needs.plan.outputs.build_matrix != '[]' || needs.plan.outputs.run_fuzzing == 'true'"
+    )
+    assert (
+        jobs["validate-package-consumption"].get("if") == "needs.plan.outputs.build_matrix != '[]'"
+    )
+
+    test_if = " ".join(str(jobs["test"].get("if", "")).split())
+    assert test_if == (
+        "always() && !cancelled() && needs.plan.result == 'success' && "
+        "(needs.build.result == 'success' || needs.build.result == 'skipped') && "
+        "needs.plan.outputs.matrix != '[]'"
+    )
 
     quality_runs = [s.get("run", "") for s in jobs["quality"]["steps"] if "run" in s]
-    assert any(
-        f'uvx --from "{detect_secrets_pin}" python scripts/run_secret_scan.py .' in r
-        for r in quality_runs
-    )
-    assert not any("detect-secrets-hook" in r for r in quality_runs)
-    assert any(
-        "uv run ruff format --check ." in r
-        and "uv run ruff check ." in r
-        and "uv run typos --force-exclude ." in r
-        for r in quality_runs
-    )
-    assert not any("typos" in r and "--diff" in r for r in quality_runs)
+    quality_joined = "\n".join(quality_runs)
+    assert "ruff " not in quality_joined
+    assert "typos" not in quality_joined
+    assert "detect-secrets" not in quality_joined
+    assert "run_secret_scan.py" not in quality_joined
+    assert "pytest" not in quality_joined
+    assert "uv run mypy packages examples tests/typing/endpoint_contracts.py" in quality_joined
 
+    for job_id, job in jobs.items():
+        if job_id == "pre-commit":
+            continue
+        other_runs = "\n".join(s.get("run", "") for s in job.get("steps", []) if "run" in s)
+        assert "ruff format" not in other_runs
+        assert "ruff check" not in other_runs
+        assert "typos --force-exclude" not in other_runs
+        assert "detect-secrets" not in other_runs
+        assert "run_secret_scan.py" not in other_runs
+
+    plan_outputs = jobs["plan"]["outputs"]
+    assert {"matrix", "build_matrix", "run_quality", "run_integration", "run_fuzzing"} <= set(
+        plan_outputs
+    )
     filter_step = next(s for s in jobs["plan"]["steps"] if s.get("id") == "filter")
-    export_patterns = yaml.safe_load(filter_step["with"]["filters"])["export_logic"]
+    parsed_filters = yaml.safe_load(filter_step["with"]["filters"])
+    export_patterns = parsed_filters["export_logic"]
     assert "packages/plugins-sinks/**" in export_patterns
+    fuzz_patterns = parsed_filters["fuzzing"]
+    assert "tests/core/test_fuzz.py" in fuzz_patterns
+    assert "tests/core/corpora/**" in fuzz_patterns
+    assert "tests/utils/verification_reporter.py" in fuzz_patterns
+
+    ci_gate = jobs["ci-gate"]
+    ci_gate_if = " ".join(str(ci_gate.get("if", "")).split())
+    assert ci_gate_if == "always() && !cancelled()"
+    assert {
+        "plan",
+        "pre-commit",
+        "quality",
+        "build",
+        "test",
+        "integration-sandbox",
+        "fuzzing",
+        "validate-package-consumption",
+        "docs",
+    } <= set(_job_needs("ci-gate"))
+    ci_gate_runs = "\n".join(s.get("run", "") for s in ci_gate["steps"] if "run" in s)
+    assert "failure" in ci_gate_runs and "cancelled" in ci_gate_runs
 
     build_steps = jobs["build"]["steps"]
     build_step = next(s for s in build_steps if s.get("name") == "Build Workspace Packages")
@@ -203,6 +245,7 @@ def _assert_guardrail_contract(
     run_tests_step = next(s for s in jobs["test"]["steps"] if s.get("name") == "Run Tests")
     assert ".venv/bin/pytest" in run_tests_step["run"]
     assert "IMEDNET_TEST_WHEELS=1" in run_tests_step["run"]
+    assert "--ignore-glob=*sinks*" not in run_tests_step["run"]
     assert "hatch run" not in run_tests_step["run"]
     assert "Passing gracefully" not in run_tests_step["run"]
     assert "-eq 5" not in run_tests_step["run"]
@@ -245,21 +288,21 @@ def test_ci_uses_canonical_full_verification():
     run_blocks = [s.get("run", "") for s in steps if "run" in s]
     assert any(s.get("uses", "").startswith("astral-sh/setup-uv@") for s in steps)
     assert any("uv sync --locked --all-packages --all-extras" in r for r in run_blocks)
-    assert any("uv run typos --force-exclude ." in r for r in run_blocks)
+    assert any("pip-audit==" in r for r in run_blocks)
     assert any(
         "uv run mypy packages examples tests/typing/endpoint_contracts.py" in r for r in run_blocks
     )
     assert any(
-        "--cov=imednet_sinks" in r and "--cov=imednet_tui" in r and "--cov-fail-under=90" in r
-        for r in run_blocks
-    )
-    assert any(
-        'uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .' in r
-        and "semgrep scan" in r
+        "semgrep scan" in r
         and "vulture" in r
-        and "pylint" in r
+        and "--enable=similarities" in r
+        and "--enable=duplicate-code" in r
         for r in run_blocks
     )
+    assert not any("pytest" in r for r in run_blocks)
+    assert not any("ruff " in r for r in run_blocks)
+    assert not any("typos" in r for r in run_blocks)
+    assert not any("run_secret_scan.py" in r for r in run_blocks)
     assert not any("pip install" in r for r in run_blocks)
     assert not any("hatch run" in r for r in run_blocks)
     assert not any("build_docs.py" in r for r in run_blocks)
@@ -270,6 +313,10 @@ def test_ci_uses_canonical_full_verification():
     run_tests_step = next(s for s in test_steps if s.get("name") == "Run Tests")
     assert "tests/integration/test_airflow*.py" in run_tests_step["run"]
     assert "tests/integration/test_workflows*.py" in run_tests_step["run"]
+    assert "--cov=imednet_sinks" in run_tests_step["run"]
+    assert "--cov=imednet_tui" in run_tests_step["run"]
+    assert "--cov-fail-under=90" in run_tests_step["run"]
+    assert "--ignore-glob=*sinks*" not in run_tests_step["run"]
     assert ".venv/bin/pytest" in run_tests_step["run"]
     assert "IMEDNET_TEST_WHEELS=1" in run_tests_step["run"]
     assert "hatch run" not in run_tests_step["run"]
@@ -316,7 +363,8 @@ def test_ci_deploy_docs_gates_and_manual_dispatch():
 
     deploy = pipeline["jobs"]["deploy-docs"]
     needs = set(deploy["needs"])
-    assert {"plan", "pre-commit", "test", "docs", "global-lint", "quality"} <= needs
+    assert "global-lint" not in needs
+    assert {"plan", "pre-commit", "test", "docs", "quality"} <= needs
     cond = " ".join(str(deploy["if"]).split())
     assert "needs.docs.result == 'success'" in cond
     assert "needs.pre-commit.result == 'success'" in cond
@@ -396,7 +444,7 @@ def test_copilot_and_consumption_workflows_use_canonical_uv_sync():
 
     consumption_job = pipeline["jobs"]["validate-package-consumption"]
     assert set(consumption_job["needs"]) == {"plan", "build"}
-    assert consumption_job.get("if") == "needs.plan.outputs.matrix != '[]'"
+    assert consumption_job.get("if") == "needs.plan.outputs.build_matrix != '[]'"
 
     consumption_steps = consumption_job["steps"]
     download_step = next(
@@ -432,7 +480,15 @@ def test_ci_export_filter_includes_sinks_and_schedules_integration_sandbox():
     )
 
     sandbox_job = pipeline["jobs"]["integration-sandbox"]
+    assert sandbox_job["needs"] == ["plan"]
     assert "needs.plan.outputs.run_integration == 'true'" in sandbox_job["if"]
+
+    fuzzing_job = pipeline["jobs"]["fuzzing"]
+    assert fuzzing_job["needs"] == ["plan"]
+    assert (
+        fuzzing_job["if"]
+        == "needs.plan.outputs.build_matrix != '[]' || needs.plan.outputs.run_fuzzing == 'true'"
+    )
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="Bash is needed for workflow scripts")
@@ -567,18 +623,16 @@ def _mutate_widened_mypy_scope(project: dict, hooks: dict, typos_cfg: dict, pipe
     project["tool"]["hatch"]["envs"]["lint"]["scripts"]["mypy-check"] = "mypy {args:.}"
 
 
-def _mutate_global_lint_pip_install(
+def _mutate_reintroduced_global_lint(
     project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
 ) -> None:
-    pipeline["jobs"]["global-lint"]["steps"].append({"run": "pip install ruff"})
+    pipeline["jobs"]["global-lint"] = {"name": "Global Code Quality Check", "steps": []}
 
 
-def _mutate_global_lint_subset_select(
+def _mutate_pre_commit_pip_install(
     project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
 ) -> None:
-    for step in pipeline["jobs"]["global-lint"]["steps"]:
-        if "run" in step:
-            step["run"] += "\nruff check . --select F401,F841"
+    pipeline["jobs"]["pre-commit"]["steps"].append({"run": "pip install ruff"})
 
 
 def _mutate_pre_commit_unpinned_uvx(
@@ -589,18 +643,92 @@ def _mutate_pre_commit_unpinned_uvx(
             step["run"] = "uvx pre-commit run --all-files --show-diff-on-failure"
 
 
-def _mutate_quality_missing_needs(
+def _mutate_quality_waits_for_pre_commit(
     project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
 ) -> None:
-    pipeline["jobs"]["quality"]["needs"] = []
+    pipeline["jobs"]["quality"]["needs"] = ["pre-commit"]
 
 
-def _mutate_quality_missing_typos(
+def _mutate_quality_missing_run_quality_if(
     project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
 ) -> None:
-    for step in pipeline["jobs"]["quality"]["steps"]:
-        if "run" in step:
-            step["run"] = step["run"].replace("uv run typos --force-exclude .\n", "")
+    pipeline["jobs"]["quality"].pop("if", None)
+
+
+def _mutate_duplicate_ruff_in_quality(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["quality"]["steps"].append({"run": "uv run ruff check ."})
+
+
+def _mutate_duplicate_typos_in_quality(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["quality"]["steps"].append({"run": "uv run typos --force-exclude ."})
+
+
+def _mutate_duplicate_secret_scan_in_quality(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["quality"]["steps"].append(
+        {"run": 'uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .'}
+    )
+
+
+def _mutate_duplicate_pytest_in_quality(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["quality"]["steps"].append({"run": "uv run pytest -q"})
+
+
+def _mutate_build_waits_for_quality(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["build"]["needs"] = ["plan", "quality"]
+
+
+def _mutate_build_gated_on_test_matrix(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["build"]["if"] = "needs.plan.outputs.matrix != '[]'"
+
+
+def _mutate_consumption_gated_on_test_matrix(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["validate-package-consumption"]["if"] = "needs.plan.outputs.matrix != '[]'"
+
+
+def _mutate_fuzzing_missing_run_fuzzing_gate(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["fuzzing"]["if"] = "needs.plan.outputs.matrix != '[]'"
+
+
+def _mutate_test_missing_skipped_build_allowance(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["test"]["if"] = "needs.plan.outputs.matrix != '[]'"
+
+
+def _mutate_core_sinks_ignore_glob(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    run_step = next(s for s in pipeline["jobs"]["test"]["steps"] if s.get("name") == "Run Tests")
+    run_step["run"] = run_step["run"].replace(
+        "--ignore-glob=*workflows*",
+        "--ignore-glob=*workflows* --ignore-glob=*sinks*",
+    )
+
+
+def _mutate_missing_ci_gate(project: dict, hooks: dict, typos_cfg: dict, pipeline: dict) -> None:
+    pipeline["jobs"].pop("ci-gate", None)
+
+
+def _mutate_ci_gate_bare_always(
+    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
+) -> None:
+    pipeline["jobs"]["ci-gate"]["if"] = "always()"
 
 
 def _mutate_missing_sinks_export_filter(
@@ -678,27 +806,6 @@ def _mutate_lint_all_missing_secrets(
     project["tool"]["hatch"]["envs"]["lint"]["scripts"]["all"].remove("secrets")
 
 
-def _mutate_quality_missing_secret_scan(
-    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
-) -> None:
-    for step in pipeline["jobs"]["quality"]["steps"]:
-        if "run" in step:
-            step["run"] = step["run"].replace(
-                'uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .\n', ""
-            )
-
-
-def _mutate_quality_raw_detect_secrets_hook(
-    project: dict, hooks: dict, typos_cfg: dict, pipeline: dict
-) -> None:
-    for step in pipeline["jobs"]["quality"]["steps"]:
-        if "run" in step:
-            step["run"] = step["run"].replace(
-                "python scripts/run_secret_scan.py .",
-                "detect-secrets-hook --baseline .secrets.baseline .",
-            )
-
-
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -722,13 +829,23 @@ def _mutate_quality_raw_detect_secrets_hook(
         _mutate_package_scoped_fmt,
         _mutate_quality_all_packages_arg,
         _mutate_widened_mypy_scope,
-        _mutate_global_lint_pip_install,
-        _mutate_global_lint_subset_select,
+        _mutate_reintroduced_global_lint,
+        _mutate_pre_commit_pip_install,
         _mutate_pre_commit_unpinned_uvx,
-        _mutate_quality_missing_needs,
-        _mutate_quality_missing_typos,
-        _mutate_quality_missing_secret_scan,
-        _mutate_quality_raw_detect_secrets_hook,
+        _mutate_quality_waits_for_pre_commit,
+        _mutate_quality_missing_run_quality_if,
+        _mutate_duplicate_ruff_in_quality,
+        _mutate_duplicate_typos_in_quality,
+        _mutate_duplicate_secret_scan_in_quality,
+        _mutate_duplicate_pytest_in_quality,
+        _mutate_build_waits_for_quality,
+        _mutate_build_gated_on_test_matrix,
+        _mutate_consumption_gated_on_test_matrix,
+        _mutate_fuzzing_missing_run_fuzzing_gate,
+        _mutate_test_missing_skipped_build_allowance,
+        _mutate_core_sinks_ignore_glob,
+        _mutate_missing_ci_gate,
+        _mutate_ci_gate_bare_always,
         _mutate_missing_sinks_export_filter,
         _mutate_build_selective_upload,
         _mutate_test_hatch_run,
@@ -793,6 +910,12 @@ def test_all_workflows_enforce_sha_pinning_least_privilege_concurrency_and_safe_
             assert isinstance(job.get("permissions"), dict), f"{ctx} missing job permissions"
             if wf_name == "main.yml" and job_id == "scorecard":
                 assert job.get("if") == "github.event_name != 'pull_request'"
+            job_if = " ".join(str(job.get("if", "")).split())
+            if "always()" in job_if:
+                assert "!cancelled()" in job_if, (
+                    f"{ctx} uses job-level always() without !cancelled(), "
+                    "which overrides concurrency cancel-in-progress"
+                )
 
             steps = job.get("steps", [])
             for step in steps:
@@ -856,9 +979,83 @@ def test_all_workflows_enforce_sha_pinning_least_privilege_concurrency_and_safe_
     )
     for pinned_tool in (
         '"pip-audit==',
-        '"detect-secrets==',
         '"semgrep==',
         '"vulture==',
         '"pylint==',
     ):
         assert pinned_tool in quality_runs, f"Missing pinned {pinned_tool} in quality job"
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or shutil.which("jq") is None,
+    reason="Bash and jq are needed to verify plan and ci-gate scripts",
+)
+def test_ci_plan_outputs_and_ci_gate_evaluate_upstream_results(tmp_path: Path) -> None:
+    pipeline = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    set_matrix_step = next(
+        s for s in pipeline["jobs"]["plan"]["steps"] if s.get("id") == "set-matrix"
+    )
+    for changed_csv, expected_quality, expected_build, expected_test in (
+        ("docs/index.rst,AGENTS.md", "false", "[]", "[]"),
+        ("examples/demo.py", "true", "[]", "[]"),
+        ("tests/unit/test_export_sinks_and_schema_caches.py", "true", "[]", '["core"]'),
+    ):
+        out_file = tmp_path / "github_output.txt"
+        out_file.write_text("", encoding="utf-8")
+        subprocess.run(
+            [shutil.which("bash"), "-euo", "pipefail", "-c", set_matrix_step["run"]],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "ALL_CHANGED_FILES": changed_csv,
+                "GITHUB_OUTPUT": str(out_file),
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        outputs = dict(
+            line.split("=", 1) for line in out_file.read_text(encoding="utf-8").splitlines()
+        )
+        assert outputs["run_quality"] == expected_quality
+        assert outputs["build_matrix"] == expected_build
+        assert outputs["matrix"] == expected_test
+
+    ci_gate_if = " ".join(str(pipeline["jobs"]["ci-gate"].get("if", "")).split())
+
+    def _eval_ci_gate_if(expr: str, *, workflow_cancelled: bool) -> bool:
+        tokens = {part.strip() for part in expr.split("&&")}
+        if "always()" not in tokens:
+            return False
+        if "!cancelled()" in tokens and workflow_cancelled:
+            return False
+        return True
+
+    assert _eval_ci_gate_if(ci_gate_if, workflow_cancelled=True) is False
+    assert _eval_ci_gate_if(ci_gate_if, workflow_cancelled=False) is True
+
+    gate_script = pipeline["jobs"]["ci-gate"]["steps"][0]["run"]
+    for needs_payload, expected_rc in (
+        (
+            '{"plan":{"result":"success"},"pre-commit":{"result":"success"},'
+            '"quality":{"result":"skipped"},"build":{"result":"skipped"},'
+            '"test":{"result":"skipped"},"docs":{"result":"success"}}',
+            0,
+        ),
+        (
+            '{"plan":{"result":"success"},"build":{"result":"failure"},"test":{"result":"skipped"}}',
+            1,
+        ),
+        (
+            '{"plan":{"result":"success"},"quality":{"result":"cancelled"}}',
+            1,
+        ),
+    ):
+        res = subprocess.run(
+            [shutil.which("bash"), "-euo", "pipefail", "-c", gate_script],
+            env={**os.environ, "NEEDS_JSON": needs_payload},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == expected_rc
