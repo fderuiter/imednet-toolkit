@@ -10,7 +10,6 @@ readiness validation, and state ledger management.
 from __future__ import annotations
 
 import argparse
-import builtins
 import contextlib
 import io
 import os
@@ -36,6 +35,7 @@ from imednet.spi.cli import (
     display_list,
     emit_json,
     fetching_status,
+    flush_stdout,
     is_json_output_mode,
     load_offline_schema,
     parse_email_notify,
@@ -50,6 +50,7 @@ from imednet.spi.cli import (
     simulation_mode_context,
     validate_cli_path_segment,
     with_sdk,
+    write_stdout,
 )
 from imednet.spi.models import PROFILE_REGISTRY, StudyConfiguration
 from imednet.spi.utils import (
@@ -123,8 +124,7 @@ def _emit_line(text: str = "", *, err: bool = False) -> None:
     if err:
         print_error(sanitized)
         return
-    with contextlib.suppress(BrokenPipeError, OSError):
-        builtins.print(sanitized, file=sys.stdout)
+    write_stdout(sanitized)
 
 
 def _reject_interactive_json_mode(interactive: bool, output_format: str | None) -> None:
@@ -1431,9 +1431,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 if not is_json_output_mode():
                     print_progress(f"Wrote UAT specification for study '{study_key}' to '{dest}'.")
                 return
-            with contextlib.suppress(BrokenPipeError, OSError):
-                sys.stdout.write(f"{serialized}\n")
-                sys.stdout.flush()
+            if write_stdout(serialized):
+                flush_stdout()
         except (ValueError, OSError) as exc:
             _exit_uat_validation_error(exc)
 

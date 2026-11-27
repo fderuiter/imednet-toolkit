@@ -33,8 +33,10 @@ from .output import (
     console,
     display_list,
     emit_json,
+    flush_stdout,
     format_job_progress,
     print_error,
+    write_stdout,
 )
 from .terminal import (
     NO_COLOR_ENV,
@@ -79,6 +81,7 @@ __all__ = [
     "display_list",
     "emit_json",
     "fetching_status",
+    "flush_stdout",
     "format_job_progress",
     "get_model_value",
     "get_sdk",
@@ -105,6 +108,7 @@ __all__ = [
     "supports_fullscreen_ui",
     "supports_interactive_stdin",
     "supports_live_status",
+    "write_stdout",
 ]
 
 

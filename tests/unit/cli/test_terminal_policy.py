@@ -689,7 +689,9 @@ def test_spi_cli_reexports_output_and_format_helpers() -> None:
         "resolve_output_format",
         "display_list",
         "emit_json",
+        "flush_stdout",
         "validate_cli_path_segment",
+        "write_stdout",
     ):
         assert name in spi_cli.__all__, f"{name} missing from imednet.spi.cli.__all__"
         assert hasattr(spi_cli, name), f"{name} missing on imednet.spi.cli"
@@ -698,4 +700,340 @@ def test_spi_cli_reexports_output_and_format_helpers() -> None:
     assert spi_cli.resolve_output_format is args_mod.resolve_output_format
     assert spi_cli.display_list is output_mod.display_list
     assert spi_cli.emit_json is output_mod.emit_json
+    assert spi_cli.flush_stdout is output_mod.flush_stdout
+    assert spi_cli.write_stdout is output_mod.write_stdout
     assert spi_cli.validate_cli_path_segment is decorators_mod.validate_cli_path_segment
+
+
+def _run_early_closed_pipe_subprocess(
+    code: str, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
+    """Run a Python CLI snippet whose stdout pipe reader closes after reading one line."""
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    first_line = proc.stdout.readline()
+    proc.stdout.close()
+    stderr_text = proc.stderr.read()
+    proc.stderr.close()
+    rc = proc.wait(timeout=15)
+    return rc, first_line, stderr_text
+
+
+def test_early_pipe_closure_exits_zero_with_empty_stderr_and_preserves_error_codes(
+    tmp_path: Any,
+) -> None:
+    """AC 6, Req 5 & Guardrail 4: records list, studies list --simulation, and datadict commands exit 0 with empty stderr on early pipe closure while preserving non-zero validation/parser exits."""
+    import subprocess
+
+    env = dict(os.environ)
+    env.pop("IMEDNET_NON_INTERACTIVE", None)
+
+    # 1. studies list --simulation (JSON mode has completely empty stderr; table mode has zero pipe errors)
+    rc_json, first_json, err_json = _run_early_closed_pipe_subprocess(
+        "import imednet.cli as cli; cli.app(['studies', 'list', '--simulation', '--format', 'json'])",
+        env=env,
+    )
+    assert rc_json == 0, (
+        f"studies list --simulation --format json failed: rc={rc_json}, stderr={err_json!r}"
+    )
+    assert first_json != ""
+    assert err_json == ""
+
+    rc_tbl, first_tbl, err_tbl = _run_early_closed_pipe_subprocess(
+        "import imednet.cli as cli; cli.app(['studies', 'list', '--simulation'])",
+        env=env,
+    )
+    assert rc_tbl == 0, f"studies list --simulation table failed: rc={rc_tbl}, stderr={err_tbl!r}"
+    assert first_tbl != ""
+    assert err_tbl.strip() in ("", "Fetching studies...")
+    assert "BrokenPipe" not in err_tbl and "Error" not in err_tbl and "Exception" not in err_tbl
+
+    # 2. datadict schema
+    rc, first, err = _run_early_closed_pipe_subprocess(
+        "import imednet.cli as cli; cli.app(['datadict', 'schema'])",
+        env=env,
+    )
+    assert rc == 0, f"datadict schema failed with rc={rc}, stderr={err!r}"
+    assert "{" in first
+    assert err == ""
+
+    # 3. records list (large multi-row payload exceeding pipe buffer in both JSON and table modes)
+    records_json_script = """
+import imednet.cli as cli
+from unittest.mock import MagicMock, patch
+from imednet.models.records import Record
+
+sdk = MagicMock()
+sdk.records.list.return_value = [
+    Record.model_construct(
+        record_id=i,
+        study_key="S1",
+        subject_key=f"SUBJ-{i:04d}",
+        form_key="DM",
+        record_status="Completed",
+        record_data={"NOTE": "x" * 120},
+    )
+    for i in range(1, 400)
+]
+with patch("imednet.cli.utils.context.get_sdk", return_value=sdk):
+    cli.app(["records", "list", "S1", "--format", "json"])
+"""
+    rc_rec_json, first_rec_json, err_rec_json = _run_early_closed_pipe_subprocess(
+        records_json_script, env=env
+    )
+    assert rc_rec_json == 0, (
+        f"records list --format json failed: rc={rc_rec_json}, stderr={err_rec_json!r}"
+    )
+    assert "{" in first_rec_json
+    assert err_rec_json == ""
+
+    records_table_script = records_json_script.replace(', "--format", "json"', "")
+    rc, first, err = _run_early_closed_pipe_subprocess(records_table_script, env=env)
+    assert rc == 0, f"records list table failed with rc={rc}, stderr={err!r}"
+    assert "Found 399 records:" in first
+    assert err.strip() in ("", "Fetching records for study 'S1'...")
+    assert "BrokenPipe" not in err and "Error" not in err and "Exception" not in err
+
+    # 4. datadict to-odm and datadict validate on valid DataDictionary
+    valid_dd_path = tmp_path / "valid_dd.json"
+    from imednet.datadict import DataDictionary, to_file
+
+    to_file(DataDictionary(), valid_dd_path)
+    rc_odm, first_odm, err_odm = _run_early_closed_pipe_subprocess(
+        f"import imednet.cli as cli; cli.app(['datadict', 'to-odm', {str(valid_dd_path)!r}])",
+        env=env,
+    )
+    assert rc_odm == 0, f"datadict to-odm failed with rc={rc_odm}, stderr={err_odm!r}"
+    assert "<?xml" in first_odm or "<ODM" in first_odm
+    assert err_odm == ""
+
+    rc_val_ok, _, err_val_ok = _run_early_closed_pipe_subprocess(
+        f"import imednet.cli as cli; cli.app(['datadict', 'validate', {str(valid_dd_path)!r}, '--format', 'json'])",
+        env=env,
+    )
+    assert rc_val_ok == 0
+    assert err_val_ok == ""
+
+    # 5. Guardrail 4: invalid DataDictionary still exits 1 even when stdout pipe closes early
+    invalid_dd_path = tmp_path / "invalid_dd.json"
+    invalid_dd_path.write_text('{"invalid": true}', encoding="utf-8")
+    rc_val_bad, _, _ = _run_early_closed_pipe_subprocess(
+        f"import imednet.cli as cli; cli.app(['datadict', 'validate', {str(invalid_dd_path)!r}, '--format', 'json'])",
+        env=env,
+    )
+    assert rc_val_bad == 1
+
+    # Invalid CLI flag still exits 2
+    bad_arg = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import imednet.cli as cli; cli.app(['records', 'list', '--bogus-flag'])",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert bad_arg.returncode == 2
+
+
+@pytest.mark.skipif(pty is None, reason="POSIX pty module required")
+def test_unknown_term_pty_emits_all_250_records_and_curses_fallback_drains_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 7, Req 6 & Guardrail 2: TERM=xterm-unknown-terminfo-9999 on a PTY emits all 250 records without 100-item truncation, and runtime grid fallback drains remaining pages."""
+    from imednet.models.records import Record
+    from imednet_tui.terminal import is_interactive_terminal as tui_is_interactive
+
+    monkeypatch.delenv("IMEDNET_NON_INTERACTIVE", raising=False)
+    monkeypatch.delenv("IMEDNET_CLI_OUTPUT_FORMAT", raising=False)
+    monkeypatch.setenv("TERM", "xterm-unknown-terminfo-9999")
+    monkeypatch.setattr(sys, "argv", ["imednet", "records", "list", "S1"])
+
+    # In-memory _FakeTTY parity across core and imednet-tui
+    tty_in = _FakeTTY()
+    tty_out = _FakeTTY()
+    assert terminal_mod.supports_fullscreen_ui(tty_in, tty_out) is False
+    assert tui_is_interactive(stdin=tty_in, stdout=tty_out) is False
+
+    records_250 = [
+        Record.model_construct(
+            record_id=i,
+            study_key="S1",
+            subject_key=f"SUBJ-{i:04d}",
+            form_key="DM",
+            record_status="Completed",
+            record_data={},
+        )
+        for i in range(1, 251)
+    ]
+
+    mock_sdk = MagicMock()
+    mock_sdk.records.list.side_effect = lambda *_a, **_kw: iter(records_250)
+
+    assert pty is not None
+    in_master, in_slave = pty.openpty()
+    out_master, out_slave = pty.openpty()
+    err_buf = io.StringIO()
+    captured_chunks: list[bytes] = []
+
+    def _drain_master() -> None:
+        while True:
+            try:
+                chunk = os.read(out_master, 4096)
+                if not chunk:
+                    break
+                captured_chunks.append(chunk)
+            except OSError:
+                break
+
+    import threading
+
+    reader = threading.Thread(target=_drain_master, daemon=True)
+    reader.start()
+    try:
+        in_file = os.fdopen(in_slave, "r", encoding="utf-8", closefd=True)
+        out_file = os.fdopen(out_slave, "w", encoding="utf-8", closefd=True)
+        with (
+            patch.object(sys, "stdin", in_file),
+            patch.object(sys, "stdout", out_file),
+            patch.object(sys, "stderr", err_buf),
+            patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+        ):
+            assert grid_mod.is_interactive_terminal() is False
+            cli.app(["records", "list", "S1"])
+            out_file.flush()
+    finally:
+        for f_name in ("in_file", "out_file"):
+            if f_name in locals():
+                with contextlib.suppress(OSError):
+                    locals()[f_name].close()
+        with contextlib.suppress(OSError):
+            os.close(in_master)
+        reader.join(timeout=5)
+        with contextlib.suppress(OSError):
+            os.close(out_master)
+
+    pty_output = b"".join(captured_chunks).decode("utf-8", errors="replace")
+    assert "Found 250 records:" in pty_output
+    assert "SUBJ-0001" in pty_output
+    assert "SUBJ-0250" in pty_output
+    assert "Showing first 100" not in pty_output
+
+    # Verify runtime fallback page draining when run_interactive_grid returns False
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr("imednet.cli.utils.grid.is_interactive_terminal", lambda: True)
+    monkeypatch.setattr("imednet.cli.utils.grid.run_interactive_grid", lambda **_kw: False)
+    out_buf = io.StringIO()
+    with (
+        patch.object(sys, "stdout", out_buf),
+        patch.object(sys, "stderr", io.StringIO()),
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+    ):
+        cli.app(["records", "list", "S1"])
+    fallback_output = out_buf.getvalue()
+    assert "Found 250 records:" in fallback_output
+    assert "SUBJ-0250" in fallback_output
+    assert "Showing first 100" not in fallback_output
+
+    # Explicit --limit 50 still caps at 50 even if interactive startup falls back
+    out_limited = io.StringIO()
+    with (
+        patch.object(sys, "stdout", out_limited),
+        patch.object(sys, "stderr", io.StringIO()),
+        patch("imednet.cli.utils.context.get_sdk", return_value=mock_sdk),
+    ):
+        cli.app(["records", "list", "S1", "--limit", "50"])
+    limited_text = out_limited.getvalue()
+    assert "Found 50 records:" in limited_text
+    assert "SUBJ-0050" in limited_text
+    assert "SUBJ-0051" not in limited_text
+
+
+def test_in_process_stream_guards_execution_guard_and_terminfo_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """Verify in-process write_stdout, flush_stdout, cli_execution_guard, with_sdk, and terminfo directory lookup."""
+    import errno
+
+    from imednet.cli.decorators import cli_execution_guard, with_sdk
+    from imednet.cli.utils import output as output_mod
+
+    class _BrokenStream:
+        def __init__(self, fail_after: int = 0, err_cls: str = "epipe") -> None:
+            self.writes = 0
+            self.fail_after = fail_after
+            self.err_cls = err_cls
+
+        def write(self, _s: str) -> int:
+            self.writes += 1
+            if self.writes > self.fail_after:
+                if self.err_cls == "broken":
+                    raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+                if self.err_cls == "epipe":
+                    raise OSError(errno.EPIPE, "Broken pipe")
+                raise OSError(errno.EIO, "I/O error")
+            return len(_s)
+
+        def flush(self) -> None:
+            if self.err_cls == "broken":
+                raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+            if self.err_cls == "epipe":
+                raise OSError(errno.EPIPE, "Broken pipe")
+            raise OSError(errno.EIO, "I/O error")
+
+    assert output_mod.flush_stdout(None) is True
+    output_mod._silence_broken_pipe(None)
+    assert output_mod.write_stdout("hi", stream=_BrokenStream(0, "broken")) is False
+    assert output_mod.write_stdout("hi", stream=_BrokenStream(0, "epipe")) is False
+    assert output_mod.flush_stdout(_BrokenStream(0, "broken")) is False
+    assert output_mod.flush_stdout(_BrokenStream(0, "io")) is False
+    with pytest.raises(OSError):
+        output_mod.write_stdout("hi", stream=_BrokenStream(0, "io"))
+
+    # _print_table halts cleanly when stdout breaks on header, separator, or row
+    for fail_after in (0, 2, 4):
+        monkeypatch.setattr(sys, "stdout", _BrokenStream(fail_after=fail_after, err_cls="broken"))
+        assert output_mod._print_table([{"a": 1}, {"a": 2}], ["a"]) is False
+
+    # cli_execution_guard suppresses BrokenPipeError and re-raises non-pipe errors
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    with cli_execution_guard():
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+    with pytest.raises(RuntimeError, match="boom"), cli_execution_guard():
+        raise RuntimeError("boom")
+
+    # @with_sdk suppresses BrokenPipeError cleanly while still closing SDK
+    fake_sdk = MagicMock()
+    monkeypatch.setattr("imednet.cli.utils.context.get_sdk", lambda: fake_sdk)
+
+    @with_sdk
+    def _pipe_cmd(_sdk: Any) -> None:
+        raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+
+    _pipe_cmd()
+    fake_sdk.close.assert_called_once()
+
+    # Terminfo lookup: reject invalid tokens, resolve custom $TERMINFO directory, and hit cache
+    assert terminal_mod._has_terminfo_support("") is False
+    assert terminal_mod._has_terminfo_support("dumb") is False
+    assert terminal_mod._has_terminfo_support("../bad") is False
+    assert terminal_mod._has_terminfo_support("bad\x00term") is False
+
+    custom_ti = tmp_path / "terminfo"
+    (custom_ti / "c").mkdir(parents=True)
+    (custom_ti / "c" / "custom-term-2026").write_bytes(b"\x1a\x01")
+    monkeypatch.setenv("TERMINFO", str(custom_ti))
+    monkeypatch.setenv("TERMINFO_DIRS", f"{custom_ti}:")
+    assert terminal_mod._has_terminfo_support("custom-term-2026") is True
+    assert terminal_mod._has_terminfo_support("custom-term-2026") is True
