@@ -1099,12 +1099,27 @@ def test_redcap_record_validation_decimals_slider_date_dmy_descriptive_and_check
         )
 
     # PHI masking on sensitive Multi Select indicator variable
-    secret_code = "1985_SECRET"
+    phi_dob_suffix = "1985_07_14"
     with pytest.raises(ValidationError) as exc_phi:
         validate_record_data(
             dd,
             "exam",
-            {"weight_kg": 72.45, "symptoms___1": 1, f"DateOfBirth___{secret_code}": 1},
+            {"weight_kg": 72.45, "symptoms___1": 1, f"DateOfBirth___{phi_dob_suffix}": 1},
         )
     assert MASKED_SENTINEL in str(exc_phi.value)
-    assert secret_code not in str(exc_phi.value)
+    assert phi_dob_suffix not in str(exc_phi.value)
+
+    phi_report = validate_record_data(
+        dd,
+        "exam",
+        {
+            "weight_kg": 72.45,
+            "symptoms___1": 1,
+            f"DateOfBirth___{phi_dob_suffix}": MASKED_SENTINEL,
+        },
+        collect_errors=True,
+    )
+    assert phi_report.errors
+    for issue in phi_report.errors:
+        assert phi_dob_suffix not in issue.message
+        assert issue.variable_name == f"DateOfBirth___{MASKED_SENTINEL}"

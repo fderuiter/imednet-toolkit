@@ -1631,31 +1631,42 @@ def validate_record_data(
     for name, value in data.items():
         if _contains_masked_sentinel(value):
             type_failed_vars.add(name)
+            shown_var = name
+            if name in resolved_indicators:
+                p_name, _, p_suffix = resolved_indicators[name]
+                if p_suffix and (
+                    global_sensitivity_registry.is_sensitive(name)
+                    or global_sensitivity_registry.is_sensitive(p_name)
+                ):
+                    shown_var = f"{p_name}___{MASKED_SENTINEL}"
             _record_error(
-                f"Variable '{name}' on form '{form_key}' contains masked PHI sentinel '{MASKED_SENTINEL}'",
-                variable_name=name,
+                f"Variable '{shown_var}' on form '{form_key}' contains masked PHI sentinel '{MASKED_SENTINEL}'",
+                variable_name=shown_var,
                 rule_id="masked_phi",
             )
             continue
         if name in resolved_indicators:
             parent_name, parent_var, suffix = resolved_indicators[name]
+            is_sens = global_sensitivity_registry.is_sensitive(
+                name
+            ) or global_sensitivity_registry.is_sensitive(parent_name)
+            shown_ind_name = f"{parent_name}___{MASKED_SENTINEL}" if is_sens and suffix else name
             if value is not None and value != "":
                 try:
                     _validate_checkbox_indicator_value(value)
                 except ValidationError as exc:
                     type_failed_vars.add(name)
-                    _record_error(exc.message, variable_name=name, rule_id="type", exc=exc)
+                    _record_error(
+                        exc.message, variable_name=shown_ind_name, rule_id="type", exc=exc
+                    )
             if not isinstance(schema, BaseSchemaCache):
                 parent_constraints = extract_variable_constraints(parent_var)
                 if not suffix or suffix not in set(parent_constraints.choices):
-                    is_sens = global_sensitivity_registry.is_sensitive(
-                        name
-                    ) or global_sensitivity_registry.is_sensitive(parent_name)
                     shown_suffix = MASKED_SENTINEL if is_sens else suffix
                     _record_error(
-                        f"Invalid choice '{shown_suffix}' for variable '{name}' on form '{form_key}'. "
+                        f"Invalid choice '{shown_suffix}' for variable '{shown_ind_name}' on form '{form_key}'. "
                         f"Allowed values: {parent_constraints.choices}",
-                        variable_name=name,
+                        variable_name=shown_ind_name,
                         rule_id="choice",
                     )
             continue
