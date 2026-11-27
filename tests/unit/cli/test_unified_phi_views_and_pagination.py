@@ -109,7 +109,7 @@ def _setup_encrypted_store_sdk(
     monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(db_path))
 
     sdk = ImednetSDK(
-        api_key="test-api-key-enc",
+        api_key="test-api-key-enc",  # pragma: allowlist secret
         security_key="sdk-scoped-secret-key-for-fernet-derivation",
         base_url="https://scoped-origin.imednet.example",
     )
@@ -190,8 +190,8 @@ def test_encrypted_store_upper_snake_and_camel_case_phi_masked_across_commands(
                 "usubjid": "STUDY_ENC-SUBJ-01",
                 "subjid": "SUBJ-01",
                 "studyid": study_key,
-                "CUSTOM_SECRET_NOTE": "RawUpperSecret",
-                "customSecretNote": "RawCamelVariant",
+                "CUSTOM_SECRET_NOTE": "RawUpperSecret",  # pragma: allowlist secret
+                "customSecretNote": "RawCamelVariant",  # pragma: allowlist secret
                 "patientAlias": "RawPatientAlias",
                 "PATIENT_ALIAS": "RawSnakeVariant",
                 "SAFE_METRIC": 98,
@@ -266,8 +266,9 @@ def test_encrypted_store_upper_snake_and_camel_case_phi_masked_across_commands(
         )
         assert code_raw == 0
         raw_item = json.loads(out_raw)["items"][0]
-        assert raw_item["records"][0]["recordData"]["CUSTOM_SECRET_NOTE"] == "RawUpperSecret"
-        assert raw_item["records"][0]["recordData"]["patientAlias"] == "RawPatientAlias"
+        raw_data = raw_item["records"][0]["recordData"]
+        assert raw_data["CUSTOM_SECRET_NOTE"] == "RawUpperSecret"  # pragma: allowlist secret
+        assert raw_data["patientAlias"] == "RawPatientAlias"
         assert "RawPatientAlias" in raw_item["queries"][0]["description"]
         assert "RawUpperSecret" in raw_item["queries"][0]["queryComments"][0]["comment"]
 
