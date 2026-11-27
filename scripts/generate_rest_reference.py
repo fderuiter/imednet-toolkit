@@ -109,12 +109,12 @@ BODY_FIELD_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
     "formKey": (
         "String",
         "Conditional",
-        "Case Report Form (CRF) unique key identifier. Either ``formKey`` or ``formId`` is required.",
+        "Case Report Form (CRF) unique key identifier. Either ``formKey`` or ``formId`` is required when creating records.",
     ),
     "formId": (
         "Integer",
         "Conditional",
-        "Numeric CRF identifier accepted in place of ``formKey`` (either ``formKey`` or ``formId`` is required).",
+        "Numeric CRF identifier accepted in place of ``formKey``.",
     ),
     "siteName": (
         "String",
@@ -129,7 +129,7 @@ BODY_FIELD_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
     "subjectKey": (
         "String",
         "Conditional",
-        "Participant subject key. One of ``subjectKey``, ``subjectId``, or ``subjectOid`` is required when creating or updating records for an existing subject (omit when registering a new subject).",
+        "Participant subject key. One of ``subjectKey``, ``subjectId``, or ``subjectOid`` is required when creating or updating records for an existing subject (omit for server-assigned keys when registering a new subject).",
     ),
     "subjectId": (
         "Integer",
@@ -144,17 +144,37 @@ BODY_FIELD_DESCRIPTIONS: dict[str, tuple[str, str, str]] = {
     "intervalName": (
         "String",
         "Conditional",
-        "Scheduled study visit or interval name. Either ``intervalName`` or ``intervalId`` is required when updating a scheduled visit record.",
+        "Scheduled study visit or interval name. Either ``intervalName`` or ``intervalId`` (or ``visitId``) is required when updating a scheduled visit record.",
     ),
     "intervalId": (
         "Integer",
         "Conditional",
         "Numeric study visit or interval identifier accepted in place of ``intervalName`` for scheduled visit records.",
     ),
+    "visitId": (
+        "Integer",
+        "Conditional",
+        "Numeric subject visit instance identifier used to target a specific scheduled visit record.",
+    ),
     "recordId": (
         "Integer",
         "Conditional",
-        "Existing numeric record identifier used when updating a specific unscheduled record.",
+        "Existing numeric record identifier used when updating a specific record directly.",
+    ),
+    "recordOid": (
+        "String",
+        "Conditional",
+        "Existing system-assigned record OID accepted in place of ``recordId`` when updating a specific record.",
+    ),
+    "recordStatus": (
+        "String",
+        "Optional",
+        "Target lifecycle status for the record (e.g., ``Record Incomplete``, ``Record Complete``, ``Complete``).",
+    ),
+    "reasonForChange": (
+        "String",
+        "Optional",
+        "Audit trail reason explaining why an existing record is being modified.",
     ),
     "data": (
         "Object",
@@ -469,7 +489,14 @@ def _generate_endpoint_rst(operation: dict[str, Any], res_key: str = "") -> list
             lines.extend(
                 [
                     "The request body must be a JSON array of record objects (``[{...}, ...]``). "
-                    "Each record object in the array supports the following fields:",
+                    "In Python, pass a sequence of typed "
+                    ":class:`~imednet.models.records.BaseRecordRequest` subclasses "
+                    "(:class:`~imednet.models.records.RegisterSubjectRequest`, "
+                    ":class:`~imednet.models.records.CreateNewRecordRequest`, "
+                    ":class:`~imednet.models.records.UpdateScheduledRecordRequest`, or "
+                    ":class:`~imednet.models.records.UpdateRecordRequest`), mappings, a "
+                    "``DataFrame``, or a CSV path. Each record object supports the following 14 "
+                    "write attributes plus ``data``:",
                     "",
                 ]
             )
