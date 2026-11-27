@@ -123,6 +123,9 @@ def extract_sdk_base_url(sdk: Any) -> str | None:
                 return sanitize_base_url(candidate)
             except Exception:  # noqa: S112
                 continue
+    wrapped_sync = _safe_context_attr(sdk, "_sync_sdk")
+    if wrapped_sync is not None and wrapped_sync is not sdk:
+        return extract_sdk_base_url(wrapped_sync)
     return None
 
 
@@ -136,10 +139,14 @@ def extract_sdk_security_key(sdk: Any) -> str | None:
         return None
     cfg = _safe_context_attr(sdk, "config")
     sdk_auth = _safe_context_attr(sdk, "auth")
-    sync_client_auth = _safe_context_attr(_safe_context_attr(sdk, "_client"), "auth")
-    async_client_auth = _safe_context_attr(_safe_context_attr(sdk, "_async_client"), "auth")
-    pub_client_auth = _safe_context_attr(_safe_context_attr(sdk, "client"), "auth")
-    pub_async_auth = _safe_context_attr(_safe_context_attr(sdk, "async_client"), "auth")
+    sync_client = _safe_context_attr(sdk, "_client")
+    async_client = _safe_context_attr(sdk, "_async_client")
+    pub_client = _safe_context_attr(sdk, "client")
+    pub_async = _safe_context_attr(sdk, "async_client")
+    sync_client_auth = _safe_context_attr(sync_client, "auth")
+    async_client_auth = _safe_context_attr(async_client, "auth")
+    pub_client_auth = _safe_context_attr(pub_client, "auth")
+    pub_async_auth = _safe_context_attr(pub_async, "auth")
 
     security_candidates = (
         _safe_context_attr(sdk, "_security_key"),
@@ -149,6 +156,10 @@ def extract_sdk_security_key(sdk: Any) -> str | None:
         _safe_context_attr(async_client_auth, "security_key"),
         _safe_context_attr(pub_client_auth, "security_key"),
         _safe_context_attr(pub_async_auth, "security_key"),
+        _safe_context_attr(sync_client, "security_key"),
+        _safe_context_attr(async_client, "security_key"),
+        _safe_context_attr(pub_client, "security_key"),
+        _safe_context_attr(pub_async, "security_key"),
     )
     oidc_candidates = (
         _safe_context_attr(sdk_auth, "token"),
@@ -166,6 +177,10 @@ def extract_sdk_security_key(sdk: Any) -> str | None:
         _safe_context_attr(async_client_auth, "api_key"),
         _safe_context_attr(pub_client_auth, "api_key"),
         _safe_context_attr(pub_async_auth, "api_key"),
+        _safe_context_attr(sync_client, "api_key"),
+        _safe_context_attr(async_client, "api_key"),
+        _safe_context_attr(pub_client, "api_key"),
+        _safe_context_attr(pub_async, "api_key"),
     )
 
     simulated_placeholders = {"SIMULATED_KEY", "simulated_security_key", "simulated_api_key"}
@@ -177,6 +192,11 @@ def extract_sdk_security_key(sdk: Any) -> str | None:
                     simulated_fallback = candidate
                 continue
             return candidate
+    wrapped_sync = _safe_context_attr(sdk, "_sync_sdk")
+    if wrapped_sync is not None and wrapped_sync is not sdk:
+        wrapped_key = extract_sdk_security_key(wrapped_sync)
+        if wrapped_key is not None:
+            return wrapped_key
     return simulated_fallback
 
 

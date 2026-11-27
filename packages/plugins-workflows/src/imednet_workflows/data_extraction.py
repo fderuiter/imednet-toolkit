@@ -15,6 +15,7 @@ from imednet.spi.utils import (
     parse_revision_timestamp_utc,
     resolve_enrichment_pipeline,
     run_sync_over_async,
+    sdk_governance_context,
     split_revision_date_bounds,
 )
 
@@ -166,18 +167,19 @@ class AsyncDataExtractionWorkflow:
             user_filter=user_filter,
             **filters,
         )
-        resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
-        if mask_phi:
-            pipeline = resolve_enrichment_pipeline(study_key)
-            if pipeline is not None and getattr(pipeline, "phi_keys", None):
-                resolved_phi.update(pipeline.phi_keys)
-        _by_rec, all_ordered = map_revisions_to_audit_records(
-            revisions,
-            default_location_oid=default_location_oid,
-            mask_phi=mask_phi,
-            custom_phi_keys=resolved_phi or None,
-        )
-        return all_ordered
+        with sdk_governance_context(self._sdk):
+            resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+            if mask_phi:
+                pipeline = resolve_enrichment_pipeline(study_key)
+                if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                    resolved_phi.update(pipeline.phi_keys)
+            _by_rec, all_ordered = map_revisions_to_audit_records(
+                revisions,
+                default_location_oid=default_location_oid,
+                mask_phi=mask_phi,
+                custom_phi_keys=resolved_phi or None,
+            )
+            return all_ordered
 
 
 class DataExtractionWorkflow:
@@ -278,30 +280,32 @@ class DataExtractionWorkflow:
                 user_filter=user_filter,
                 **filters,
             )
-            resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
-            if mask_phi:
-                pipeline = resolve_enrichment_pipeline(study_key)
-                if pipeline is not None and getattr(pipeline, "phi_keys", None):
-                    resolved_phi.update(pipeline.phi_keys)
-            _by_rec, all_ordered = map_revisions_to_audit_records(
-                revisions,
-                default_location_oid=default_location_oid,
-                mask_phi=mask_phi,
-                custom_phi_keys=resolved_phi or None,
+            with sdk_governance_context(self._sdk):
+                resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+                if mask_phi:
+                    pipeline = resolve_enrichment_pipeline(study_key)
+                    if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                        resolved_phi.update(pipeline.phi_keys)
+                _by_rec, all_ordered = map_revisions_to_audit_records(
+                    revisions,
+                    default_location_oid=default_location_oid,
+                    mask_phi=mask_phi,
+                    custom_phi_keys=resolved_phi or None,
+                )
+                return all_ordered
+        with sdk_governance_context(self._sdk):
+            return run_sync_over_async(
+                lambda: self._async_core.extract_odm_audit_records(
+                    study_key,
+                    start_date=start_date,
+                    end_date=end_date,
+                    user_filter=user_filter,
+                    default_location_oid=default_location_oid,
+                    mask_phi=mask_phi,
+                    phi_keys=phi_keys,
+                    **filters,
+                )
             )
-            return all_ordered
-        return run_sync_over_async(
-            lambda: self._async_core.extract_odm_audit_records(
-                study_key,
-                start_date=start_date,
-                end_date=end_date,
-                user_filter=user_filter,
-                default_location_oid=default_location_oid,
-                mask_phi=mask_phi,
-                phi_keys=phi_keys,
-                **filters,
-            )
-        )
 
 
 # Integration:

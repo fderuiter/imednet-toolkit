@@ -188,11 +188,11 @@ and :func:`~imednet.utils.security.mask_clinical_phi`. Key matching normalizes
 camelCase, PascalCase, hyphenated, and upper/lower snake_case ``Variable`` names
 before comparison, replacing matching non-null values with ``***MASKED***``.
 
-* **13 Default Sensitive PHI Keys** (redacted to ``***MASKED***`` across case
+* **14 Default Sensitive PHI Keys** (redacted to ``***MASKED***`` across case
   and delimiter variants):
-  ``patient_name``, ``patient_initials``, ``dob``, ``date_of_birth``, ``ssn``,
-  ``phone``, ``email``, ``address``, ``birth_date``, ``brthdtc``, ``brthdat``,
-  ``brthyr``, and ``subjinit``.
+  ``patient_name``, ``patname``, ``patient_initials``, ``dob``, ``date_of_birth``,
+  ``ssn``, ``phone``, ``email``, ``address``, ``birth_date``, ``brthdtc``,
+  ``brthdat``, ``brthyr``, and ``subjinit``.
 * **6 Exempt Structural Keys** (preserved so ``Study``, ``Subject``, and
   ``Record`` joins, partitions, and graph edges remain intact even if passed in
   custom key lists):

@@ -37,6 +37,7 @@ from imednet.spi.utils import (
     redact_sensitive_text,
     sanitize_csv_formula,
     sanitize_diagnostic_text,
+    sdk_governance_context,
 )
 
 if TYPE_CHECKING:
@@ -203,16 +204,20 @@ def setup_audit_parsers(
             if odm_target is not None:
                 from imednet.spi.cdisc import build_odm_archive, to_odm_file
 
-                custom_phi = resolve_custom_phi_fields(study_key) if mask_phi else set()
-                archive = build_odm_archive(
-                    study_key,
-                    revisions=revisions,
-                    mask_phi=mask_phi,
-                    custom_phi_keys=custom_phi or None,
-                )
-                to_odm_file(
-                    archive, odm_target, mask_phi=mask_phi, custom_phi_keys=custom_phi or None
-                )
+                with sdk_governance_context(sdk):
+                    custom_phi = resolve_custom_phi_fields(study_key) if mask_phi else set()
+                    archive = build_odm_archive(
+                        study_key,
+                        revisions=revisions,
+                        mask_phi=mask_phi,
+                        custom_phi_keys=custom_phi or None,
+                    )
+                    to_odm_file(
+                        archive,
+                        odm_target,
+                        mask_phi=mask_phi,
+                        custom_phi_keys=custom_phi or None,
+                    )
                 emit_line(f"Saved {len(revisions)} audit_trail to {odm_target}")
                 return
             export_list_to_file(

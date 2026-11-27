@@ -19,7 +19,9 @@ import pandas as pd
 from pydantic import BaseModel, Field, ValidationError, create_model
 
 from imednet.spi.cdisc import (
+    DatasetJsonBundle,
     DatasetJsonEnvelope,
+    build_dataset_json_bundle,
     build_dataset_json_envelope,
 )
 from imednet.spi.endpoints import Record as RecordModel
@@ -55,6 +57,7 @@ from imednet.spi.utils import (
     mask_custom_phi_recursive,
     normalize_phi_keys_snapshot,
     resolve_enrichment_pipeline,
+    sdk_governance_context,
     stamp_tabular_batch,
 )
 
@@ -186,6 +189,58 @@ def transform_records_to_dataset_json(
     if resolved_pipeline is not None and getattr(resolved_pipeline, "phi_keys", None):
         resolved_phi.update(resolved_pipeline.phi_keys)
     return build_dataset_json_envelope(
+        study_key,
+        records=records,
+        forms=tuple(forms),
+        variables=tuple(variables),
+        as_sdtm=as_sdtm,
+        sdtm_domain=domain,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        naming_convention=naming_convention,
+        preserve_record_id=preserve_record_id,
+        include_deleted=include_deleted,
+        mask_phi=mask_phi,
+        custom_phi_keys=resolved_phi or None,
+        enrichment_pipeline=resolved_pipeline,
+        metadata_version_oid=metadata_version_oid,
+        file_oid=file_oid,
+        creation_datetime=creation_datetime,
+    )
+
+
+def transform_records_to_dataset_json_bundle(
+    records: Iterable[Any],
+    study_key: str,
+    *,
+    forms: Iterable[Any] = (),
+    variables: Iterable[Any] = (),
+    as_sdtm: bool = False,
+    domain: str | None = None,
+    use_labels_as_columns: bool = False,
+    variable_whitelist: list[str] | None = None,
+    form_whitelist: list[int] | None = None,
+    naming_convention: str | None = None,
+    preserve_record_id: bool = False,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    enrichment_pipeline: EnrichmentPipeline | None = _UNSET_PIPELINE,
+    phi_keys: Iterable[str] | None = None,
+    metadata_version_oid: str = "MDV.001",
+    file_oid: str | None = None,
+    creation_datetime: str | None = None,
+) -> DatasetJsonBundle:
+    """Transform clinical records across multiple Forms or SDTM domains into a ``DatasetJsonBundle``."""
+    resolved_pipeline = (
+        enrichment_pipeline
+        if enrichment_pipeline is not _UNSET_PIPELINE
+        else resolve_enrichment_pipeline(study_key)
+    )
+    resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+    if resolved_pipeline is not None and getattr(resolved_pipeline, "phi_keys", None):
+        resolved_phi.update(resolved_pipeline.phi_keys)
+    return build_dataset_json_bundle(
         study_key,
         records=records,
         forms=tuple(forms),
@@ -429,7 +484,8 @@ class RecordMapper:
         if not sk:
             return None
         if sk not in self._enrichment_cache:
-            self._enrichment_cache[sk] = resolve_enrichment_pipeline(sk)
+            with sdk_governance_context(self.sdk):
+                self._enrichment_cache[sk] = resolve_enrichment_pipeline(sk)
         return self._enrichment_cache[sk]
 
     # ------------------------------------------------------------------
@@ -2039,54 +2095,134 @@ class RecordMapper:
         effective_include_deleted = (
             self._include_deleted if include_deleted is None else include_deleted
         )
-        pipeline = self._get_enrichment_pipeline(study_key)
-        pipeline_phi_keys = set(pipeline.phi_keys) if pipeline is not None else set()
+        with sdk_governance_context(self.sdk):
+            pipeline = self._get_enrichment_pipeline(study_key)
+            pipeline_phi_keys = set(pipeline.phi_keys) if pipeline is not None else set()
 
-        study_forms = self._iter_sdk_lookup_items(study_key, "forms", "get_forms")
-        if not (as_sdtm or domain):
-            self._fetch_variable_metadata(
+            study_forms = self._iter_sdk_lookup_items(study_key, "forms", "get_forms")
+            study_visits = self._iter_sdk_lookup_items(study_key, "visits", "get_visits")
+            if not (as_sdtm or domain):
+                self._fetch_variable_metadata(
+                    study_key,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                )
+                study_vars: list[Any] = list(self._last_variables)
+            else:
+                study_vars = []
+
+            extra_filters: dict[str, Any] = {}
+            if form_whitelist is not None:
+                extra_filters["formId"] = form_whitelist
+
+            record_stream: Iterable[Any] = (
+                records
+                if records is not None
+                else self._iter_records(
+                    study_key,
+                    visit_key=visit_key,
+                    extra_filters=extra_filters or None,
+                    include_deleted=effective_include_deleted,
+                )
+            )
+            return build_dataset_json_envelope(
                 study_key,
+                records=record_stream,
+                forms=study_forms,
+                variables=study_vars,
+                visits=study_visits,
+                as_sdtm=as_sdtm,
+                sdtm_domain=domain,
+                use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
-            )
-            study_vars: list[Any] = list(self._last_variables)
-        else:
-            study_vars = []
-
-        extra_filters: dict[str, Any] = {}
-        if form_whitelist is not None:
-            extra_filters["formId"] = form_whitelist
-
-        record_stream: Iterable[Any] = (
-            records
-            if records is not None
-            else self._iter_records(
-                study_key,
-                visit_key=visit_key,
-                extra_filters=extra_filters or None,
+                naming_convention=naming_convention,
+                preserve_record_id=preserve_record_id,
                 include_deleted=effective_include_deleted,
+                mask_phi=should_mask,
+                custom_phi_keys=pipeline_phi_keys or None,
+                enrichment_pipeline=pipeline,
+                metadata_version_oid=metadata_version_oid,
+                file_oid=file_oid,
+                creation_datetime=creation_datetime,
             )
+
+    def to_dataset_json_bundle(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | None = None,
+    ) -> DatasetJsonBundle:
+        """Emit a ``DatasetJsonBundle`` mapping each Form or SDTM domain to a flat v1.1 envelope."""
+        self._active_study_key = study_key
+        should_mask = self.mask_phi if mask_phi is None else mask_phi
+        effective_include_deleted = (
+            self._include_deleted if include_deleted is None else include_deleted
         )
-        return build_dataset_json_envelope(
-            study_key,
-            records=record_stream,
-            forms=study_forms,
-            variables=study_vars,
-            as_sdtm=as_sdtm,
-            sdtm_domain=domain,
-            use_labels_as_columns=use_labels_as_columns,
-            variable_whitelist=variable_whitelist,
-            form_whitelist=form_whitelist,
-            naming_convention=naming_convention,
-            preserve_record_id=preserve_record_id,
-            include_deleted=effective_include_deleted,
-            mask_phi=should_mask,
-            custom_phi_keys=pipeline_phi_keys or None,
-            enrichment_pipeline=pipeline,
-            metadata_version_oid=metadata_version_oid,
-            file_oid=file_oid,
-            creation_datetime=creation_datetime,
-        )
+        with sdk_governance_context(self.sdk):
+            pipeline = self._get_enrichment_pipeline(study_key)
+            pipeline_phi_keys = set(pipeline.phi_keys) if pipeline is not None else set()
+
+            study_forms = self._iter_sdk_lookup_items(study_key, "forms", "get_forms")
+            study_visits = self._iter_sdk_lookup_items(study_key, "visits", "get_visits")
+            if not (as_sdtm or domain):
+                self._fetch_variable_metadata(
+                    study_key,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                )
+                study_vars: list[Any] = list(self._last_variables)
+            else:
+                study_vars = []
+
+            extra_filters: dict[str, Any] = {}
+            if form_whitelist is not None:
+                extra_filters["formId"] = form_whitelist
+
+            record_stream: Iterable[Any] = (
+                records
+                if records is not None
+                else self._iter_records(
+                    study_key,
+                    visit_key=visit_key,
+                    extra_filters=extra_filters or None,
+                    include_deleted=effective_include_deleted,
+                )
+            )
+            return build_dataset_json_bundle(
+                study_key,
+                records=record_stream,
+                forms=study_forms,
+                variables=study_vars,
+                visits=study_visits,
+                as_sdtm=as_sdtm,
+                sdtm_domain=domain,
+                use_labels_as_columns=use_labels_as_columns,
+                variable_whitelist=variable_whitelist,
+                form_whitelist=form_whitelist,
+                naming_convention=naming_convention,
+                preserve_record_id=preserve_record_id,
+                include_deleted=effective_include_deleted,
+                mask_phi=should_mask,
+                custom_phi_keys=pipeline_phi_keys or None,
+                enrichment_pipeline=pipeline,
+                metadata_version_oid=metadata_version_oid,
+                file_oid=file_oid,
+                creation_datetime=creation_datetime,
+            )
 
     def sdtm_dataset_json(
         self,
@@ -2132,6 +2268,7 @@ class _AsyncMapperSdkShim:
         intervals: list[Any],
         visits: list[Any],
         records: list[Any],
+        delegate_sdk: Any = None,
     ) -> None:
         self._variables = variables
         self._forms = forms
@@ -2139,6 +2276,7 @@ class _AsyncMapperSdkShim:
         self._intervals = intervals
         self._visits = visits
         self._records = records
+        self._sync_sdk = delegate_sdk
         self.forms = type("_F", (), {"list": lambda _s, **_kw: list(forms)})()
 
     def get_variables(self, **_kw: Any) -> list[Any]:
@@ -2323,6 +2461,7 @@ class AsyncRecordMapper(RecordMapper):
             intervals=intervals,
             visits=visits,
             records=records,
+            delegate_sdk=self.sdk,
         )
 
     async def iter_dataframes(  # type: ignore[override]
@@ -2361,17 +2500,18 @@ class AsyncRecordMapper(RecordMapper):
         orig = self.sdk
         try:
             self.sdk = shim  # type: ignore[assignment]
-            frames = list(
-                super().iter_dataframes(
-                    study_key=study_key,
-                    visit_key=visit_key,
-                    use_labels_as_columns=use_labels_as_columns,
-                    variable_whitelist=variable_whitelist,
-                    form_whitelist=form_whitelist,
-                    mask_phi=mask_phi,
-                    include_deleted=include_deleted,
+            with sdk_governance_context(orig):
+                frames = list(
+                    super().iter_dataframes(
+                        study_key=study_key,
+                        visit_key=visit_key,
+                        use_labels_as_columns=use_labels_as_columns,
+                        variable_whitelist=variable_whitelist,
+                        form_whitelist=form_whitelist,
+                        mask_phi=mask_phi,
+                        include_deleted=include_deleted,
+                    )
                 )
-            )
         finally:
             self.sdk = orig
         for df in frames:
@@ -2444,16 +2584,17 @@ class AsyncRecordMapper(RecordMapper):
         orig = self.sdk
         try:
             self.sdk = shim  # type: ignore[assignment]
-            return super().build_hierarchy(
-                study_key=study_key,
-                visit_key=visit_key,
-                use_labels_as_keys=use_labels_as_keys,
-                variable_whitelist=variable_whitelist,
-                form_whitelist=form_whitelist,
-                mask_phi=mask_phi,
-                include_deleted=include_deleted,
-                records=mat_records,
-            )
+            with sdk_governance_context(orig):
+                return super().build_hierarchy(
+                    study_key=study_key,
+                    visit_key=visit_key,
+                    use_labels_as_keys=use_labels_as_keys,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    mask_phi=mask_phi,
+                    include_deleted=include_deleted,
+                    records=mat_records,
+                )
         finally:
             self.sdk = orig
 
@@ -2479,17 +2620,18 @@ class AsyncRecordMapper(RecordMapper):
         orig = self.sdk
         try:
             self.sdk = shim  # type: ignore[assignment]
-            frames = list(
-                super().iter_sdtm_dataframes(
-                    study_key=study_key,
-                    domain=domain,
-                    visit_key=visit_key,
-                    variable_whitelist=variable_whitelist,
-                    form_whitelist=form_whitelist,
-                    mask_phi=mask_phi,
-                    include_deleted=include_deleted,
+            with sdk_governance_context(orig):
+                frames = list(
+                    super().iter_sdtm_dataframes(
+                        study_key=study_key,
+                        domain=domain,
+                        visit_key=visit_key,
+                        variable_whitelist=variable_whitelist,
+                        form_whitelist=form_whitelist,
+                        mask_phi=mask_phi,
+                        include_deleted=include_deleted,
+                    )
                 )
-            )
         finally:
             self.sdk = orig
         for df in frames:
@@ -2563,23 +2705,81 @@ class AsyncRecordMapper(RecordMapper):
         orig = self.sdk
         try:
             self.sdk = shim  # type: ignore[assignment]
-            return super().to_dataset_json(
-                study_key=study_key,
-                visit_key=visit_key,
-                use_labels_as_columns=use_labels_as_columns,
-                variable_whitelist=variable_whitelist,
-                form_whitelist=form_whitelist,
-                as_sdtm=as_sdtm,
-                domain=domain,
-                naming_convention=naming_convention,
-                preserve_record_id=preserve_record_id,
-                mask_phi=mask_phi,
-                include_deleted=include_deleted,
-                metadata_version_oid=metadata_version_oid,
-                file_oid=file_oid,
-                creation_datetime=creation_datetime,
-                records=mat_records,
+            with sdk_governance_context(orig):
+                return super().to_dataset_json(
+                    study_key=study_key,
+                    visit_key=visit_key,
+                    use_labels_as_columns=use_labels_as_columns,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    as_sdtm=as_sdtm,
+                    domain=domain,
+                    naming_convention=naming_convention,
+                    preserve_record_id=preserve_record_id,
+                    mask_phi=mask_phi,
+                    include_deleted=include_deleted,
+                    metadata_version_oid=metadata_version_oid,
+                    file_oid=file_oid,
+                    creation_datetime=creation_datetime,
+                    records=mat_records,
+                )
+        finally:
+            self.sdk = orig
+
+    async def to_dataset_json_bundle(  # type: ignore[override]
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | AsyncIterable[Any] | None = None,
+    ) -> DatasetJsonBundle:
+        """Asynchronously emit a ``DatasetJsonBundle`` for CDASH Forms or SDTM domains."""
+        mat_records: list[Any] | None = None
+        if records is not None:
+            mat_records = (
+                [r async for r in records] if hasattr(records, "__aiter__") else list(records)
             )
+        shim = await self._build_shim(
+            study_key,
+            visit_key=visit_key,
+            variable_whitelist=variable_whitelist,
+            form_whitelist=form_whitelist,
+            need_variables=not bool(as_sdtm or domain),
+            pre_records=mat_records,
+        )
+        orig = self.sdk
+        try:
+            self.sdk = shim  # type: ignore[assignment]
+            with sdk_governance_context(orig):
+                return super().to_dataset_json_bundle(
+                    study_key=study_key,
+                    visit_key=visit_key,
+                    use_labels_as_columns=use_labels_as_columns,
+                    variable_whitelist=variable_whitelist,
+                    form_whitelist=form_whitelist,
+                    as_sdtm=as_sdtm,
+                    domain=domain,
+                    naming_convention=naming_convention,
+                    preserve_record_id=preserve_record_id,
+                    mask_phi=mask_phi,
+                    include_deleted=include_deleted,
+                    metadata_version_oid=metadata_version_oid,
+                    file_oid=file_oid,
+                    creation_datetime=creation_datetime,
+                    records=mat_records,
+                )
         finally:
             self.sdk = orig
 
@@ -2619,11 +2819,13 @@ __all__ = [
     "DEFAULT_CHUNK_SIZE",
     "SDTM_DOMAIN_SPECS",
     "AsyncRecordMapper",
+    "DatasetJsonBundle",
     "DatasetJsonEnvelope",
     "RecordMapper",
     "_SdtmNormalizer",
     "_iter_sorted_sdtm_frames",
     "format_iso8601_dtc",
     "transform_records_to_dataset_json",
+    "transform_records_to_dataset_json_bundle",
     "transform_records_to_sdtm",
 ]

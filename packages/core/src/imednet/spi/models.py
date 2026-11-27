@@ -13,12 +13,14 @@ if TYPE_CHECKING:
     from imednet.models import *
 
 _EXCHANGE_EXPORTS: tuple[str, ...] = (
-    "DatasetJsonClinicalData",
+    "DatasetJsonBundle",
+    "DatasetJsonColumn",
     "DatasetJsonEnvelope",
     "DatasetJsonItem",
-    "DatasetJsonItemGroup",
     "DatasetJsonItemType",
     "DatasetJsonScalar",
+    "DatasetJsonSourceSystem",
+    "DatasetJsonTargetDataType",
     "OdmAdminData",
     "OdmAnnotation",
     "OdmArchive",
