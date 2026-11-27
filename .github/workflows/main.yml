@@ -41,31 +41,6 @@ jobs:
             revert
 
   # ------------------------------------------------------------------
-  # JOB 0.1: GLOBAL LINTING (Runs unconditionally)
-  # ------------------------------------------------------------------
-  global-lint:
-    name: Global Code Quality Check
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.11"
-      - name: Set up uv
-        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
-        with:
-          enable-cache: "false"
-      - name: Run Global Lint & Spelling Checks
-        run: |
-          uvx --from "ruff==0.15.22" ruff format --check .
-          uvx --from "ruff==0.15.22" ruff check .
-          uvx --from "typos==1.30.0" typos --force-exclude .
-
-  # ------------------------------------------------------------------
   # JOB 0.2: PRE-COMMIT CHECK (Runs unconditionally)
   # ------------------------------------------------------------------
   pre-commit:
@@ -112,7 +87,9 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       build_matrix: ${{ steps.set-matrix.outputs.build_matrix }}
+      run_quality: ${{ steps.set-matrix.outputs.run_quality }}
       run_integration: ${{ steps.filter.outputs.export_logic }}
+      run_fuzzing: ${{ steps.filter.outputs.fuzzing }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -132,6 +109,10 @@ jobs:
               - 'packages/**/tests/integration/**'
               - 'packages/plugins-sinks/**'
               - 'docker-compose.yml'
+            fuzzing:
+              - 'tests/core/test_fuzz.py'
+              - 'tests/core/corpora/**'
+              - 'tests/utils/verification_reporter.py'
 
       - name: Get changed files
         id: changed-files
@@ -152,6 +133,7 @@ jobs:
           echo "Impacted packages: $PLAN"
           echo "matrix=$(echo "$PLAN" | jq -c '.test')" >> "$GITHUB_OUTPUT"
           echo "build_matrix=$(echo "$PLAN" | jq -c '.build')" >> "$GITHUB_OUTPUT"
+          echo "run_quality=$(echo "$PLAN" | jq -r '.quality')" >> "$GITHUB_OUTPUT"
 
   scorecard:
     name: OpenSSF Scorecard
@@ -192,7 +174,8 @@ jobs:
   # ------------------------------------------------------------------
   quality:
     name: Workspace Quality & Security
-    needs: [pre-commit]
+    needs: [plan]
+    if: needs.plan.outputs.run_quality == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -238,7 +221,6 @@ jobs:
 
       - name: Run Quality & Security Checks
         run: |
-          uvx --from "detect-secrets==1.5.0" python scripts/run_secret_scan.py .
           uvx --from "semgrep==1.185.0" semgrep scan --config p/security-audit --metrics off --error packages
           uvx --from "vulture==2.16" vulture packages vulture_whitelist.py --min-confidence 80 --exclude "**/tests/**,**/docs/**,**/scripts/**"
           uvx --from "pylint==4.1.4" pylint --rcfile=pyproject.toml --disable=all --enable=similarities --min-similarity-lines=20 --ignore-paths='.*/tests/.*,.*/docs/.*,.*/scripts/.*,.*/models/.*,tests/.*,docs/.*,scripts/.*,.*\.json$' --ignore-patterns='.*monitor.*,.*integrations.*,.*sinks.*,.*testing.*' packages
@@ -246,11 +228,7 @@ jobs:
 
       - name: Run Canonical Workspace Verification
         run: |
-          uv run ruff format --check .
-          uv run ruff check .
-          uv run typos --force-exclude .
           uv run mypy packages examples tests/typing/endpoint_contracts.py
-          uv run pytest -q --cov=imednet --cov=imednet_workflows --cov=apache_airflow_providers_imednet --cov=imednet_sinks --cov=imednet_tui --cov-fail-under=90
 
       - name: Verify Model Type Stubs
         run: |
@@ -263,8 +241,8 @@ jobs:
   # ------------------------------------------------------------------
   build:
     name: Build Distribution
-    needs: [plan, quality]
-    if: needs.plan.outputs.matrix != '[]'
+    needs: [plan]
+    if: needs.plan.outputs.build_matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -365,7 +343,12 @@ jobs:
   test:
     name: Test ${{ matrix.package }} (Python ${{ matrix.python-version }})
     needs: [plan, build]
-    if: needs.plan.outputs.matrix != '[]'
+    if: >-
+      always() &&
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -440,7 +423,7 @@ jobs:
           IMEDNET_POSTMAN_PATH: ${{ github.workspace }}/imednet.postman_collection.json
         run: |
           if [ "$PACKAGE" = "core" ]; then
-            TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*sinks* --ignore-glob=*tui/* tests/"
+            TEST_ARGS="--ignore-glob=*airflow* --ignore-glob=*workflows* --ignore-glob=*tui/* tests/"
             COV_ARGS="--cov=imednet"
           elif [ "$PACKAGE" = "plugins-workflows" ]; then
             TEST_ARGS="tests/unit/test_workflows*.py tests/integration/test_workflows*.py tests/integration/test_sync_worker_integration.py tests/unit/workflows/ tests/workflows/ tests/unit/test_chunked_pipeline.py tests/unit/cli/ tests/unit/test_config_version_control.py tests/unit/test_duckdb_ingestion_workflow.py tests/unit/test_job_poller.py tests/unit/test_record_mapper.py tests/unit/test_record_mapper_hierarchy.py tests/unit/test_state_ledger.py tests/unit/test_state_ledger_providers.py tests/unit/test_study_structure.py tests/unit/test_sync_worker.py tests/unit/test_cached_records_loader.py tests/unit/test_batch_validation_and_polling.py tests/unit/test_keyed_upserts_and_watermark_recovery.py tests/unit/test_mode_safe_plugin_protocols.py tests/unit/test_tabular_import.py tests/unit/test_airflow_cas_and_wildcards.py tests/unit/test_idempotent_syncs_and_sdtm_lineage.py tests/unit/test_scoped_sdtm_enrichment_standards_contracts.py tests/unit/test_sink_phi_resolution_unification.py tests/unit/test_spi_streaming_checkpoints.py"
@@ -467,7 +450,7 @@ jobs:
   # ------------------------------------------------------------------
   integration-sandbox:
     name: Hermetic Integration Sandbox
-    needs: [plan, build]
+    needs: [plan]
     if: needs.plan.outputs.run_integration == 'true' && needs.plan.outputs.matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
@@ -520,8 +503,8 @@ jobs:
   # ------------------------------------------------------------------
   fuzzing:
     name: Robustness Fuzzing
-    needs: [plan, build]
-    if: needs.plan.outputs.matrix != '[]'
+    needs: [plan]
+    if: needs.plan.outputs.build_matrix != '[]' || needs.plan.outputs.run_fuzzing == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -607,7 +590,7 @@ jobs:
   validate-package-consumption:
     name: Validate Package Consumption
     needs: [plan, build]
-    if: needs.plan.outputs.matrix != '[]'
+    if: needs.plan.outputs.build_matrix != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -655,7 +638,7 @@ jobs:
   # ------------------------------------------------------------------
   docs:
     name: Build Documentation
-    needs: plan
+    needs: [plan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -740,11 +723,40 @@ jobs:
           path: docs/_build/html
 
   # ------------------------------------------------------------------
+  # JOB 4.5: CI GATE (Unconditional Required Status Summary)
+  # ------------------------------------------------------------------
+  ci-gate:
+    name: CI Gate
+    needs:
+      - plan
+      - pre-commit
+      - quality
+      - build
+      - test
+      - integration-sandbox
+      - fuzzing
+      - validate-package-consumption
+      - docs
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Verify Upstream Job Results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS_JSON" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$NEEDS_JSON" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null; then
+            echo "One or more upstream CI jobs failed or were cancelled." >&2
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------
   # JOB 5: DEPLOY DOCS (Only on main push or manual dispatch)
   # ------------------------------------------------------------------
   deploy-docs:
     name: Deploy to GH Pages
-    needs: [plan, pre-commit, test, docs, global-lint, quality]
+    needs: [plan, pre-commit, quality, build, test, docs, ci-gate]
     concurrency:
       group: pages
       cancel-in-progress: false

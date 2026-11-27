@@ -1,4 +1,9 @@
-from scripts.ci_plan import is_ignored_path, parse_dependency_name, plan_ci_impact
+from scripts.ci_plan import (
+    is_ignored_path,
+    is_quality_ignored_path,
+    parse_dependency_name,
+    plan_ci_impact,
+)
 
 
 def test_parse_dependency_name_simple():
@@ -52,8 +57,14 @@ def test_is_ignored_path_exempts_agents_docs_examples_and_markdown():
     assert is_ignored_path("AGENTS.md") is True
     assert is_ignored_path("scripts/setup_agent_harnesses.py") is False
 
+    assert is_quality_ignored_path(".agents/skills/workflow-guide/agents/openai.yaml") is True
+    assert is_quality_ignored_path("docs/agents/issue-tracker.md") is True
+    assert is_quality_ignored_path("AGENTS.md") is True
+    assert is_quality_ignored_path("examples/demo.py") is False
+    assert is_quality_ignored_path("scripts/setup_agent_harnesses.py") is False
 
-def test_plan_ci_impact_skips_packages_for_agents_only_changes():
+
+def test_plan_ci_impact_skips_packages_and_quality_for_docs_agents_and_markdown():
     packages = {
         "core": {"name": "imednet", "deps": []},
         "plugins-workflows": {"name": "imednet-workflows", "deps": ["imednet"]},
@@ -62,11 +73,29 @@ def test_plan_ci_impact_skips_packages_for_agents_only_changes():
         [
             ".agents/skills/triage/SKILL.md",
             ".agents/skills/triage/agents/openai.yaml",
+            "docs/how-to/verification.rst",
             "AGENTS.md",
         ],
         packages,
     )
-    assert result == {"test": [], "build": []}
+    assert result == {"test": [], "build": [], "quality": False}
+
+
+def test_plan_ci_impact_runs_quality_without_building_packages_for_examples():
+    packages = {
+        "core": {"name": "imednet", "deps": []},
+        "plugins-workflows": {"name": "imednet-workflows", "deps": ["imednet"]},
+    }
+    assert plan_ci_impact(["examples/demo.py"], packages) == {
+        "test": [],
+        "build": [],
+        "quality": True,
+    }
+    assert plan_ci_impact(["docs/index.rst", "examples/airflow/dag.py"], packages) == {
+        "test": [],
+        "build": [],
+        "quality": True,
+    }
 
 
 def test_plan_ci_impact_falls_back_on_scripts_and_propagates_core_deps():
@@ -74,13 +103,14 @@ def test_plan_ci_impact_falls_back_on_scripts_and_propagates_core_deps():
         "core": {"name": "imednet", "deps": []},
         "plugins-workflows": {"name": "imednet-workflows", "deps": ["imednet"]},
     }
-    assert set(plan_ci_impact(["scripts/setup_agent_harnesses.py"], packages)["test"]) == {
-        "core",
-        "plugins-workflows",
-    }
+    fallback = plan_ci_impact(["scripts/setup_agent_harnesses.py"], packages)
+    assert set(fallback["test"]) == {"core", "plugins-workflows"}
+    assert fallback["quality"] is True
+
     core_change = plan_ci_impact(["packages/core/src/imednet/client.py"], packages)
     assert core_change["build"] == ["core"]
     assert set(core_change["test"]) == {"core", "plugins-workflows"}
+    assert core_change["quality"] is True
 
 
 def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
@@ -98,6 +128,7 @@ def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
     ) == {
         "build": [],
         "test": ["providers-airflow"],
+        "quality": True,
     }
     assert plan_ci_impact(
         [
@@ -111,6 +142,7 @@ def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
     ) == {
         "build": [],
         "test": ["plugins-workflows"],
+        "quality": True,
     }
     assert plan_ci_impact(
         ["tests/unit/tui/test_app_structure.py", "tests/unit/cli/test_tui_cli.py"],
@@ -118,10 +150,17 @@ def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
     ) == {
         "build": [],
         "test": ["plugins-tui"],
+        "quality": True,
     }
     assert plan_ci_impact(["tests/unit/test_client.py"], packages) == {
         "build": [],
         "test": ["core"],
+        "quality": True,
+    }
+    assert plan_ci_impact(["tests/unit/test_export_sinks_and_schema_caches.py"], packages) == {
+        "build": [],
+        "test": ["core"],
+        "quality": True,
     }
     assert plan_ci_impact(
         [
@@ -138,15 +177,19 @@ def test_plan_ci_impact_maps_top_level_tests_without_building_wheels():
     ) == {
         "build": [],
         "test": ["core", "plugins-workflows"],
+        "quality": True,
     }
     assert plan_ci_impact(["tests/unit/test_airflow_cas_and_wildcards.py"], packages) == {
         "build": [],
         "test": ["plugins-workflows", "providers-airflow"],
+        "quality": True,
     }
     assert plan_ci_impact(["tests/unit/test_sink_phi_resolution_unification.py"], packages) == {
         "build": [],
         "test": ["core", "plugins-sinks", "plugins-workflows"],
+        "quality": True,
     }
     shared_test = plan_ci_impact(["tests/conftest.py"], packages)
     assert shared_test["build"] == []
     assert shared_test["test"] == list(packages.keys())
+    assert shared_test["quality"] is True

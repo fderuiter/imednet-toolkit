@@ -34,7 +34,14 @@ if TYPE_CHECKING:
         SimulationTransport,
         create_simulation_transport,
     )
-    from .utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
+    from .utils.typing import (
+        DataFrameLike,
+        FilterScalar,
+        FilterValue,
+        ItemId,
+        JsonDict,
+        RecordsInput,
+    )
 
     ImednetClient = ImednetSDK
 
@@ -47,6 +54,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "AsyncWorkflowsNamespaceProtocol": ("imednet.plugins", "AsyncWorkflowsNamespaceProtocol"),
     "BaseClient": ("imednet.core.base_client", "BaseClient"),
     "Config": ("imednet.config", "Config"),
+    "DataFrameLike": ("imednet.utils.typing", "DataFrameLike"),
     "DefaultRetryPolicy": ("imednet.core.retry", "DefaultRetryPolicy"),
     "FilterConflictError": ("imednet.errors.orchestration", "FilterConflictError"),
     "FilterScalar": ("imednet.utils.typing", "FilterScalar"),
@@ -104,6 +112,7 @@ __all__ = [
     "AsyncWorkflowsNamespaceProtocol",
     "BaseClient",
     "Config",
+    "DataFrameLike",
     "DefaultRetryPolicy",
     "FilterConflictError",
     "FilterScalar",

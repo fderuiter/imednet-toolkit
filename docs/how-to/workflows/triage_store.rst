@@ -7,6 +7,12 @@ workflows with validated :class:`~imednet.models.triage.TriageStatus`
 transitions (``NEW`` ↔ ``UNDER_REVIEW`` ↔ ``RESOLVED``), reviewer assignments,
 annotations, and immutable transition history.
 
+Default and ``IMEDNET_TRIAGE_DB_PATH`` stores automatically partition SQLite
+files per normalized EDC ``base_url`` origin directory, enforce owner-only
+``0700``/``0600`` permissions on POSIX hosts, and scrub ``Query`` comments,
+annotations, and status transition notes against global and study-configured
+``phi_fields`` sensitivity rules.
+
 Managing a Local Triage Queue
 -----------------------------
 

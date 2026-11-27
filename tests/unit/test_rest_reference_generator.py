@@ -405,12 +405,20 @@ def test_records_post_documents_email_notify_array_framing_and_conditional_ids(
         "subjectOid",
         "intervalName",
         "intervalId",
+        "visitId",
         "recordId",
+        "recordOid",
     )
     for field in conditional_fields:
         pattern = rf"\* - ``{field}``\n\s+- (?:String|Integer)\n\s+- Conditional\n"
         assert re.search(pattern, create_section), (
             f"Expected {field} marked Conditional in records.rst"
+        )
+
+    for opt_field in ("recordStatus", "reasonForChange"):
+        opt_pattern = rf"\* - ``{opt_field}``\n\s+- String\n\s+- Optional\n"
+        assert re.search(opt_pattern, create_section), (
+            f"Expected {opt_field} marked Optional in records.rst"
         )
 
     assert re.search(r"\* - ``data``\n\s+- Object\n\s+- Required\n", create_section)
