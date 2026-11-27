@@ -595,9 +595,19 @@ def test_grid_side_panel_brace_paging_resize_clamping_and_acronym_labels() -> No
     assert tall_max is not None
     assert grid.side_panel_scroll == tall_max
 
-    # Narrow terminal (width < 50 -> panel_width == 0) resolves max_scroll to 0
+    # Narrow terminal (24 <= width < 50) opens full-width detail modal and scrolls cleanly
     win.width = 40
     grid._side_panel_max_scroll = None
+    grid.side_panel_scroll = 0
+    grid._handle_normal_input("}")
+    assert grid._side_panel_max_scroll is not None
+    assert grid._side_panel_max_scroll > 0
+    assert grid.side_panel_scroll == grid._side_panel_max_scroll
+
+    # Below 24 columns (too small for grid or modal) resolves max_scroll to 0
+    win.width = 20
+    grid._side_panel_max_scroll = None
+    grid.side_panel_scroll = 0
     grid._handle_normal_input("}")
     assert grid._side_panel_max_scroll == 0
     assert grid.side_panel_scroll == 0
@@ -1644,3 +1654,347 @@ def test_run_interactive_grid_guards_locale_error() -> None:
     ):
         assert run_interactive_grid(items=items, fields=["ID"]) is True
         mock_wrapper.assert_called_once()
+
+
+def test_grid_clamps_top_idx_after_scrolling_to_100_and_filtering_to_10_matches() -> None:
+    """AC 1 & Req 1: Scrolling to item 100 on 80x24 and filtering to 10 matches renders all 10 without blank leading lines."""
+    win = MockWindow(height=24, width=80)
+    rows = [
+        {
+            "ID": idx + 1,
+            "Subject": f"SUBJ-{idx + 1:03d}",
+            "Tag": "COHORT-TOP" if idx < 10 else ("COHORT-TAIL" if idx >= 90 else "OTHER"),
+        }
+        for idx in range(100)
+    ]
+    grid = InteractiveDataGrid(win, items=rows, fields=["ID", "Subject", "Tag"])
+
+    for _ in range(99):
+        grid._handle_normal_input(curses.KEY_DOWN)
+    grid.draw()
+    assert grid.selected_idx == 99
+    assert grid.top_idx == 80
+
+    for query, expected_first_subj, expected_last_subj in (
+        ("cohort-tail", "SUBJ-091", "SUBJ-100"),
+        ("cohort-top", "SUBJ-001", "SUBJ-010"),
+    ):
+        grid.search_query = ""
+        grid.filter_entries()
+        grid.selected_idx = 99
+        grid.top_idx = 80
+        grid._handle_normal_input("/")
+        for ch in query:
+            grid._handle_search_input(ch)
+        grid._handle_search_input("\n")
+        grid.draw()
+
+        assert len(grid.filtered_entries) == 10
+        assert grid.top_idx == 0
+        row_texts = {
+            y: "".join(text for ry, _, text, _ in win.strings if ry == y) for y in range(3, 13)
+        }
+        assert all(row_texts[y].strip() != "" for y in range(3, 13))
+        assert expected_first_subj in row_texts[3]
+        assert expected_last_subj in row_texts[12]
+
+
+def test_grid_clamps_top_idx_when_terminal_expands_from_80x14_to_80x30() -> None:
+    """AC 2 & Req 1: Expanding from 80x14 to 80x30 at the end of 20 items clamps top_idx to 0 and renders all 20 items."""
+    win = MockWindow(height=14, width=80)
+    rows = [{"ID": idx + 1, "Subject": f"SUBJ-{idx + 1:02d}"} for idx in range(20)]
+    grid = InteractiveDataGrid(win, items=rows, fields=["ID", "Subject"])
+
+    for _ in range(19):
+        grid._handle_normal_input(curses.KEY_DOWN)
+    grid.draw()
+    assert grid.selected_idx == 19
+    assert grid.top_idx == 10
+
+    def _expand_on_resize() -> int | str:
+        if not getattr(_expand_on_resize, "expanded", False):
+            _expand_on_resize.expanded = True  # type: ignore[attr-defined]
+            win.height = 30
+            return curses.KEY_RESIZE
+        return "q"
+
+    win.get_wch = _expand_on_resize  # type: ignore[method-assign]
+    grid.run()
+
+    assert grid.top_idx == 0
+    assert grid.selected_idx == 19
+    rendered_subjects = [
+        "".join(text for ry, _, text, _ in win.strings if ry == y) for y in range(3, 23)
+    ]
+    assert len(rendered_subjects) == 20
+    assert "SUBJ-01" in rendered_subjects[0]
+    assert "SUBJ-20" in rendered_subjects[19]
+
+
+def test_grid_restores_anchored_selection_and_scroll_offset_on_typo_backspace_and_esc() -> None:
+    """AC 3 & Req 2: Deleting a zero-match typo or pressing Esc in '/' search restores anchored selection and scroll offset."""
+    win = MockWindow(height=24, width=80)
+    rows = [
+        {
+            "ID": idx + 1,
+            "Subject": f"SUBJ-{idx:03d}",
+            "Status": "Active" if idx % 2 == 0 else "Pending",
+        }
+        for idx in range(100)
+    ]
+    grid = InteractiveDataGrid(win, items=rows, fields=["ID", "Subject", "Status"])
+
+    # Position at row 55 with custom scroll offset (top_idx=40 -> offset=15)
+    grid.selected_idx = 55
+    grid.top_idx = 40
+    grid.draw()
+    assert grid.selected_idx == 55
+    assert grid.top_idx == 40
+
+    # 1. Narrow to SUBJ-05 (10 matches; SUBJ-055 is match index 5), type typo 'z' -> 0 matches, delete 'z'
+    grid._handle_normal_input("/")
+    for ch in "SUBJ-05":
+        grid._handle_search_input(ch)
+    assert len(grid.filtered_entries) == 10
+    assert grid.selected_idx == 5
+    assert grid.top_idx == 0
+
+    grid._handle_search_input("z")
+    assert len(grid.filtered_entries) == 0
+    assert grid.selected_idx == 0
+    assert grid.top_idx == 0
+
+    grid._handle_search_input(curses.KEY_BACKSPACE)
+    assert grid.search_query == "SUBJ-05"
+    assert len(grid.filtered_entries) == 10
+    assert grid.selected_idx == 5
+    assert grid.top_idx == 0
+
+    # Backspace remaining query -> restores exact unfiltered selection (55) and scroll offset (40)
+    for _ in range(len("SUBJ-05")):
+        grid._handle_search_input(curses.KEY_BACKSPACE)
+    assert grid.search_query == ""
+    assert grid.selected_idx == 55
+    assert grid.top_idx == 40
+    grid._handle_search_input("\n")
+
+    # 2. Press '/' from (55, 40), type zero-match typo, and press Esc inside '/' search
+    grid._handle_normal_input("/")
+    for ch in "zzzz-typo":
+        grid._handle_search_input(ch)
+    assert len(grid.filtered_entries) == 0
+    grid._handle_search_input(27)
+    assert grid.is_searching is False
+    assert grid.search_query == ""
+    assert grid.selected_idx == 55
+    assert grid.top_idx == 40
+
+    # 3. Commit a filter ("Active" -> 50 matches), scroll to (30, 18), type typo in '/', press Esc in '/'
+    grid._handle_normal_input("/")
+    for ch in "Active":
+        grid._handle_search_input(ch)
+    grid._handle_search_input("\n")
+    assert len(grid.filtered_entries) == 50
+    grid.selected_idx = 30
+    grid.top_idx = 18
+    grid._record_manual_anchor(24)
+
+    grid._handle_normal_input("/")
+    for ch in "zzz":
+        grid._handle_search_input(ch)
+    assert len(grid.filtered_entries) == 0
+    grid._handle_search_input("\x1b")
+    assert grid.is_searching is False
+    assert grid.search_query == "Active"
+    assert len(grid.filtered_entries) == 50
+    assert grid.selected_idx == 30
+    assert grid.top_idx == 18
+
+
+def test_grid_48x24_detail_modal_scrolling_resize_esc_and_phi_masking() -> None:
+    """AC 4, Req 3 & Guardrail 3: Space on 48x24 opens full-width detail modal with [/] scrolling, resize adaptation, PHI masking, and two-step Esc."""
+    from imednet.cli.utils.export import mask_cli_records
+    from imednet.cli.utils.output import _display_width
+
+    win = MockWindow(height=24, width=48)
+    raw_vars = {f"VAR_{i:02d}": f"Observation {i}" for i in range(1, 35)}
+    raw_vars["patient_name"] = "Jane Secret Doe"
+    rec = Record.model_construct(
+        record_id=901,
+        study_key="STUDY-MODAL",
+        subject_key="SUBJ-901",
+        form_key="VITALS",
+        record_status="Completed",
+        record_data=raw_vars,
+    )
+    masked_records = mask_cli_records([rec], study_key="STUDY-MODAL", mask_phi=True)
+    rows = [
+        {
+            "ID": 901,
+            "Subject": "SUBJ-901",
+            "Form": "VITALS",
+            "Status": "Completed",
+        }
+    ]
+    grid = InteractiveDataGrid(
+        win,
+        items=rows,
+        fields=["ID", "Subject", "Form", "Status"],
+        label="records",
+        details=masked_records,
+    )
+
+    # Apply a search filter first so second Esc can be verified
+    grid._handle_normal_input("/")
+    for ch in "SUBJ-901":
+        grid._handle_search_input(ch)
+    grid._handle_search_input("\n")
+    assert grid.search_query == "SUBJ-901"
+
+    # Space on 48x24 opens full-width detail modal
+    grid._handle_normal_input(" ")
+    assert grid.side_panel_open is True
+    grid.draw()
+
+    screen_text = "\n".join(text for _, _, text, _ in win.strings)
+    assert "DETAIL MODAL" in screen_text
+    assert "RECORD METADATA" in screen_text
+    assert "FORM VARIABLES" in screen_text
+    assert "Jane Secret Doe" not in screen_text
+    for y, x, text, _ in win.strings:
+        assert x + _display_width(text) <= 48, f"Modal overflowed 48 cols on row {y}: {text!r}"
+
+    # Scroll modal lines with ']', '}', and '[' (revealing masked PHI variable at end of sorted list)
+    assert grid._side_panel_max_scroll is not None and grid._side_panel_max_scroll > 0
+    grid._handle_normal_input("]")
+    grid._handle_normal_input("]")
+    assert grid.side_panel_scroll == 2
+    grid.draw()
+    scrolled_text = "\n".join(text for _, _, text, _ in win.strings)
+    assert "Lines 3-" in scrolled_text
+
+    grid._handle_normal_input("[")
+    assert grid.side_panel_scroll == 1
+
+    grid._handle_normal_input("}")
+    grid._handle_normal_input("}")
+    grid.draw()
+    bottom_text = "\n".join(text for _, _, text, _ in win.strings)
+    assert "***MASKED***" in bottom_text
+    assert "Jane Secret Doe" not in bottom_text
+
+    # Adapt cleanly across resizes: 48x24 (modal) -> 80x24 (side panel) -> 48x24 (modal)
+    win.width = 80
+    grid._side_panel_max_scroll = None
+    grid.draw()
+    wide_text = "\n".join(text for _, _, text, _ in win.strings)
+    assert "[SIDE PANEL]" in wide_text
+    assert "RECORD INSPECTION" in wide_text
+
+    win.width = 48
+    grid._side_panel_max_scroll = None
+    grid.draw()
+    narrow_text = "\n".join(text for _, _, text, _ in win.strings)
+    assert "DETAIL MODAL" in narrow_text
+
+    # First Esc closes modal; search_query stays active
+    grid._handle_normal_input(27)
+    assert grid.side_panel_open is False
+    assert grid.search_query == "SUBJ-901"
+
+    # Second Esc clears search_query
+    grid._handle_normal_input(27)
+    assert grid.search_query == ""
+
+
+def test_grid_lazy_search_index_calls_extract_once_extends_on_load_all_and_fast_on_2000_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC 5, Req 4 & Metric 2: extract_item_details runs <=1 time per Record across 8-char search, extends cache on load_all, and runs <25 ms per repeat keystroke across 2,000 Records."""
+    import time
+
+    import imednet.cli.utils.grid as grid_mod
+
+    real_extract = grid_mod.extract_item_details
+    per_record_calls: dict[int, int] = {}
+
+    def _spy_extract(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        rec_id = getattr(detail, "record_id", id(detail))
+        per_record_calls[rec_id] = per_record_calls.get(rec_id, 0) + 1
+        return real_extract(detail)
+
+    monkeypatch.setattr(grid_mod, "extract_item_details", _spy_extract)
+
+    def _build_record(n: int) -> Record:
+        return Record.model_construct(
+            record_id=n,
+            study_key="S1",
+            subject_key=f"SUBJ-{n:04d}",
+            form_key="AE",
+            record_status="Completed",
+            record_data={
+                "AE_TERM": "hypertension" if n % 25 == 0 else "headache",
+                "SEVERITY": "Moderate",
+                "SITE_CODE": f"SITE-{n % 10}",
+            },
+        )
+
+    initial_records = [_build_record(i) for i in range(1, 101)]
+    more_records = [_build_record(i) for i in range(101, 251)]
+    initial_rows = [
+        {"ID": r.record_id, "Subject": r.subject_key, "Form": r.form_key} for r in initial_records
+    ]
+    more_rows = [
+        {"ID": r.record_id, "Subject": r.subject_key, "Form": r.form_key} for r in more_records
+    ]
+
+    win = MockWindow(height=24, width=80)
+    grid = InteractiveDataGrid(
+        win,
+        items=initial_rows,
+        fields=["ID", "Subject", "Form"],
+        label="records",
+        details=initial_records,
+        truncated=True,
+        on_load_all=lambda: (more_rows, more_records),
+    )
+
+    assert per_record_calls == {}
+    grid._handle_normal_input("/")
+    for ch in "hypertns":  # 8-character search
+        grid._handle_search_input(ch)
+
+    assert len(per_record_calls) == 100
+    assert max(per_record_calls.values()) == 1
+
+    # Extend cache on action_load_all without re-extracting initial 100 records
+    grid.search_query = "hypertension"
+    grid.action_load_all()
+    assert len(grid.all_entries) == 250
+    assert len(grid._search_cache) == 250
+    assert len(per_record_calls) == 250
+    assert max(per_record_calls.values()) == 1
+    assert len(grid.filtered_entries) == 10
+
+    # Latency verification across 2,000 Record items (< 25 ms per repeat keystroke)
+    monkeypatch.setattr(grid_mod, "extract_item_details", real_extract)
+    records_2k = [_build_record(i) for i in range(1, 2001)]
+    rows_2k = [
+        {"ID": r.record_id, "Subject": r.subject_key, "Form": r.form_key} for r in records_2k
+    ]
+    grid_2k = InteractiveDataGrid(
+        win,
+        items=rows_2k,
+        fields=["ID", "Subject", "Form"],
+        label="records",
+        details=records_2k,
+    )
+    grid_2k._handle_normal_input("/")
+    grid_2k._handle_search_input("h")  # initial lazy index build
+
+    for ch in "ypertension":
+        t0 = time.perf_counter()
+        grid_2k._handle_search_input(ch)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        assert elapsed_ms < 25.0, f"Keystroke {ch!r} took {elapsed_ms:.2f} ms (>= 25 ms)"
+    assert len(grid_2k.filtered_entries) == 80

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import io
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -660,9 +663,85 @@ def _colorize(text: str, color: str) -> str:
     return f"{_ANSI_COLORS.get(resolved_color, '')}{text}{_ANSI_COLORS['reset']}"
 
 
-def _print_table(items: Sequence[Any], fields: list[str]) -> None:
-    if not items:
+def _is_broken_pipe_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` represents a closed downstream stdout/stderr pipe."""
+    return isinstance(exc, BrokenPipeError) or (
+        isinstance(exc, OSError) and exc.errno == errno.EPIPE
+    )
+
+
+def _silence_broken_pipe(stream: Any = None) -> None:
+    """Redirect a broken pipe descriptor to devnull so CPython shutdown flushes cleanly."""
+    target = sys.stdout if stream is None else stream
+    if target is None:
         return
+    with contextlib.suppress(AttributeError, OSError, io.UnsupportedOperation, ValueError):
+        fileno_fn = getattr(target, "fileno", None)
+        if callable(fileno_fn):
+            fd = fileno_fn()
+            if type(fd) is int and fd >= 0:
+                st_mode = os.fstat(fd).st_mode
+                if stat.S_ISFIFO(st_mode) or stat.S_ISSOCK(st_mode):
+                    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+                    try:
+                        os.dup2(devnull_fd, fd)
+                    finally:
+                        os.close(devnull_fd)
+    with contextlib.suppress(Exception):
+        flush_fn = getattr(target, "flush", None)
+        if callable(flush_fn):
+            flush_fn()
+
+
+def flush_stdout(stream: Any = None) -> bool:
+    """Flush ``stdout`` safely, suppressing broken-pipe disconnects.
+
+    Returns:
+        True when flushed normally, False when downstream closed the pipe early.
+    """
+    target = sys.stdout if stream is None else stream
+    if target is None:
+        return True
+    try:
+        flush_fn = getattr(target, "flush", None)
+        if callable(flush_fn):
+            flush_fn()
+        return True
+    except BaseException as exc:
+        if _is_broken_pipe_error(exc):
+            _silence_broken_pipe(target)
+            return False
+        if isinstance(exc, OSError):
+            return False
+        raise
+
+
+def write_stdout(
+    text: str = "",
+    *,
+    end: str = "\n",
+    stream: Any = None,
+    flush: bool = False,
+) -> bool:
+    """Write ``text`` to ``stdout`` safely, suppressing broken-pipe disconnects.
+
+    Returns:
+        True when written normally, False when downstream closed the pipe early.
+    """
+    target = sys.stdout if stream is None else stream
+    try:
+        print(text, end=end, file=target, flush=flush)
+        return True
+    except BaseException as exc:
+        if _is_broken_pipe_error(exc):
+            _silence_broken_pipe(target)
+            return False
+        raise
+
+
+def _print_table(items: Sequence[Any], fields: list[str]) -> bool:
+    if not items:
+        return True
 
     headers = [_format_header_label(header) for header in fields]
 
@@ -683,8 +762,10 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
             col_widths[i] = max(col_widths[i], _display_width(cell))
 
     header_str = " | ".join(_pad_display_width(h, w) for h, w in zip(headers, col_widths))  # noqa: B905
-    print(_colorize(header_str, "bold_magenta"))
-    print("-" * _display_width(header_str))
+    if not write_stdout(_colorize(header_str, "bold_magenta")):
+        return False
+    if not write_stdout("-" * _display_width(header_str)):
+        return False
 
     is_hc = os.environ.get("IMEDNET_HIGH_CONTRAST") == "1"
 
@@ -703,7 +784,9 @@ def _print_table(items: Sequence[Any], fields: list[str]) -> None:
                 if color:
                     c = _colorize(cell, color)
             colored_row.append(c + " " * max(0, col_widths[i] - _display_width(cell)))
-        print(" | ".join(colored_row))
+        if not write_stdout(" | ".join(colored_row)):
+            return False
+    return True
 
 
 def _project_item_to_row(
@@ -738,6 +821,7 @@ def display_list(
     truncated: bool = False,
     status_notice: str | None = None,
     on_load_all: Callable[[], Any] | None = None,
+    drain_on_fallback: bool = True,
 ) -> None:
     """Display a human table or one versioned JSON response without progress text."""
     from .args import resolve_output_format
@@ -749,7 +833,8 @@ def display_list(
     if resolved_format != "table":
         raise ValueError("Unsupported output format")
     if not items:
-        print(empty_msg or f"No {label} found.")
+        if write_stdout(empty_msg or f"No {label} found."):
+            flush_stdout()
         return
 
     effective_notice = status_notice or (
@@ -773,11 +858,32 @@ def display_list(
             data_list = list(items)
 
         if not data_list:
-            print(f"Found {len(items)} {label}:")
-            print(items)
+            if write_stdout(f"Found {len(items)} {label}:") and write_stdout(str(items)):
+                flush_stdout()
             return
 
         field_keys = list(data_list[0].keys())
+
+    def _drain_remaining() -> tuple[list[dict[str, Any]], list[Any], list[Any]]:
+        assert on_load_all is not None
+        loaded = on_load_all()
+        if (
+            isinstance(loaded, tuple)
+            and len(loaded) == 2
+            and not isinstance(loaded[0], (str, bytes, dict))
+        ):
+            raw_rows, raw_details = loaded
+            more_rows = list(raw_rows)
+            projected = [
+                _project_item_to_row(r, field_keys, explicit_fields=explicit_fields)
+                for r in more_rows
+            ]
+            return projected, list(raw_details), more_rows
+        raw_items = list(loaded) if loaded is not None else []
+        projected_items = [
+            _project_item_to_row(r, field_keys, explicit_fields=explicit_fields) for r in raw_items
+        ]
+        return projected_items, raw_items, raw_items
 
     # Launch interactive data grid if connected to an active terminal
     try:
@@ -811,35 +917,27 @@ def display_list(
         if on_load_all is not None:
 
             def _wrapped_load_all() -> tuple[list[dict[str, Any]], list[Any]]:
-                loaded = on_load_all()
-                if (
-                    isinstance(loaded, tuple)
-                    and len(loaded) == 2
-                    and not isinstance(loaded[0], (str, bytes, dict))
-                ):
-                    raw_rows, raw_details = loaded
-                    projected = [
-                        _project_item_to_row(r, field_keys, explicit_fields=explicit_fields)
-                        for r in raw_rows
-                    ]
-                    return projected, list(raw_details)
-                raw_items = list(loaded)
-                projected_items = [
-                    _project_item_to_row(r, field_keys, explicit_fields=explicit_fields)
-                    for r in raw_items
-                ]
-                return projected_items, raw_items
+                projected_more, details_more, _ = _drain_remaining()
+                return projected_more, details_more
 
             grid_kwargs["on_load_all"] = _wrapped_load_all
         grid_ran = run_interactive_grid(**grid_kwargs)
         if grid_ran:
             return
+        if truncated and drain_on_fallback and on_load_all is not None:
+            projected_more, _, more_table_items = _drain_remaining()
+            items = [*items, *more_table_items]
+            data_list.extend(projected_more)
+            effective_notice = status_notice
 
     # Non-interactive / piped fallback: emit standard ASCII table
-    print(f"Found {len(items)} {label}:")
-    _print_table(items if fields else data_list, field_keys)
-    if effective_notice:
-        print(f"Notice: {effective_notice}")
+    if not write_stdout(f"Found {len(items)} {label}:"):
+        return
+    if not _print_table(items if fields else data_list, field_keys):
+        return
+    if effective_notice and not write_stdout(f"Notice: {effective_notice}"):
+        return
+    flush_stdout()
 
 
 def print_error(
@@ -889,4 +987,5 @@ def emit_json(items: Sequence[Any], resource: str, *, status: str = "complete") 
     }
     # Serialize before the first byte is emitted: failures cannot create partial JSON.
     rendered = json.dumps(envelope, default=_json_default, ensure_ascii=False, allow_nan=False)
-    print(rendered)
+    if write_stdout(rendered):
+        flush_stdout()
