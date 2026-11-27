@@ -511,7 +511,7 @@ class SyncSDKConvenienceMixin:
         """Create records in the specified study."""
         from imednet.utils.tabular import normalize_records_input
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         if skip_validation:
             return self.records.create(
                 study_key,
@@ -700,7 +700,7 @@ class AsyncSDKConvenienceMixin:
         """Asynchronously create records in the specified study."""
         from imednet.utils.tabular import normalize_records_input
 
-        normalized = normalize_records_input(records_data, schema=schema)
+        normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
         if skip_validation:
             return await self.records.create(
                 study_key,

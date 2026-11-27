@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any
 
 from pydantic import (
+    ConfigDict,
     Field,
     RootModel,
     SerializerFunctionWrapHandler,
@@ -214,17 +215,105 @@ class RecordData(RootModel[dict[str, Any]]):
 class BaseRecordRequest(ImednetBaseModel):
     """Base class for record creation/update requests."""
 
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        str_strip_whitespace=True,
+        hide_input_in_errors=True,
+    )
+
     form_key: str = Field("", alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
+    site_name: str = Field("", alias="siteName")
+    site_id: int | None = Field(default=None, alias="siteId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    interval_name: str = Field("", alias="intervalName")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    visit_id: int | None = Field(default=None, alias="visitId")
+    record_id: int | None = Field(default=None, alias="recordId")
+    record_oid: str | None = Field(default=None, alias="recordOid")
+    record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
+    reason_for_change: str | None = Field(default=None, alias="reasonForChange")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
+
+    @field_validator("subject_oid", "record_oid", "reason_for_change", mode="before")
+    @classmethod
+    def _normalize_optional_request_text(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator("subject_key", mode="before")
+    @classmethod
+    def _normalize_base_subject_key(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @field_validator("record_status", mode="before")
+    @classmethod
+    def _normalize_optional_record_status(cls, value: Any) -> RecordStatus | str | None:
+        if value is None:
+            return None
+        if isinstance(value, RecordStatus):
+            return value
+        if isinstance(value, Enum):
+            return str(value.value)
+        text = str(value).strip()
+        if not text:
+            return None
+        return coerce_status(RecordStatus, text)
+
+    @model_serializer(mode="wrap")
+    def _serialize_record_request(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        serialized: dict[str, Any] = handler(self)
+        for key in list(serialized):
+            val = serialized[key]
+            if val is None:
+                serialized.pop(key, None)
+            elif isinstance(val, Enum):
+                serialized[key] = str(val.value)
+        if not self.form_key and (
+            self.form_id is not None or self.record_id is not None or self.record_oid is not None
+        ):
+            serialized.pop("form_key", None)
+            serialized.pop("formKey", None)
+        if not self.site_name and (
+            self.site_id is not None or not isinstance(self, RegisterSubjectRequest)
+        ):
+            serialized.pop("site_name", None)
+            serialized.pop("siteName", None)
+        if self.subject_key == "" and (self.subject_id is not None or self.subject_oid is not None):
+            serialized.pop("subject_key", None)
+            serialized.pop("subjectKey", None)
+        if not self.interval_name and (
+            self.interval_id is not None
+            or self.visit_id is not None
+            or not isinstance(self, UpdateScheduledRecordRequest)
+        ):
+            serialized.pop("interval_name", None)
+            serialized.pop("intervalName", None)
+        return serialized
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        """Serialize record request payload to canonical ``camelCase`` excluding ``None``."""
+        kwargs.setdefault("by_alias", True)
+        kwargs.setdefault("exclude_none", True)
+        return super().model_dump(**kwargs)
 
 
 class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
-    ``None`` so server-assigned subject keys continue working by default; when
-    explicitly supplied, they are preserved for enrollment and deduplication.
+    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or
+    ``siteId``). Optional ``subjectKey`` and ``subjectOid`` attributes are
+    omitted when ``None`` so server-assigned subject keys continue working by
+    default; when explicitly supplied, they are preserved for enrollment and
+    deduplication.
     """
 
     site_name: str = Field(
@@ -240,66 +329,29 @@ class RegisterSubjectRequest(BaseRecordRequest):
         alias="subjectKey",
         description="Optional client-assigned subject key",
     )
-    subject_oid: str | None = Field(
-        default=None,
-        alias="subjectOid",
-        description="Optional subject OID",
-    )
-
-    @field_validator("subject_key", "subject_oid", mode="before")
-    @classmethod
-    def _normalize_optional_subject_identifier(cls, value: Any) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_enrollment_fields(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
-        serialized: dict[str, Any] = handler(self)
-        if self.site_id is None:
-            serialized.pop("site_id", None)
-            serialized.pop("siteId", None)
-        elif not self.site_name:
-            serialized.pop("site_name", None)
-            serialized.pop("siteName", None)
-        if self.subject_key is None:
-            serialized.pop("subject_key", None)
-            serialized.pop("subjectKey", None)
-        if self.subject_oid is None:
-            serialized.pop("subject_oid", None)
-            serialized.pop("subjectOid", None)
-        return serialized
-
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        """Serialize enrollment payload, omitting ``None`` optional attributes by default."""
-        kwargs.setdefault("exclude_none", True)
-        if not self.site_name and self.site_id is not None:
-            raw_exclude = kwargs.get("exclude")
-            if raw_exclude is None:
-                kwargs["exclude"] = {"site_name"}
-            elif isinstance(raw_exclude, set):
-                kwargs["exclude"] = raw_exclude | {"site_name"}
-            elif isinstance(raw_exclude, dict):
-                merged = dict(raw_exclude)
-                merged["site_name"] = True
-                kwargs["exclude"] = merged
-        return super().model_dump(**kwargs)
 
 
 class UpdateScheduledRecordRequest(BaseRecordRequest):
     """Payload for updating an existing scheduled record."""
 
-    subject_key: str = Field("", alias="subjectKey")
+    subject_key: str = Field("", alias="subjectKey")  # type: ignore[assignment]
     interval_name: str = Field("", alias="intervalName")
+
+    @field_validator("subject_key", mode="before")
+    @classmethod
+    def _normalize_required_subject_key(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
 
 
 class CreateNewRecordRequest(BaseRecordRequest):
     """Payload for creating a new unscheduled record."""
 
-    subject_key: str = Field("", alias="subjectKey")
+    subject_key: str = Field("", alias="subjectKey")  # type: ignore[assignment]
+
+    @field_validator("subject_key", mode="before")
+    @classmethod
+    def _normalize_required_subject_key(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
 
 
 __all__ = [

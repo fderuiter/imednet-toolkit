@@ -6,14 +6,16 @@ Encapsulates validation, header construction, and execution logic for record cre
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
+
+from pydantic import BaseModel
 
 from imednet.constants import HEADER_EMAIL_NOTIFY
 from imednet.core.endpoint.dispatch import Operation
 from imednet.core.protocols import AsyncRequesterProtocol, RequesterProtocol
 from imednet.utils.security import validate_header_value
-from imednet.utils.tabular import ensure_no_masked_sentinel
+from imednet.utils.tabular import normalize_record_sequence
 from imednet.validation.cache import (
     ValidationSchemaProtocol,
     is_schema_record_prevalidated,
@@ -40,7 +42,7 @@ class RecordCreateOperation(Operation[T]):
     def __init__(
         self,
         path: str,
-        records_data: list[dict[str, Any]],
+        records_data: Sequence[BaseModel | Mapping[str, Any]],
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
         *,
@@ -51,7 +53,7 @@ class RecordCreateOperation(Operation[T]):
 
         Args:
             path: The full API path for the request.
-            records_data: List of record data objects to create.
+            records_data: Sequence of record models or mappings to create/update.
             email_notify: Email notification setting.
             schema: Optional validation schema (BaseSchemaCache or DataDictionary).
             study_key: Optional study key used for study-partitioned schema lookup.
@@ -59,34 +61,47 @@ class RecordCreateOperation(Operation[T]):
                 the caller has already validated the batch.
 
         Raises:
-            ValidationError: If record data is invalid against the schema.
+            ValidationError: If record data is invalid against the schema or contains
+                masked PHI sentinels.
             ClientError: If email_notify contains invalid characters.
         """
         self.path = path
-        self.records_data = records_data
+        raw_items = list(records_data)
+        self.records_data: list[dict[str, Any]] = normalize_record_sequence(
+            raw_items, convert_record_data_alias=True
+        )
         self.email_notify = email_notify
         self.schema = schema
         self.study_key = study_key if study_key is not None else _infer_study_key_from_path(path)
         self.skip_validation = skip_validation
 
-        ensure_no_masked_sentinel(self.records_data)
-        self._validate()
+        self._validate(raw_items)
         self.headers = self._build_headers()
 
-    def _validate(self) -> None:
+    def _validate(self, raw_items: Sequence[Any] | None = None) -> None:
         """Validate records against schema if provided and not already validated."""
         if self.skip_validation or self.schema is None:
             return
+        source_items = raw_items if raw_items is not None else self.records_data
         is_rec_prevalidated = getattr(self.schema, "is_record_prevalidated", None)
         if callable(is_rec_prevalidated):
-            for rec in self.records_data:
-                if is_rec_prevalidated(rec) is not True:
+            for raw_rec, rec in zip(source_items, self.records_data, strict=False):
+                if (
+                    is_rec_prevalidated(rec) is not True
+                    and is_rec_prevalidated(raw_rec) is not True
+                ):
                     validate_record_entry(self.schema, rec, study_key=self.study_key)
             return
         if getattr(self.schema, "is_prevalidated", False) is True:
             return
-        for rec in self.records_data:
-            if not is_schema_record_prevalidated(self.schema, rec):
+        for raw_rec, rec in zip(source_items, self.records_data, strict=False):
+            if not (
+                is_schema_record_prevalidated(self.schema, rec)
+                or (
+                    isinstance(raw_rec, dict)
+                    and is_schema_record_prevalidated(self.schema, raw_rec)
+                )
+            ):
                 validate_record_entry(self.schema, rec, study_key=self.study_key)
 
     def _build_headers(self) -> dict[str, str]:

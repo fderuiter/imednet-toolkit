@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from imednet.core.context import get_study_context, sdk_governance_context
 from imednet.core.endpoint.edc_mixin import EdcAsyncListEndpoint, EdcSyncListEndpoint
 from imednet.core.endpoint.structs import ParamState
 from imednet.core.protocols import ParamProcessor
@@ -134,12 +135,15 @@ class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: igno
     def to_dataframe(
         self,
         study_key: str | None = None,
+        *,
+        mask_phi: bool = True,
         **filters: Any,
     ) -> pd.DataFrame:
         """Export queried users directly to a pandas DataFrame.
 
         Args:
             study_key: Optional study key override.
+            mask_phi: Whether to mask sensitive PHI fields by default.
             **filters: Resource filters passed to :meth:`list`.
 
         Returns:
@@ -151,8 +155,10 @@ class UsersEndpoint(UsersOperationDef, EdcSyncListEndpoint[User]):  # type: igno
         from imednet.utils.pandas import check_pandas, users_to_dataframe
 
         check_pandas("users_to_dataframe")
-        users = list(self.list(study_key=study_key, **filters))
-        return users_to_dataframe(users)
+        with sdk_governance_context(self):
+            resolved_study_key = study_key or get_study_context()
+            users = list(self.list(study_key=study_key, **filters))
+            return users_to_dataframe(users, mask_phi=mask_phi, study_key=resolved_study_key)
 
 
 class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type: ignore[misc]
@@ -161,12 +167,15 @@ class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type
     async def to_dataframe(
         self,
         study_key: str | None = None,
+        *,
+        mask_phi: bool = True,
         **filters: Any,
     ) -> pd.DataFrame:
         """Export queried users asynchronously directly to a pandas DataFrame.
 
         Args:
             study_key: Optional study key override.
+            mask_phi: Whether to mask sensitive PHI fields by default.
             **filters: Resource filters passed to :meth:`list`.
 
         Returns:
@@ -178,5 +187,7 @@ class AsyncUsersEndpoint(UsersOperationDef, EdcAsyncListEndpoint[User]):  # type
         from imednet.utils.pandas import check_pandas, users_to_dataframe
 
         check_pandas("users_to_dataframe")
-        users = [user async for user in self.list(study_key=study_key, **filters)]
-        return users_to_dataframe(users)
+        with sdk_governance_context(self):
+            resolved_study_key = study_key or get_study_context()
+            users = [user async for user in self.list(study_key=study_key, **filters)]
+            return users_to_dataframe(users, mask_phi=mask_phi, study_key=resolved_study_key)
