@@ -55,8 +55,8 @@ class SubjectKeyword(ImednetBaseModel):
 
     keyword_name: str = Field("", alias="keywordName")
     keyword_key: str = Field("", alias="keywordKey")
-    keyword_id: int = Field(0, alias="keywordId")
-    date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
+    keyword_id: int | None = Field(default=None, alias="keywordId")
+    date_added: datetime | None = Field(default=None, alias="dateAdded")
 
     def __init__(
         self,
@@ -65,16 +65,18 @@ class SubjectKeyword(ImednetBaseModel):
         keywordName: str = "",
         keyword_key: str = "",
         keywordKey: str = "",
-        keyword_id: int = 0,
-        keywordId: int = 0,
-        date_added: datetime = ...,
-        dateAdded: datetime = ...,
+        keyword_id: int | None = None,
+        keywordId: int | None = None,
+        date_added: datetime | None = None,
+        dateAdded: datetime | None = None,
     ) -> None: ...
 
 class Subject(ImednetBaseModel):
     """A subject (participant) in a study, with status and site info."""
 
-    keywords: list[SubjectKeyword] = Field(default_factory=list, alias="keywords")
+    keywords: list[SubjectKeyword] | None = Field(
+        default_factory=list[SubjectKeyword], alias="keywords"
+    )
     subject_status: SubjectStatus | str | None = Field(default=None, alias="subjectStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
     study_key: str | None = Field(default=None, alias="studyKey")
@@ -91,7 +93,7 @@ class Subject(ImednetBaseModel):
     def __init__(
         self,
         *,
-        keywords: list[SubjectKeyword] = ...,
+        keywords: list[SubjectKeyword] | None = ...,
         subject_status: SubjectStatus | str | None = None,
         subjectStatus: SubjectStatus | str | None = None,
         deleted: bool | None = None,

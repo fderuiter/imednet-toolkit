@@ -310,3 +310,123 @@ async def test_paginator_and_async_paginator_limit_1000_spans_multiple_500_item_
     assert len(async_client.calls) == 2
     assert async_client.calls[0]["params"] == {"page": 0, "size": 500}
     assert async_client.calls[1]["params"] == {"page": 1, "size": 500}
+
+
+@pytest.mark.asyncio
+async def test_nested_multi_page_iterators_and_list_operation_has_more() -> None:
+    """PaginatorCursorState isolates nested multi-page iterators and preserves pre/post cursor None."""
+    import inspect
+
+    from imednet.core.async_client import AsyncClient
+    from imednet.core.client import Client
+    from imednet.core.endpoint.operations.list import ListOperation
+    from imednet.core.operations.circuit_breaker import CircuitBreaker, ProbeLease
+    from imednet.core.paginator import PaginatorCursorState
+    from imednet.sdk import AsyncImednetSDK, ImednetSDK
+
+    state = PaginatorCursorState()
+    assert state.cursor is None
+    assert state.has_more is True
+
+    class PageTableClient:
+        def get(self, path: str, params: dict[str, Any] | None = None):
+            page = (params or {}).get("page", 0)
+            pages = {
+                0: {"data": [1, 2], "pagination": {"totalPages": 2}},
+                1: {"data": [3], "pagination": {"totalPages": 2}},
+            }
+            payload = pages[page]
+            return type("Resp", (), {"json": lambda self: payload})()
+
+    class AsyncPageTableClient:
+        async def get(self, path: str, params: dict[str, Any] | None = None):
+            page = (params or {}).get("page", 0)
+            pages = {
+                0: {"data": [1, 2], "pagination": {"totalPages": 2}},
+                1: {"data": [3], "pagination": {"totalPages": 2}},
+            }
+            payload = pages[page]
+            return type("Resp", (), {"json": lambda self: payload})()
+
+    paginator = Paginator(PageTableClient(), "/p", page_size=2)  # type: ignore[arg-type]
+    assert paginator.cursor is None
+    assert paginator.has_more is True
+
+    pairs = [(a, b) for a in paginator for b in paginator]
+    expected_pairs = [(a, b) for a in (1, 2, 3) for b in (1, 2, 3)]
+    assert pairs == expected_pairs
+    assert paginator.cursor is None
+    assert paginator.has_more is False
+
+    async_paginator = AsyncPaginator(AsyncPageTableClient(), "/p", page_size=2)  # type: ignore[arg-type]
+    assert async_paginator.cursor is None
+    assert async_paginator.has_more is True
+    async_pairs: list[tuple[int, int]] = []
+    async for a in async_paginator:
+        async for b in async_paginator:
+            async_pairs.append((a, b))
+    assert async_pairs == expected_pairs
+    assert async_paginator.cursor is None
+    assert async_paginator.has_more is False
+
+    # Verify ListOperation _PaginatedIterator & _AsyncPaginatedIterator pre-start has_more and isolated cursors
+    from imednet.core.endpoint.operations.list import _PaginatedIterator
+
+    op = ListOperation(path="/p", params={}, page_size=2, parse_func=lambda x: x * 10)
+    sync_it_1 = op.execute_sync(PageTableClient(), Paginator)  # type: ignore[arg-type]
+    sync_it_2 = _PaginatedIterator(sync_it_1._paginator, lambda x: x * 10)  # type: ignore[attr-defined]
+    assert sync_it_1.has_more is True  # type: ignore[attr-defined]
+    assert sync_it_1.cursor is None  # type: ignore[attr-defined]
+    assert next(sync_it_1) == 10
+    assert sync_it_1.cursor == 1  # type: ignore[attr-defined]
+    assert list(sync_it_2) == [10, 20, 30]
+    assert sync_it_2.has_more is False
+    assert sync_it_1.has_more is True  # type: ignore[attr-defined]
+    assert list(sync_it_1) == [20, 30]
+    assert sync_it_1.has_more is False  # type: ignore[attr-defined]
+    assert sync_it_1.cursor is None  # type: ignore[attr-defined]
+
+    async_it = op.execute_async(AsyncPageTableClient(), AsyncPaginator)  # type: ignore[arg-type]
+    assert async_it.has_more is True  # type: ignore[attr-defined]
+    assert async_it.cursor is None  # type: ignore[attr-defined]
+    assert [x async for x in async_it] == [10, 20, 30]
+    assert async_it.has_more is False  # type: ignore[attr-defined]
+    assert async_it.cursor is None  # type: ignore[attr-defined]
+
+    # Guardrail: public __init__ signatures preserved
+    assert list(inspect.signature(Paginator.__init__).parameters) == [
+        "self",
+        "client",
+        "path",
+        "params",
+        "page_size",
+        "page_param",
+        "size_param",
+        "data_key",
+        "metadata_key",
+    ]
+    assert list(inspect.signature(AsyncPaginator.__init__).parameters) == [
+        "self",
+        "client",
+        "path",
+        "params",
+        "page_size",
+        "page_param",
+        "size_param",
+        "data_key",
+        "metadata_key",
+    ]
+    assert list(inspect.signature(CircuitBreaker.__init__).parameters) == [
+        "self",
+        "failure_threshold",
+        "recovery_timeout",
+        "half_open_max_probes",
+    ]
+    assert list(inspect.signature(ProbeLease.__init__).parameters) == [
+        "self",
+        "breaker",
+        "epoch",
+        "is_probe",
+    ]
+    for public_cls in (ImednetSDK, AsyncImednetSDK, Client, AsyncClient):
+        assert "api_key" in inspect.signature(public_cls.__init__).parameters

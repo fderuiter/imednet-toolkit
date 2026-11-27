@@ -18,7 +18,8 @@ from tenacity import (
 
 from imednet.core.operations.circuit_breaker import (
     CircuitBreaker,
-    ProbeLease,
+    CircuitBreakerError,
+    CircuitState,
     get_global_circuit_breaker,
 )
 from imednet.core.operations.monitor import OperationMonitor
@@ -124,14 +125,26 @@ class UniversalExecutor:
                 return True
         return True
 
+    def _effective_wait_strategy(self, retry_state: RetryCallState) -> float:
+        """Skip backoff sleep immediately when the circuit breaker is OPEN."""
+        if self.circuit_breaker.state is CircuitState.OPEN:
+            return 0.0
+        return float(self.wait_strategy(retry_state))
+
+    def _effective_retry_predicate(self, retry_state: RetryCallState) -> bool:
+        """Never retry CircuitBreakerError; delegate other failures to retry_predicate."""
+        if retry_state.outcome and retry_state.outcome.failed:
+            exc = retry_state.outcome.exception()
+            if isinstance(exc, CircuitBreakerError):
+                return False
+        return bool(self.retry_predicate(retry_state))
+
     def _handle_retry_exhausted(
         self,
         error: RetryError,
-        lease: ProbeLease,
         monitor: OperationMonitor,
     ) -> NoReturn:
-        """Record breaker failure and escalate the underlying cause after retry exhaustion."""
-        lease.record_failure()
+        """Escalate the underlying cause after retry exhaustion."""
         cause = error.last_attempt.exception() if error.last_attempt else error
         if isinstance(cause, Exception):
             try:
@@ -143,66 +156,88 @@ class UniversalExecutor:
             raise cause
         raise error
 
-    def _handle_unretried_exception(
-        self,
-        error: Exception,
-        lease: ProbeLease,
+    @staticmethod
+    def _handle_breaker_aborted(
+        attempts: int,
+        last_exc: Exception | None,
         monitor: OperationMonitor,
-    ) -> None:
-        """Record breaker failure only when retriable, and notify operation telemetry."""
-        if self._should_record_failure(error):
-            lease.record_failure()
-        monitor.on_failure(error)
+    ) -> NoReturn:
+        """Re-raise pre-flight CircuitBreakerError or escalate the prior failed attempt."""
+        if attempts > 0 and last_exc is not None:
+            if attempts > 1:
+                monitor.on_retry_error(last_exc, attempts - 1)
+            monitor.on_failure(last_exc)
+            raise last_exc
+        raise
 
     def execute(self, func: Callable[[], T]) -> T:
         """Synchronous execution."""
         retryer = self.retry_config.create_retryer(
-            wait_strategy=self.wait_strategy,
-            retry_predicate=self.retry_predicate,
+            wait_strategy=self._effective_wait_strategy,
+            retry_predicate=self._effective_retry_predicate,
         )
+        attempts = 0
+        last_exc: Exception | None = None
 
-        with (
-            self.circuit_breaker.acquire() as lease,
-            OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor,
-        ):
-            try:
-                result: Any = retryer(func)
+        def _run_attempt() -> T:
+            nonlocal attempts, last_exc
+            with self.circuit_breaker.acquire() as lease:
+                attempts += 1
+                try:
+                    result = func()
+                except Exception as err:
+                    last_exc = err
+                    if self._should_record_failure(err):
+                        lease.record_failure()
+                    raise
                 lease.record_success()
+                return result
+
+        with OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor:
+            try:
+                result: Any = retryer(_run_attempt)
                 monitor.on_success()
                 return result  # type: ignore[no-any-return]
             except RetryError as err:
-                self._handle_retry_exhausted(err, lease, monitor)
+                self._handle_retry_exhausted(err, monitor)
+            except CircuitBreakerError:
+                self._handle_breaker_aborted(attempts, last_exc, monitor)
             except Exception as err:
-                self._handle_unretried_exception(err, lease, monitor)
+                monitor.on_failure(err)
                 raise
 
     async def execute_async(self, func: Callable[[], Awaitable[T]]) -> T:
         """Asynchronous execution."""
         retryer = self.retry_config.create_async_retryer(
-            wait_strategy=self.wait_strategy,
-            retry_predicate=self.retry_predicate,
+            wait_strategy=self._effective_wait_strategy,
+            retry_predicate=self._effective_retry_predicate,
         )
+        attempts = 0
+        last_exc: Exception | None = None
 
-        async with (
-            self.circuit_breaker.acquire() as lease,
-            OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor,
-        ):
-            try:
-
-                async def _async_wrapper() -> T:
-                    """Wrapper to await the function.
-
-                    Returns:
-                        T: Result of the operation.
-                    """
-                    return await func()
-
-                result: Any = await retryer(_async_wrapper)
+        async def _run_attempt() -> T:
+            nonlocal attempts, last_exc
+            async with self.circuit_breaker.acquire() as lease:
+                attempts += 1
+                try:
+                    result = await func()
+                except Exception as err:
+                    last_exc = err
+                    if self._should_record_failure(err):
+                        lease.record_failure()
+                    raise
                 lease.record_success()
+                return result
+
+        async with OperationMonitor(self.tracer, self.operation_name, **self.attributes) as monitor:
+            try:
+                result: Any = await retryer(_run_attempt)
                 monitor.on_success()
                 return result  # type: ignore[no-any-return]
             except RetryError as err:
-                self._handle_retry_exhausted(err, lease, monitor)
+                self._handle_retry_exhausted(err, monitor)
+            except CircuitBreakerError:
+                self._handle_breaker_aborted(attempts, last_exc, monitor)
             except Exception as err:
-                self._handle_unretried_exception(err, lease, monitor)
+                monitor.on_failure(err)
                 raise

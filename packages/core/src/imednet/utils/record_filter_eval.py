@@ -295,8 +295,8 @@ class CompiledRecordPredicate:
         """Return *record* (or projected copy for ``recordDataFilter='none'``) if matched."""
         if not self.matches(record):
             return None
-        if self.project_empty_record_data and record.record_data:
-            return record.model_copy(update={"record_data": {}})
+        if self.project_empty_record_data and record.record_data is not None:
+            return record.model_copy(update={"record_data": None})
         return record
 
 

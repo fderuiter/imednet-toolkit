@@ -207,6 +207,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 interactive=False if no_interactive else None,
                 output_format=resolved_format,
                 on_load_all=_load_more_records if load_remaining is not None else None,
+                drain_on_fallback=limit is None,
             )
 
     def _dispatch_list_records(args: argparse.Namespace) -> None:

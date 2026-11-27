@@ -64,23 +64,13 @@ def _resolve_study_registry(study_key: str | None) -> SensitivityRegistry:
     return global_sensitivity_registry
 
 
-def _models_to_dataframe(
-    models: Iterable[ImednetBaseModel],
-    feature_name: str | None = None,
+def _rows_to_dataframe(
+    rows: list[dict[str, Any]],
     *,
     mask_phi: bool = True,
     study_key: str | None = None,
 ) -> pd.DataFrame:
-    """Convert an iterable of :class:`~imednet.models.base.ImednetBaseModel` to a DataFrame.
-
-    Each model is serialized using :meth:`pydantic.BaseModel.model_dump` with
-    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`. When
-    ``mask_phi`` is ``True`` (default), sensitive PHI keys, inline text PHI,
-    and committed ``StudyConfiguration`` PHI rules are redacted with
-    ``***MASKED***``.
-    """
-    check_pandas(feature_name)
-    rows = [model.model_dump(by_alias=False) for model in models]
+    """Convert pre-serialized model row dicts to a DataFrame with optional PHI masking."""
     if not rows or not mask_phi:
         return pd.DataFrame(rows)
 
@@ -101,6 +91,26 @@ def _models_to_dataframe(
             registries[row_sk] = reg
         sanitized_rows.append(sanitize_diagnostic_payload(row, registry=reg))
     return pd.DataFrame(sanitized_rows)
+
+
+def _models_to_dataframe(
+    models: Iterable[ImednetBaseModel],
+    feature_name: str | None = None,
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
+    """Convert an iterable of :class:`~imednet.models.base.ImednetBaseModel` to a DataFrame.
+
+    Each model is serialized using :meth:`pydantic.BaseModel.model_dump` with
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`. When
+    ``mask_phi`` is ``True`` (default), sensitive PHI keys, inline text PHI,
+    and committed ``StudyConfiguration`` PHI rules are redacted with
+    ``***MASKED***``.
+    """
+    check_pandas(feature_name)
+    rows = [model.model_dump(by_alias=False) for model in models]
+    return _rows_to_dataframe(rows, mask_phi=mask_phi, study_key=study_key)
 
 
 def queries_to_dataframe(
@@ -220,9 +230,12 @@ def users_to_dataframe(
     """Convert a list of :class:`~imednet.models.users.User` to a DataFrame.
 
     Each user model is serialized using :meth:`pydantic.BaseModel.model_dump` with
-    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    ``by_alias=False`` (plus the ``name`` convenience property) and returned as a
+    :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(users, "users_to_dataframe", mask_phi=mask_phi, study_key=study_key)
+    check_pandas("users_to_dataframe")
+    user_dicts = [{**u.model_dump(by_alias=False), "name": u.name} for u in users]
+    return _rows_to_dataframe(user_dicts, mask_phi=mask_phi, study_key=study_key)
 
 
 def _is_custom_phi_column(col: str, phi_keys: set[str]) -> bool:
@@ -298,7 +311,10 @@ def records_to_dataframe(
 
     if flatten:
         base_df = df.drop(columns=["record_data"])
-        record_df = pd.json_normalize(df["record_data"].tolist(), sep="_")
+        record_df = pd.json_normalize(
+            [d if isinstance(d, dict) else {} for d in df["record_data"].tolist()],
+            sep="_",
+        )
         clean_label_map = (
             {str(k): str(v) for k, v in label_map.items() if k and v and str(v).strip()}
             if label_map

@@ -23,8 +23,8 @@ class FormStructure(ImednetBaseModel):
     disabled: bool | None = Field(default=None, alias="disabled")
     epro_form: bool = Field(..., alias="eproForm")
     allow_copy: bool = Field(..., alias="allowCopy")
-    date_created: datetime = Field(..., alias="dateCreated")
-    date_modified: datetime = Field(..., alias="dateModified")
+    date_created: datetime | None = Field(default=None, alias="dateCreated")
+    date_modified: datetime | None = Field(default=None, alias="dateModified")
     variables: list[Variable] = Field(default_factory=list)
 
     def __init__(
@@ -44,10 +44,10 @@ class FormStructure(ImednetBaseModel):
         eproForm: bool = ...,
         allow_copy: bool = ...,
         allowCopy: bool = ...,
-        date_created: datetime = ...,
-        dateCreated: datetime = ...,
-        date_modified: datetime = ...,
-        dateModified: datetime = ...,
+        date_created: datetime | None = None,
+        dateCreated: datetime | None = None,
+        date_modified: datetime | None = None,
+        dateModified: datetime | None = None,
         variables: list[Variable] = ...,
     ) -> None: ...
     @classmethod
@@ -62,8 +62,8 @@ class IntervalStructure(ImednetBaseModel):
     interval_description: str = Field(..., alias="intervalDescription")
     interval_group_name: str = Field(..., alias="intervalGroupName")
     disabled: bool | None = Field(default=None, alias="disabled")
-    date_created: datetime = Field(..., alias="dateCreated")
-    date_modified: datetime = Field(..., alias="dateModified")
+    date_created: datetime | None = Field(default=None, alias="dateCreated")
+    date_modified: datetime | None = Field(default=None, alias="dateModified")
     forms: list[FormStructure] = Field(default_factory=list)
 
     def __init__(
@@ -80,10 +80,10 @@ class IntervalStructure(ImednetBaseModel):
         interval_group_name: str = ...,
         intervalGroupName: str = ...,
         disabled: bool | None = None,
-        date_created: datetime = ...,
-        dateCreated: datetime = ...,
-        date_modified: datetime = ...,
-        dateModified: datetime = ...,
+        date_created: datetime | None = None,
+        dateCreated: datetime | None = None,
+        date_modified: datetime | None = None,
+        dateModified: datetime | None = None,
         forms: list[FormStructure] = ...,
     ) -> None: ...
     @classmethod

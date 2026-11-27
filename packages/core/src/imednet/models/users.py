@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import Field, computed_field, field_validator
+from pydantic import Field, field_validator
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
@@ -53,9 +53,8 @@ Role = ModelEngine.get_model('Role', Role)
 class User(ImednetBaseModel):
     """A user account in the system."""
 
-    roles: list[Role] = Field(default_factory=list, alias="roles")
+    roles: list[Role] | None = Field(default_factory=list[Role], alias="roles")
 
-    @computed_field  # type: ignore[prop-decorator]
     @property
     def name(self) -> str:
         """A convenience full-name property so you can do `user.name`.

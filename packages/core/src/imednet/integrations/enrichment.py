@@ -507,7 +507,7 @@ class CentralizedMapper:
         mask_phi: bool = True,
         study_config: StudyConfiguration | None = None,
         naming_convention: str | None = None,
-        as_sdtm: bool = False,
+        as_sdtm: bool | None = None,
         sdtm_domain: str | None = None,
         seq_counters: dict[str, int] | None = None,
         domain_seq_counters: dict[str, dict[str, int]] | None = None,
@@ -544,7 +544,12 @@ class CentralizedMapper:
             if isinstance(sdtm_domain, str) and sdtm_domain.strip()
             else None
         )
-        self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        if as_sdtm is None:
+            self.as_sdtm = bool(self.sdtm_domain is not None)
+        else:
+            if not isinstance(as_sdtm, bool):
+                raise ValueError("as_sdtm must be a boolean")
+            self.as_sdtm = as_sdtm
         self._explicit_seq_counters = seq_counters is not None
         self._seq_counters: dict[str, int] = seq_counters if seq_counters is not None else {}
         self._domain_seq_counters: dict[str, dict[str, int]] = (
@@ -792,7 +797,8 @@ class CentralizedMapper:
                 prepared = normalizer.prepare_record(src_rec, orig_idx)
                 if prepared is not None:
                     source_by_row_id[id(prepared.row)] = src_rec
-                    grouped.setdefault(prepared.usubjid, []).append(prepared)
+                    grouped.setdefault(prepared.usubjid or "", []).append(prepared)
+            dom_pairs: list[tuple[Any, dict[str, Any]]] = []
             for usubjid in sorted(grouped):
                 finalized_rows = normalizer.finalize_subject_group(
                     grouped[usubjid],
@@ -803,8 +809,15 @@ class CentralizedMapper:
                 )
                 for row_dict in finalized_rows:
                     src = source_by_row_id.get(id(row_dict))
-                    out_row = self.post_processor(row_dict) if self.post_processor else row_dict
-                    results.append((src, out_row))
+                    dom_pairs.append((src, row_dict))
+            if dom == "DM" and len(dom_pairs) > 1:
+                from imednet.models.sdtm import deduplicate_sdtm_rows
+
+                kept_ids = {id(r) for r in deduplicate_sdtm_rows([r for _, r in dom_pairs])}
+                dom_pairs = [(s, r) for s, r in dom_pairs if id(r) in kept_ids]
+            for src, row_dict in dom_pairs:
+                out_row = self.post_processor(row_dict) if self.post_processor else row_dict
+                results.append((src, out_row))
         return results
 
     def map_record(self, record: Any, study_key: str | None = None) -> dict[str, Any]:
@@ -869,7 +882,7 @@ class CentralizedMapper:
                 else {
                     "STUDYID": sk,
                     "DOMAIN": target_domain,
-                    "USUBJID": "",
+                    "USUBJID": None,
                 }
             )
             if self.post_processor:
@@ -953,13 +966,31 @@ class CentralizedMapper:
                                 val = active_pipeline.process(val)
                 if self.mode == "tabular":
                     val = flatten(val)
-                if active_conv is None or active_conv == "snake_case":
-                    val = {_to_snake_case(k): v for k, v in val.items()}
-                else:
-                    val = {
-                        format_variable_name(k, active_conv, domain=self.sdtm_domain): v
-                        for k, v in val.items()
-                    }
+                from imednet.models.sdtm import (
+                    format_nested_variable_name,
+                    prefix_colliding_variable_name,
+                )
+
+                formatted_val: dict[str, Any] = {}
+                seen_var_lower: set[str] = set()
+                for k, v in val.items():
+                    if active_conv is None:
+                        base_k = _to_snake_case(k)
+                    elif self.mode == "tabular" or "." in k or "[" in k:
+                        base_k = format_nested_variable_name(
+                            k, active_conv, domain=self.sdtm_domain
+                        )
+                    elif active_conv == "snake_case":
+                        base_k = _to_snake_case(k)
+                    else:
+                        base_k = format_variable_name(k, active_conv, domain=self.sdtm_domain)
+                    unique_k = prefix_colliding_variable_name(
+                        base_k,
+                        convention=active_conv,
+                        used_lower=seen_var_lower,
+                    )
+                    formatted_val[unique_k] = v
+                val = formatted_val
             elif masked_meta_fields and val is not None and snake_key in masked_meta_fields:
                 val = _MASKED_VALUE
 

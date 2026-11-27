@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from imednet.errors.base import ImednetError
 from imednet.models.base import ImednetBaseModel
@@ -294,9 +294,11 @@ class JobStatus(Job):
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_record_count_keys(cls, data: Any) -> Any:
+    def _normalize_record_count_keys(cls, data: Any, info: ValidationInfo) -> Any:
         """Accept snake_case record count kwargs without colliding with properties."""
         if not isinstance(data, dict):
+            return data
+        if isinstance(info.context, dict) and info.context.get("wire"):
             return data
         normalized = dict(data)
         if "total_records" in normalized and "totalRecords" not in normalized:

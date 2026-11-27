@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import types
 from collections.abc import Callable
@@ -16,7 +17,7 @@ from typing import (
     get_origin,
 )
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from imednet.core.context import is_strict_mode
 from imednet.utils.validators import (
@@ -179,6 +180,8 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
 
 _drift_reported: set[str] = set()
 _FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]] = {}
+_WIRE_FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]] = {}
+_HAS_VALIDATE_BY_ALIAS: bool = "by_alias" in inspect.signature(BaseModel.model_validate).parameters
 
 
 def _get_field_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]:
@@ -200,6 +203,27 @@ def _get_field_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str,
 
     meta = (defined_fields, required_fields)
     _FIELD_METADATA_CACHE[cls] = meta
+    return meta
+
+
+def _get_wire_metadata(
+    cls: type[BaseModel],
+) -> tuple[set[str], list[tuple[str, str | None]]]:
+    """Retrieve or compute cached wire-only field metadata for ``from_json`` validation."""
+    if cls in _WIRE_FIELD_METADATA_CACHE:
+        return _WIRE_FIELD_METADATA_CACHE[cls]
+
+    defined_fields: set[str] = set()
+    required_fields: list[tuple[str, str | None]] = []
+
+    for name, field in cls.model_fields.items():
+        wire_key = field.alias or name
+        defined_fields.add(wire_key)
+        if field.is_required():
+            required_fields.append((name, wire_key))
+
+    meta = (defined_fields, required_fields)
+    _WIRE_FIELD_METADATA_CACHE[cls] = meta
     return meta
 
 
@@ -225,6 +249,8 @@ class ImednetBaseModel(BaseModel):
         """Precompile per-field normalizers when model annotations are resolved."""
         super().__pydantic_init_subclass__(**kwargs)
         _NORMALIZERS.pop(cls, None)
+        _FIELD_METADATA_CACHE.pop(cls, None)
+        _WIRE_FIELD_METADATA_CACHE.pop(cls, None)
         if getattr(cls, "__pydantic_complete__", False):
             _NORMALIZERS[cls] = {
                 field_name: _get_normalizer(cls, field_name) for field_name in cls.model_fields
@@ -246,7 +272,17 @@ class ImednetBaseModel(BaseModel):
                 data = {}
 
         try:
-            return cls.model_validate(data)
+            if _HAS_VALIDATE_BY_ALIAS:
+                return cls.model_validate(
+                    data,
+                    context={"wire": True},
+                    by_alias=True,
+                    by_name=False,
+                )
+            return cls.model_validate(
+                data,
+                context={"wire": True},
+            )
         except Exception as e:
             msg = f"Drift detected (destructive): {cls.__name__} validation failed: {e}"
             if msg not in _drift_reported:
@@ -256,15 +292,23 @@ class ImednetBaseModel(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _detect_drift(cls, data: Any) -> Any:
+    def _detect_drift(cls, data: Any, info: ValidationInfo) -> Any:
         """Compare incoming JSON data against the model definition to detect API drift."""
         if type(data) is not dict and not isinstance(data, dict):
             return data
 
-        try:
-            defined_fields, required_fields = _FIELD_METADATA_CACHE[cls]
-        except KeyError:
-            defined_fields, required_fields = _get_field_metadata(cls)
+        ctx = info.context
+        is_wire = type(ctx) is dict and bool(ctx.get("wire"))
+        if is_wire:
+            try:
+                defined_fields, required_fields = _WIRE_FIELD_METADATA_CACHE[cls]
+            except KeyError:
+                defined_fields, required_fields = _get_wire_metadata(cls)
+        else:
+            try:
+                defined_fields, required_fields = _FIELD_METADATA_CACHE[cls]
+            except KeyError:
+                defined_fields, required_fields = _get_field_metadata(cls)
 
         is_strict = is_strict_mode()
         warn_extra = cls.model_config.get("extra") != "ignore"
@@ -287,7 +331,12 @@ class ImednetBaseModel(BaseModel):
         if required_fields:
             missing_fields: list[str] | None = None
             for name, alias in required_fields:
-                if name not in data and (not alias or alias not in data):
+                present = (
+                    (alias in data if alias else name in data)
+                    if is_wire
+                    else (name in data or bool(alias and alias in data))
+                )
+                if not present:
                     if missing_fields is None:
                         missing_fields = [name]
                     else:
@@ -297,6 +346,15 @@ class ImednetBaseModel(BaseModel):
                 if msg not in _drift_reported:
                     _drift_reported.add(msg)
                     _drift_logger.warning(msg)
+
+        if (
+            is_wire
+            and not _HAS_VALIDATE_BY_ALIAS
+            and data.keys() & (cls.model_fields.keys() - defined_fields)
+        ):
+            return {
+                k: v for k, v in data.items() if k not in cls.model_fields or k in defined_fields
+            }
 
         return data
 

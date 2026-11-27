@@ -6,11 +6,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from itertools import pairwise
-from typing import Any
+from typing import Any, Self
 
 from pydantic import (
     Field,
     ValidationError,
+    ValidationInfo,
     ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
@@ -20,21 +21,6 @@ from imednet.models._lifecycle import coerce_field_status
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
 from imednet.models.records import RecordStatus, normalize_record_status
-
-
-def _coerce_optional_int_for_bounds(value: Any, field_name: str) -> int | None:
-    """Coerce optional integer input while rejecting booleans for bounds checking."""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be an integer, not bool.")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.lstrip("-").isdigit():
-            return int(stripped)
-    return None
 
 
 def _parse_revision_timestamp(value: Any) -> datetime | None:
@@ -85,21 +71,19 @@ class RecordRevision(ImednetBaseModel):
     data_revision: int | None = Field(default=None, alias="dataRevision")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
 
-    @model_validator(mode="before")
+    @field_validator("record_revision", "data_revision", mode="before")
     @classmethod
-    def _validate_bounds(cls, data: Any) -> Any:
+    def _reject_bool_revisions(cls, value: Any, info: ValidationInfo) -> Any:
+        """Reject boolean values before permissive integer coercion."""
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must be an integer, not bool.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> Self:  # noqa: N804
         """Enforce ``record_revision >= 1`` and ``0 <= data_revision <= record_revision``."""
-        if isinstance(data, dict):
-            raw_rec = (
-                data["record_revision"] if "record_revision" in data else data.get("recordRevision")
-            )
-            raw_data = (
-                data["data_revision"] if "data_revision" in data else data.get("dataRevision")
-            )
-            rec_rev = _coerce_optional_int_for_bounds(raw_rec, "record_revision")
-            data_rev = _coerce_optional_int_for_bounds(raw_data, "data_revision")
-            _validate_revision_bounds(rec_rev, data_rev)
-        return data
+        _validate_revision_bounds(self.record_revision, self.data_revision)
+        return self
 
     @field_validator("record_status", mode="wrap")
     @classmethod

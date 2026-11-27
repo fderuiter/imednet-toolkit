@@ -51,6 +51,7 @@ def _render_list_results(
     truncated: bool,
     no_interactive: bool,
     load_remaining: Callable[[], list[Any]] | None,
+    drain_on_fallback: bool = True,
 ) -> None:
     """Render fetched SDK items via ``display_list`` with optional table ``row_mapper``."""
     if resolved_format == "json":
@@ -74,6 +75,7 @@ def _render_list_results(
             truncated=truncated,
             interactive=False if no_interactive else None,
             on_load_all=_load_more_mapped if load_remaining is not None else None,
+            drain_on_fallback=drain_on_fallback,
         )
         return
 
@@ -87,6 +89,7 @@ def _render_list_results(
         truncated=truncated,
         interactive=False if no_interactive else None,
         on_load_all=load_remaining,
+        drain_on_fallback=drain_on_fallback,
     )
 
 
@@ -288,6 +291,7 @@ def register_list_command(
                 truncated=truncated,
                 no_interactive=no_interactive,
                 load_remaining=load_remaining,
+                drain_on_fallback=limit is None,
             )
 
         def _dispatch_study_list(args: argparse.Namespace) -> None:
@@ -384,6 +388,7 @@ def register_list_command(
                 truncated=truncated,
                 no_interactive=no_interactive,
                 load_remaining=load_remaining,
+                drain_on_fallback=limit is None,
             )
 
         def _dispatch_no_study_list(args: argparse.Namespace) -> None:
