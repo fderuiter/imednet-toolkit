@@ -190,8 +190,8 @@ def test_mongodb_sdtm_incremental_replay_dedup_and_void_reconciliation(
 
     export_to_mongodb(sdk, study_key, config=cfg)
     assert len(collection.docs) == 4
-    s01_dm = collection.docs[f"{study_key}/1"]
-    s02_dm = collection.docs[f"{study_key}/2"]
+    s01_dm = collection.docs[f"{study_key}/DM/S01"]
+    s02_dm = collection.docs[f"{study_key}/DM/S02"]
     assert s01_dm["BRTHDTC"] == "1981"
     assert s02_dm["BRTHDTC"] is None
     assert s01_dm["customPhiTag"] == "***MASKED***"
@@ -217,7 +217,7 @@ def test_mongodb_sdtm_incremental_replay_dedup_and_void_reconciliation(
     export_to_mongodb(sdk, study_key, config=cfg)
 
     assert set(collection.docs.keys()) == {
-        f"{study_key}/1",
+        f"{study_key}/DM/S01",
         f"{study_key}/3",
         f"{study_key}/5",
     }
@@ -351,18 +351,25 @@ def test_neo4j_and_snowflake_mixed_domain_partitioning_and_void_reconciliation(
         state_provider=neo_ledger,
     )
     export_to_neo4j(sdk, study_key, config=neo_cfg)
-    inc_neo_rows = [
+    inc_neo_rid_rows = [
         row
         for q, p in neo4j_calls
         if "MERGE (r:Record" in q and "RECORD_ID: row.RECORD_ID" in q
         for row in p.get("rows", ())
     ]
-    assert len(inc_neo_rows) == 3
+    inc_neo_dm_rows = [
+        row
+        for q, p in neo4j_calls
+        if "MERGE (r:Record" in q and "DOMAIN: row.DOMAIN, USUBJID: row.USUBJID" in q
+        for row in p.get("rows", ())
+    ]
+    assert len(inc_neo_rid_rows) == 2
+    assert len(inc_neo_dm_rows) == 1
     assert any(
-        r["DOMAIN"] == "DM" and "DMSEQ" not in r and r["BRTHDTC"] == "1981" for r in inc_neo_rows
+        r["DOMAIN"] == "DM" and "DMSEQ" not in r and r["BRTHDTC"] == "1981" for r in inc_neo_dm_rows
     )
-    assert any(r["DOMAIN"] == "VS" and r["VSSEQ"] == 1 for r in inc_neo_rows)
-    assert any(r["DOMAIN"] == "AE" and r["AESEQ"] == 1 for r in inc_neo_rows)
+    assert any(r["DOMAIN"] == "VS" and r["VSSEQ"] == 1 for r in inc_neo_rid_rows)
+    assert any(r["DOMAIN"] == "AE" and r["AESEQ"] == 1 for r in inc_neo_rid_rows)
 
     sf_ledger = ExtractionStateLedger(ledger_path=tmp_path / "sf_sdtm.json")
     sf_cfg = SnowflakeSinkConfig(
@@ -381,10 +388,15 @@ def test_neo4j_and_snowflake_mixed_domain_partitioning_and_void_reconciliation(
     )
     export_to_snowflake(sdk, study_key, config=sf_cfg)
     inc_sf_merges = [c.args[0] for c in cursor.execute.call_args_list if "MERGE INTO" in c.args[0]]
-    assert len(inc_sf_merges) == 1
-    assert (
-        'target."STUDYID" = source."STUDYID" AND target."RECORD_ID" = source."RECORD_ID"'
-        in inc_sf_merges[0]
+    assert len(inc_sf_merges) == 3
+    assert any(
+        'target."STUDYID" = source."STUDYID" AND target."DOMAIN" = source."DOMAIN" AND target."USUBJID" = source."USUBJID"'
+        in sql
+        for sql in inc_sf_merges
+    )
+    assert any(
+        'target."STUDYID" = source."STUDYID" AND target."RECORD_ID" = source."RECORD_ID"' in sql
+        for sql in inc_sf_merges
     )
 
     # Void both DM (record 1) and AE (record 3) -> incremental deletes target (STUDYID, RECORD_ID),
@@ -639,11 +651,36 @@ def test_baseline_as_sdtm_then_modified_since_sync_preserves_record_id_and_recon
     hive_dir = tmp_path / "sync_hive"
     ddb_path = tmp_path / "sync.duckdb"
 
-    # 1. Baseline as_sdtm=True export (no incremental, no modified_since, no ledger)
-    export_to_csv(sdk, study_key, csv_path, as_sdtm=True, quality_gate_enabled=False)
-    export_to_hive_parquet(sdk, study_key, hive_dir, as_sdtm=True, quality_gate_enabled=False)
+    # 1a. Default full non-incremental as_sdtm=True export omits RECORD_ID
+    full_csv_path = tmp_path / "full_snapshot.csv"
+    export_to_csv(sdk, study_key, full_csv_path, as_sdtm=True, quality_gate_enabled=False)
+    assert "RECORD_ID" not in pd.read_csv(full_csv_path).columns
+
+    # 1b. Seeded baseline with explicit preserve_record_id=True (for subsequent modified_since syncs)
+    export_to_csv(
+        sdk,
+        study_key,
+        csv_path,
+        as_sdtm=True,
+        preserve_record_id=True,
+        quality_gate_enabled=False,
+    )
+    export_to_hive_parquet(
+        sdk,
+        study_key,
+        hive_dir,
+        as_sdtm=True,
+        preserve_record_id=True,
+        quality_gate_enabled=False,
+    )
     export_to_duckdb(
-        sdk, study_key, ddb_path, "sdtm_sync", as_sdtm=True, quality_gate_enabled=False
+        sdk,
+        study_key,
+        ddb_path,
+        "sdtm_sync",
+        as_sdtm=True,
+        preserve_record_id=True,
+        quality_gate_enabled=False,
     )
     export_to_neo4j(
         sdk,
@@ -653,6 +690,7 @@ def test_baseline_as_sdtm_then_modified_since_sync_preserves_record_id_and_recon
             uri="bolt://localhost:7687",
             auth=("neo4j", "secret"),
             as_sdtm=True,
+            preserve_record_id=True,
             quality_gate_enabled=False,
         ),
     )
@@ -670,6 +708,7 @@ def test_baseline_as_sdtm_then_modified_since_sync_preserves_record_id_and_recon
             stage="STG",
             table="SDTM_SYNC",
             as_sdtm=True,
+            preserve_record_id=True,
             quality_gate_enabled=False,
         ),
     )
@@ -898,3 +937,170 @@ def test_neo4j_sdtm_naming_convention_and_as_sdtm_visitnum_normalization_and_edg
     assert [r["VISITNUM"] for r in as_sdtm_visit_queries[0][1]["rows"]] == [3]
     assert len(as_sdtm_direct_queries) == 1
     assert "VISITNUM" not in as_sdtm_direct_queries[0][1]["rows"][0]
+
+
+def test_sinks_unassigned_subject_guard_dm_composite_key_and_uppercase_ddl_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Neo4j skips Subject/Visit edges for unassigned rows, DM keys on (STUDYID, DOMAIN, USUBJID) even with RECORD_ID, and Snowflake deduplicates uppercase DDL columns."""
+    from imednet.integrations.enrichment import CentralizedMapper
+
+    # 1. MongoDB DM _id uses STUDYID/DM/USUBJID even when RECORD_ID is present
+    dm_with_rid = doc_mod._attach_sdtm_document_id(
+        {"STUDYID": "S1", "DOMAIN": "DM", "USUBJID": "U1", "RECORD_ID": 10},
+        {},
+        "S1",
+    )
+    assert dm_with_rid["_id"] == "S1/DM/U1"
+
+    # 2. Neo4j skips Subject/Visit nodes when USUBJID/subject_key is null/empty
+    neo4j_calls: list[tuple[str, dict[str, Any]]] = []
+    neo4j_mod = MagicMock()
+    session = MagicMock()
+    session.run.side_effect = lambda q, **p: neo4j_calls.append((q, p)) or MagicMock()
+    session_cm = MagicMock()
+    session_cm.__enter__.return_value = session
+    session_cm.__exit__.return_value = False
+    driver = MagicMock()
+    driver.session.return_value = session_cm
+    neo4j_mod.GraphDatabase.driver.return_value = driver
+    monkeypatch.setattr(graph_mod, "_require_optional_dep", lambda *_: neo4j_mod)
+
+    with graph_mod.Neo4jExportSink(
+        Neo4jSinkConfig(
+            study_key="S1",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "secret"),
+            as_sdtm=True,
+            preserve_record_id=True,
+        )
+    ) as neo_sink:
+        neo_sink.write_batch(
+            [
+                {
+                    "recordId": 91,
+                    "studyKey": "S1",
+                    "subjectKey": "",
+                    "formKey": "F_AE",
+                    "visitId": 2,
+                    "recordData": {"AETERM": "Unassigned AE"},
+                },
+                {
+                    "recordId": 92,
+                    "studyKey": "S1",
+                    "subjectKey": "U1",
+                    "formKey": "F_DM",
+                    "recordData": {"SEX": "F"},
+                },
+            ],
+            batch_id="b_unassigned",
+        )
+    assert any(
+        "CASE WHEN row.USUBJID IS NOT NULL AND row.USUBJID <> ''" in q
+        and "CASE WHEN row.USUBJID IS NULL OR row.USUBJID = ''" in q
+        for q, _ in neo4j_calls
+    )
+    assert any("DOMAIN: row.DOMAIN, USUBJID: row.USUBJID" in q for q, _ in neo4j_calls)
+
+    neo4j_calls.clear()
+    with graph_mod.Neo4jExportSink(
+        Neo4jSinkConfig(
+            study_key="S1",
+            uri="bolt://localhost:7687",
+            auth=("neo4j", "secret"),
+            as_sdtm=True,
+            preserve_record_id=False,
+        )
+    ) as neo_snap_sink:
+        neo_snap_sink.write_batch(
+            [
+                {
+                    "recordId": 93,
+                    "studyKey": "S1",
+                    "subjectKey": None,
+                    "formKey": "F_AE",
+                    "recordData": {"AETERM": "Unassigned Snapshot AE"},
+                }
+            ],
+            batch_id="b_unassigned_snap",
+        )
+    assert len(neo4j_calls) == 1
+    assert (
+        "MERGE (r:Record   {STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, AESEQ: row.AESEQ})"
+        in neo4j_calls[0][0]
+    )
+    assert neo4j_calls[0][1]["rows"][0].get("USUBJID") is None
+
+    # 3. Snowflake uppercase DDL deduplication and _post_process_warehouse nested parity
+    for conv in ("snake_case", "camelCase", "sdtm"):
+        cm = CentralizedMapper(
+            mode="tabular",
+            naming_convention=conv,
+            post_processor=wh_mod._post_process_warehouse,
+        )
+        sample_rec = {
+            "recordId": 5,
+            "studyKey": "S1",
+            "subjectKey": "U1",
+            "formKey": "AE",
+            "dateModified": "2026-07-01T00:00:00Z",
+            "recordData": {"formKey": "collision_val", "heart_rate": 72, "nested": {"bp_sys": 120}},
+        }
+        mapped = cm.map_record(sample_rec)
+        direct = wh_mod._post_process_warehouse(
+            CentralizedMapper(mode="tabular", naming_convention=conv).map_record(sample_rec),
+            naming_convention=conv,
+            _keys_already_formatted=True,
+        )
+        assert mapped == direct
+        arrow_tbl = wh_mod._records_to_arrow_table(
+            [sample_rec],
+            study_key="S1",
+            naming_convention=conv,
+        )
+        assert arrow_tbl.num_rows == 1
+
+    sf_mod = MagicMock()
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    sf_mod.connect.return_value = conn
+    monkeypatch.setattr(
+        wh_mod,
+        "_require_optional_dep",
+        lambda pkg, _extra: (
+            sf_mod if pkg == "snowflake.connector" else (pq if "parquet" in pkg else pa)
+        ),
+    )
+    with wh_mod.SnowflakeExportSink(
+        SnowflakeSinkConfig(
+            study_key="S1",
+            account="acct",
+            user="usr",
+            password="pwd",  # pragma: allowlist secret
+            database="DB",
+            schema="PUBLIC",
+            warehouse="WH",
+            stage="STG",
+            table="T_CASE_DEDUP",
+            naming_convention="camelCase",
+        )
+    ) as sf_sink:
+        sf_sink.write_batch(
+            [
+                {
+                    "recordId": 1,
+                    "studyKey": "S1",
+                    "subjectKey": "U1",
+                    "formKey": "AE",
+                    "recordData": {"studyKey": "nested_study", "StudyKey": "dup_case"},
+                }
+            ],
+            batch_id="b_sf_dedup",
+        )
+    executed_sqls = [c.args[0] for c in cursor.execute.call_args_list if c.args]
+    create_sql = next(s for s in executed_sqls if "CREATE TABLE IF NOT EXISTS" in s)
+    assert create_sql.count('"VAR_STUDYKEY"') == 1
+    merge_sql = next(s for s in executed_sqls if "MERGE INTO" in s)
+    assert merge_sql.count('target."VAR_STUDYKEY" = source."VAR_STUDYKEY"') == 1

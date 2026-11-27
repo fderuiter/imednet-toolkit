@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, model_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -66,6 +66,6 @@ class Visit(ImednetBaseModel):
     ) -> None: ...
     @model_validator(mode="before")
     @classmethod
-    def _clean_empty_dates(cls, data: Any) -> Any: ...
+    def _clean_empty_dates(cls, data: Any, info: ValidationInfo) -> Any: ...
 
 __all__ = ["Visit"]

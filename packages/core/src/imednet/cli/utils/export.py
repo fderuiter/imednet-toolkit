@@ -207,12 +207,18 @@ def export_list_to_file(
     fmt, path = resolved
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _dump_export_item(item: Any) -> dict[str, Any]:
+        try:
+            return item.model_dump(by_alias=True, warnings=False)  # type: ignore[no-any-return]
+        except TypeError:
+            return item.model_dump(by_alias=True)  # type: ignore[no-any-return]
+
     pipelines: dict[str, Any] = {}
     phi_cache: dict[str, set[str]] = {}
     with sdk_governance_context(sdk):
         data = [
             _prepare_export_row(
-                item.model_dump(by_alias=True),
+                _dump_export_item(item),
                 study_key=study_key,
                 mask_phi=mask_phi,
                 pipelines=pipelines,
@@ -349,8 +355,9 @@ def _mask_record_tree(
         is_query_map = _is_query_mapping(value)
         for k, v in value.items():
             key_str = str(k)
-            if global_sensitivity_registry.is_sensitive(key_str) or _matches_custom_phi_key(
-                key_str, custom_phi_keys
+            if not active_registry.is_exempt(key_str) and (
+                active_registry.is_sensitive(key_str)
+                or _matches_custom_phi_key(key_str, custom_phi_keys)
             ):
                 rebuilt[k] = _MASKED_VALUE
                 if type(v) is not str or v != _MASKED_VALUE:
@@ -398,15 +405,20 @@ def _mask_record_tree(
     updates: dict[str, Any] = {}
     for fname, finfo in model_fields.items():
         raw_val = getattr(value, fname, None)
-        if raw_val is None or active_registry.is_exempt(fname):
+        alias = getattr(finfo, "alias", None)
+        if (
+            raw_val is None
+            or active_registry.is_exempt(fname)
+            or (isinstance(alias, str) and active_registry.is_exempt(alias))
+        ):
             continue
         if _is_field_phi_sensitive(
             fname,
-            getattr(finfo, "alias", None),
+            alias,
             active_registry=active_registry,
             custom_phi_keys=custom_phi_keys,
         ):
-            if isinstance(raw_val, str) and raw_val != _MASKED_VALUE:
+            if raw_val != _MASKED_VALUE:
                 updates[fname] = _MASKED_VALUE
         elif isinstance(raw_val, str) and _is_diagnostic_text_model_field(
             fname, value, model_fields

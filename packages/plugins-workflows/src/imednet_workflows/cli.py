@@ -10,7 +10,6 @@ readiness validation, and state ledger management.
 from __future__ import annotations
 
 import argparse
-import builtins
 import contextlib
 import io
 import os
@@ -39,6 +38,7 @@ from imednet.spi.cli import (
     display_list,
     emit_json,
     fetching_status,
+    flush_stdout,
     is_json_output_mode,
     load_offline_schema,
     parse_email_notify,
@@ -55,8 +55,9 @@ from imednet.spi.cli import (
     simulation_mode_context,
     validate_cli_path_segment,
     with_sdk,
+    write_stdout,
 )
-from imednet.spi.models import PROFILE_REGISTRY
+from imednet.spi.models import PROFILE_REGISTRY, StudyConfiguration
 from imednet.spi.utils import (
     PathTraversalValidationError,
     build_study_sensitivity_registry,
@@ -86,14 +87,29 @@ def _resolve_workflow_phi_fields(
     sdk: Any = None,
 ) -> set[str]:
     """Resolve normalized study PHI keys via SPI under *sdk* governance."""
-    resolved = set(_spi_cli.resolve_cli_phi_fields(study_key, sdk=sdk))
+    sk = (study_key or "").strip()
+    if not sk:
+        return set()
     patched = globals().get("resolve_study_configuration")
-    if study_key and callable(patched) and patched is not _spi_utils.resolve_study_configuration:
+    if callable(patched) and patched is not _spi_utils.resolve_study_configuration:
         with sdk_governance_context(sdk):
-            cfg = patched(study_key)
-        if cfg is not None and getattr(cfg, "phi_fields", None):
-            resolved.update(str(f) for f in cfg.phi_fields)
-    return resolved
+            cfg = patched(sk)
+        raw_fields = getattr(cfg, "phi_fields", None) if cfg is not None else None
+        if not raw_fields:
+            return set()
+        non_exempt = [
+            str(k)
+            for k in raw_fields
+            if str(k).strip() and not global_sensitivity_registry.is_exempt(str(k))
+        ]
+        if not non_exempt:
+            return set()
+        return set(
+            _spi_utils.EnrichmentPipeline(
+                StudyConfiguration(study_key="PHI", phi_fields=non_exempt)
+            ).phi_keys
+        )
+    return set(_spi_cli.resolve_cli_phi_fields(sk, sdk=sdk))
 
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
@@ -139,8 +155,7 @@ def _emit_line(text: str = "", *, err: bool = False) -> None:
     if err:
         print_error(sanitized)
         return
-    with contextlib.suppress(BrokenPipeError, OSError):
-        builtins.print(sanitized, file=sys.stdout)
+    write_stdout(sanitized)
 
 
 def _reject_interactive_json_mode(interactive: bool, output_format: str | None) -> None:
@@ -159,6 +174,7 @@ def _exit_uat_validation_error(
     exc: BaseException | str,
     *,
     study_key: str | None = None,
+    sdk: Any = None,
 ) -> NoReturn:
     """Emit a secret- and PHI-redacted UAT validation error to stderr and exit 1."""
     safe_phi_study: str | None = None
@@ -166,7 +182,7 @@ def _exit_uat_validation_error(
         with contextlib.suppress(Exception):
             validate_path_segment(study_key.strip(), name="study_key")
             safe_phi_study = study_key.strip()
-    custom_phi = _resolve_workflow_phi_fields(safe_phi_study)
+    custom_phi = _resolve_workflow_phi_fields(safe_phi_study, sdk=sdk)
     sanitized = _sanitize_uat_error_text(str(exc), custom_phi_fields=custom_phi)
     prefix = "" if sanitized.startswith("Validation Error:") else "Validation Error: "
     print_error(f"{prefix}{sanitized}")
@@ -431,14 +447,20 @@ def _to_serializable(value: Any) -> Any:
         return [_to_serializable(item) for item in value]
     model_dump = getattr(type(value), "model_dump", None)
     if callable(model_dump):
-        dumped = value.model_dump(mode="json")
+        try:
+            dumped = value.model_dump(mode="json", warnings=False)
+        except TypeError:
+            dumped = value.model_dump(mode="json")
         if dumped is not value and isinstance(
             dumped, (Mapping, list, tuple, str, int, float, bool)
         ):
             return _to_serializable(dumped)
     instance_dump = getattr(value, "model_dump", None)
     if callable(instance_dump):
-        dumped = instance_dump()
+        try:
+            dumped = instance_dump(warnings=False)
+        except TypeError:
+            dumped = instance_dump()
         if dumped is not value and isinstance(
             dumped, (Mapping, list, tuple, str, int, float, bool)
         ):
@@ -1144,6 +1166,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             output_format=resolved_format,
             on_load_all=_load_more_extracted_records if load_remaining is not None else None,
             entity_kind="records",
+            drain_on_fallback=limit is None,
         )
 
     def _handle_extract_records(args: argparse.Namespace) -> None:
@@ -1358,9 +1381,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 if not is_json_output_mode():
                     print_progress(f"Wrote UAT specification for study '{study_key}' to '{dest}'.")
                 return
-            with contextlib.suppress(BrokenPipeError, OSError):
-                sys.stdout.write(f"{serialized}\n")
-                sys.stdout.flush()
+            if write_stdout(serialized):
+                flush_stdout()
         except (ValueError, OSError) as exc:
             _exit_uat_validation_error(exc)
 
@@ -1693,7 +1715,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     sdk=sdk,
                 )
             if isinstance(exc, (ValueError, OSError)):
-                _exit_uat_validation_error(exc)
+                _exit_uat_validation_error(exc, study_key=study_key, sdk=sdk)
             raise
 
         result_state = getattr(result, "state", None)

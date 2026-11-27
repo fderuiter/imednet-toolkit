@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from enum import Enum
@@ -170,6 +171,25 @@ class ProbeLease:
         self.release()
 
 
+def _validate_positive_int(name: str, value: object) -> int:
+    """Validate a positive non-boolean integer threshold or probe limit."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be an integer >= 1")
+    return value
+
+
+def _validate_recovery_timeout(value: object) -> float:
+    """Validate a finite non-negative non-boolean recovery timeout."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("recovery_timeout must be a finite non-negative number")
+    return float(value)
+
+
 class CircuitBreaker:
     """Scoped circuit breaker tracking consecutive failures across threads and tasks.
 
@@ -191,6 +211,7 @@ class CircuitBreaker:
             recovery_timeout: Time in seconds to wait before transitioning to HALF_OPEN.
             half_open_max_probes: Max number of probes allowed in HALF_OPEN state.
         """
+        self._lock = threading.RLock()
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.half_open_max_probes = half_open_max_probes
@@ -200,7 +221,42 @@ class CircuitBreaker:
         self._last_failure_time = 0.0
         self._half_open_probes = 0
         self._epoch = 0
-        self._lock = threading.RLock()
+
+    @property
+    def failure_threshold(self) -> int:
+        """Return the consecutive failure threshold required to open the circuit."""
+        with self._lock:
+            return self._failure_threshold
+
+    @failure_threshold.setter
+    def failure_threshold(self, value: int) -> None:
+        validated = _validate_positive_int("failure_threshold", value)
+        with self._lock:
+            self._failure_threshold = validated
+
+    @property
+    def recovery_timeout(self) -> float:
+        """Return the recovery timeout in seconds before probing in HALF_OPEN."""
+        with self._lock:
+            return self._recovery_timeout
+
+    @recovery_timeout.setter
+    def recovery_timeout(self, value: float) -> None:
+        validated = _validate_recovery_timeout(value)
+        with self._lock:
+            self._recovery_timeout = validated
+
+    @property
+    def half_open_max_probes(self) -> int:
+        """Return the maximum number of concurrent probes admitted in HALF_OPEN."""
+        with self._lock:
+            return self._half_open_max_probes
+
+    @half_open_max_probes.setter
+    def half_open_max_probes(self, value: int) -> None:
+        validated = _validate_positive_int("half_open_max_probes", value)
+        with self._lock:
+            self._half_open_max_probes = validated
 
     @property
     def state(self) -> CircuitState:
@@ -237,6 +293,8 @@ class CircuitBreaker:
         elif target == CircuitState.HALF_OPEN and previous != CircuitState.HALF_OPEN:
             self._half_open_probes = 0
         elif target == CircuitState.CLOSED:
+            if previous != CircuitState.CLOSED:
+                self._epoch += 1
             self._consecutive_failures = 0
             self._half_open_probes = 0
 

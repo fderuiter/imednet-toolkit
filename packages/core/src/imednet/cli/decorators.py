@@ -51,17 +51,31 @@ _redact_secrets = redact_cli_secrets
 
 @contextmanager
 def cli_execution_guard() -> Iterator[None]:
-    """Guard top-level CLI execution so user interrupts exit cleanly with code 130."""
-    from .utils.output import clear_line, print_error
+    """Guard top-level CLI execution for clean SIGINT (130) and broken-pipe (0) exits."""
+    from .utils.output import (
+        _is_broken_pipe_error,
+        _silence_broken_pipe,
+        clear_line,
+        flush_stdout,
+        print_error,
+    )
 
     try:
         yield
     except SystemExit:
+        flush_stdout()
         raise
     except KeyboardInterrupt:
         clear_line()
         print_error("\nAborted by user.")
         sys.exit(130)
+    except BaseException as exc:
+        if _is_broken_pipe_error(exc):
+            _silence_broken_pipe(sys.stdout)
+            return
+        raise
+    else:
+        flush_stdout()
 
 
 def validate_cli_path_segment(value: Any, name: str = "segment") -> None:
@@ -85,7 +99,12 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         """Initialize the SDK, execute the command, and handle common API errors."""
         from .utils import context as _context_mod
-        from .utils.output import clear_line, print_error
+        from .utils.output import (
+            _is_broken_pipe_error,
+            _silence_broken_pipe,
+            clear_line,
+            print_error,
+        )
 
         bound = wrapper_sig.bind_partial(*args, **kwargs)
         is_interactive = bool(bound.arguments.get("interactive", False))
@@ -165,6 +184,9 @@ def with_sdk(func: Callable[Concatenate[ImednetSDK, P], R]) -> Callable[P, R]:
             print_error("\nAborted by user.")
             sys.exit(130)
         except Exception as exc:  # pragma: no cover - defensive
+            if _is_broken_pipe_error(exc):
+                _silence_broken_pipe(sys.stdout)
+                return None  # type: ignore[return-value]
             msg = _redact_secrets(str(exc))
             print_error(f"Unexpected error: {msg}")
             sys.exit(1)

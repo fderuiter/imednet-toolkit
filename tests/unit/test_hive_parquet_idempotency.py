@@ -326,9 +326,9 @@ def test_hive_parquet_streaming_and_sdtm_full_reruns_preserve_record_id_contract
     files_r1 = sorted(dm_part.rglob("*.parquet"))
     assert len(files_r1) == 1
     df_r1 = pd.read_parquet(files_r1[0])
-    assert "RECORD_ID" in df_r1.columns
+    assert "RECORD_ID" not in df_r1.columns
 
-    # Rerun with updated AGE and preserve_record_id=False (submission-clean SDTM) via SinkConfig
+    # Rerun with updated AGE and preserve_record_id=True via SinkConfig
     current_age[0] = 42
     export_to_hive_parquet(
         sdk,
@@ -337,7 +337,7 @@ def test_hive_parquet_streaming_and_sdtm_full_reruns_preserve_record_id_contract
         config=SinkConfig(
             study_key=study_key,
             as_sdtm=True,
-            preserve_record_id=False,
+            preserve_record_id=True,
             quality_gate_enabled=True,
             extra={"manifest_path": str(manifest_sdtm)},
         ),
@@ -346,7 +346,7 @@ def test_hive_parquet_streaming_and_sdtm_full_reruns_preserve_record_id_contract
     assert len(files_r2) == 1
     assert not files_r1[0].exists()
     df_r2 = pd.read_parquet(files_r2[0])
-    assert "RECORD_ID" not in df_r2.columns
+    assert "RECORD_ID" in df_r2.columns
     assert "recordId" not in df_r2.columns
     assert int(df_r2["AGE"].iloc[0]) == 42
     assert len(_read_manifest_entries(manifest_sdtm)) == 2

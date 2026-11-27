@@ -44,7 +44,11 @@ def _resolve_export_study(parser: argparse.ArgumentParser, args: argparse.Namesp
     return study_key
 
 
-def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
+def _add_streaming_export_args(
+    parser: argparse.ArgumentParser,
+    *,
+    allow_sdtm_and_naming: bool = True,
+) -> None:
     """Attach unified watermark, filtering, and checkpoint flags to an export subcommand."""
     parser.add_argument(
         "--since",
@@ -134,7 +138,11 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         dest="as_sdtm",
         action="store_true",
         default=False,
-        help="Transform exported study records into CDISC SDTM domain format.",
+        help=(
+            "Transform exported study records into CDISC SDTM domain format."
+            if allow_sdtm_and_naming
+            else argparse.SUPPRESS
+        ),
     )
     parser.add_argument(
         "--sdtm-domain",
@@ -142,8 +150,12 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         dest="sdtm_domain",
         default=None,
         help=(
-            "Target CDISC SDTM domain code (e.g. AE, DM, VS, LB, CM, EX, MH, DV, DD); "
-            "implies --as-sdtm."
+            (
+                "Target CDISC SDTM domain code (e.g. AE, DM, VS, LB, CM, EX, MH, DV, DD); "
+                "implies --as-sdtm."
+            )
+            if allow_sdtm_and_naming
+            else argparse.SUPPRESS
         ),
     )
     parser.add_argument(
@@ -165,7 +177,11 @@ def _add_streaming_export_args(parser: argparse.ArgumentParser) -> None:
         dest="naming_convention",
         choices=["snake_case", "camelCase", "sdtm"],
         default=None,
-        help="Variable and metadata key naming convention when --as-sdtm is off.",
+        help=(
+            "Variable and metadata key naming convention when --as-sdtm is off."
+            if allow_sdtm_and_naming
+            else argparse.SUPPRESS
+        ),
     )
     add_no_interactive(parser)
 
@@ -445,6 +461,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     def _dispatch_json(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(json_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
+        if args.hierarchical and (
+            stream_kwargs.get("as_sdtm") or stream_kwargs.get("sdtm_domain") is not None
+        ):
+            print_error(
+                "Error: --hierarchical JSON export cannot be combined with --as-sdtm or --sdtm-domain."
+            )
+            sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_json_cmd(
                 study_key=study_key,
@@ -493,7 +516,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         default=None,
         help="Optional deterministic ISO-8601 CreationDateTime header value.",
     )
-    _add_streaming_export_args(odm_parser)
+    _add_streaming_export_args(odm_parser, allow_sdtm_and_naming=False)
 
     @with_sdk
     def export_odm_cmd(
@@ -532,6 +555,20 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     def _dispatch_odm(args: argparse.Namespace) -> None:
         study_key = _resolve_export_study(odm_parser, args)
         stream_kwargs = _extract_streaming_kwargs(args)
+        unsupported_odm_flags: list[str] = []
+        if stream_kwargs.get("as_sdtm"):
+            unsupported_odm_flags.append("--as-sdtm")
+        if stream_kwargs.get("sdtm_domain") is not None:
+            unsupported_odm_flags.append("--sdtm-domain")
+        if stream_kwargs.get("naming_convention") is not None:
+            unsupported_odm_flags.append("--naming-convention")
+        if unsupported_odm_flags:
+            joined_flags = ", ".join(unsupported_odm_flags)
+            print_error(
+                f"Error: CDISC ODM 1.3.2 export does not support SDTM or naming convention "
+                f"options ({joined_flags})."
+            )
+            sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             export_odm_cmd(
                 study_key=study_key,

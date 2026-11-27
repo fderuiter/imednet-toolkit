@@ -140,3 +140,82 @@ async def test_universal_executor_skips_failure_accounting_for_non_retriable_err
 
     assert breaker.state == CircuitState.CLOSED
     assert breaker.consecutive_failures == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_universal_executor_opens_default_breaker_after_5_attempts_and_aborts_open_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    asynchronous: bool,
+) -> None:
+    """UniversalExecutor acquires one ProbeLease per attempt, opens after 5 failures, and sends 0 OPEN retries."""
+    from imednet.core.operations.circuit_breaker import (
+        CircuitBreaker,
+        CircuitBreakerError,
+        CircuitState,
+    )
+
+    now = 10.0
+    monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
+
+    breaker = CircuitBreaker()
+    executor = UniversalExecutor(
+        retry_config=RetryConfig(
+            retries=3,
+            backoff_factor=0.0,
+            retry_policy=DefaultOperationRetryPolicy(),
+        ),
+        circuit_breaker=breaker,
+    )
+
+    calls = 0
+    succeed = False
+
+    def sync_op() -> str:
+        nonlocal calls
+        calls += 1
+        if not succeed:
+            raise RuntimeError("transient sink outage")
+        return "ok"
+
+    async def async_op() -> str:
+        return sync_op()
+
+    async def invoke() -> str:
+        if asynchronous:
+            return await executor.execute_async(async_op)
+        return executor.execute(sync_op)
+
+    # Call 1: 4 attempts -> 4 failures, still CLOSED
+    with pytest.raises(RuntimeError, match="transient sink outage"):
+        await invoke()
+    assert calls == 4
+    assert breaker.consecutive_failures == 4
+    assert breaker.state is CircuitState.CLOSED
+
+    # Call 2: 5th failure opens breaker on attempt 1 and aborts remaining 3 retries immediately
+    with pytest.raises(RuntimeError, match="transient sink outage"):
+        await invoke()
+    assert calls == 5
+    assert breaker.state is CircuitState.OPEN
+    assert breaker.epoch == 1
+
+    # Call 3 while OPEN: 0 attempts, raises CircuitBreakerError
+    with pytest.raises(CircuitBreakerError):
+        await invoke()
+    assert calls == 5
+
+    # Advance past recovery_timeout: HALF_OPEN sends 1 probe and 0 OPEN retries on failure
+    now = 25.0
+    with pytest.raises(RuntimeError, match="transient sink outage"):
+        await invoke()
+    assert calls == 6
+    assert breaker.state is CircuitState.OPEN
+    assert breaker.epoch == 2
+
+    # Advance past recovery_timeout again: healthy probe closes HALF_OPEN and increments _epoch
+    now = 40.0
+    succeed = True
+    assert await invoke() == "ok"
+    assert calls == 7
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.epoch == 3

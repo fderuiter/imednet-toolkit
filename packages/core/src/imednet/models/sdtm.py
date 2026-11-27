@@ -5,7 +5,17 @@ from __future__ import annotations
 import functools
 import math
 import re
-from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterable,
+    AsyncIterator,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from collections.abc import (
+    Set as AbstractSet,
+)
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -1134,6 +1144,142 @@ def format_variable_name(
     return re.sub(r"[^A-Za-z0-9]", "", snake).upper()
 
 
+_NESTED_SEGMENT_RE = re.compile(r"^([^\[\]]+?)((?:\[\d+\])*)$")
+
+
+def format_nested_variable_name(
+    name: str,
+    convention: str | None,
+    *,
+    domain: str | None = None,
+) -> str:
+    """Format a flat or dotted/indexed nested clinical variable key using ``convention``."""
+    canonical_conv = normalize_naming_convention(convention)
+    if canonical_conv is None or not name:
+        return name
+
+    raw_parts = name.split(".")
+    if len(raw_parts) == 1 and "[" not in name:
+        return format_variable_name(name, canonical_conv, domain=domain)
+
+    parsed: list[tuple[str, str]] = []
+    for part in raw_parts:
+        if not part:
+            continue
+        match = _NESTED_SEGMENT_RE.match(part)
+        if match is not None:
+            parsed.append((match.group(1), match.group(2)))
+        else:
+            parsed.append((part, ""))
+
+    if not parsed:
+        return format_variable_name(name, canonical_conv, domain=domain)
+
+    formatted_parts: list[str] = []
+    for idx, (base, indices) in enumerate(parsed):
+        idx_suffix = indices.replace("[", "_").replace("]", "") if indices else ""
+        if canonical_conv == "snake_case":
+            conv_base = _to_snake_identifier(base) or base
+            formatted_parts.append(f"{conv_base}{idx_suffix}")
+        elif canonical_conv == "camelCase":
+            conv_base = format_variable_name(base, "camelCase")
+            if idx > 0 and conv_base:
+                conv_base = conv_base[0].upper() + conv_base[1:]
+            formatted_parts.append(f"{conv_base}{idx_suffix}")
+        else:
+            seg_dom = domain if idx == len(parsed) - 1 else None
+            conv_base = format_variable_name(base, "sdtm", domain=seg_dom)
+            formatted_parts.append(f"{conv_base}{idx_suffix}")
+
+    if canonical_conv == "camelCase":
+        return "".join(formatted_parts)
+    return "_".join(formatted_parts)
+
+
+def prefix_colliding_variable_name(
+    col: str,
+    metadata_lower: AbstractSet[str] = frozenset(),
+    *,
+    convention: str | None = None,
+    used_lower: set[str] | None = None,
+) -> str:
+    """Prefix metadata collisions with ``var_``/``VAR_`` and disambiguate case-insensitive duplicates."""
+    canonical_conv = normalize_naming_convention(convention)
+    prefix = "VAR_" if canonical_conv == "sdtm" else "var_"
+    candidate = f"{prefix}{col}" if col.lower() in metadata_lower else col
+    if used_lower is not None:
+        if candidate.lower() in used_lower:
+            suffix = 2
+            while True:
+                disambiguated = f"{candidate}_{suffix}"
+                if (
+                    disambiguated.lower() not in used_lower
+                    and disambiguated.lower() not in metadata_lower
+                ):
+                    candidate = disambiguated
+                    break
+                suffix += 1
+        used_lower.add(candidate.lower())
+    return candidate
+
+
+def extract_sdtm_composite_key(
+    row: Mapping[str, Any],
+) -> tuple[str, str, str, str | None, int | None] | None:
+    """Return ``(STUDYID, DOMAIN, USUBJID, seq_col, seq_val)`` for a transformed SDTM row."""
+    study_id = row.get("STUDYID")
+    domain = row.get("DOMAIN")
+    usubjid = row.get("USUBJID")
+    if study_id is None or domain is None or usubjid is None:
+        return None
+    dom_str = str(domain).strip().upper()
+    usubjid_str = str(usubjid).strip()
+    if not dom_str or not usubjid_str:
+        return None
+    if dom_str == "DM":
+        return (str(study_id), "DM", usubjid_str, None, None)
+    seq_col = f"{dom_str}SEQ"
+    raw_seq = row.get(seq_col)
+    if raw_seq is None:
+        for cand_col, cand_val in row.items():
+            cand_str = str(cand_col)
+            if cand_str.endswith("SEQ") and cand_str.upper() != "DMSEQ" and cand_val is not None:
+                seq_col = cand_str
+                raw_seq = cand_val
+                break
+    if raw_seq is None or isinstance(raw_seq, bool):
+        return (str(study_id), dom_str, usubjid_str, seq_col, None)
+    try:
+        seq_val = int(raw_seq)
+    except (TypeError, ValueError):
+        try:
+            as_float = float(raw_seq)
+        except (TypeError, ValueError):
+            return (str(study_id), dom_str, usubjid_str, seq_col, None)
+        if math.isnan(as_float) or math.isinf(as_float) or not as_float.is_integer():
+            return (str(study_id), dom_str, usubjid_str, seq_col, None)
+        seq_val = int(as_float)
+    return (str(study_id), dom_str, usubjid_str, seq_col, seq_val)
+
+
+def deduplicate_sdtm_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate transformed SDTM rows by composite key ``(STUDYID, DOMAIN, USUBJID[, <DOM>SEQ])``."""
+    if len(rows) <= 1:
+        return list(rows)
+    dedup_index: dict[tuple[Any, ...], int] = {}
+    ordered_rows: list[dict[str, Any] | None] = []
+    for row in rows:
+        comp = extract_sdtm_composite_key(row)
+        if comp is None or (comp[1] != "DM" and comp[4] is None):
+            ordered_rows.append(row)
+            continue
+        if comp in dedup_index:
+            ordered_rows[dedup_index[comp]] = None
+        dedup_index[comp] = len(ordered_rows)
+        ordered_rows.append(row)
+    return [r for r in ordered_rows if r is not None]
+
+
 _BASE_SDTM_CONSUMED_KEYS: frozenset[str] = frozenset(
     {
         "USUBJID",
@@ -1432,7 +1578,7 @@ def _normalize_positive_visitnum(val: Any) -> int | None:
 class _PreparedSdtmRow:
     """Normalized SDTM row prior to final per-subject sequence number assignment."""
 
-    usubjid: str
+    usubjid: str | None
     sort_key: tuple[tuple[int, str], tuple[tuple[int, str], ...], tuple[int, int, str], int]
     row: dict[str, Any]
     record_id: Any = None
@@ -1962,12 +2108,12 @@ class _SdtmNormalizer:
                 else None
             )
             or subj_fallback
-            or ""
         )
-        usubjid = str(usubjid_raw)
+        usubjid_text = str(usubjid_raw).strip() if usubjid_raw is not None else ""
+        usubjid: str | None = usubjid_text if usubjid_text else None
         if (
             self.mask_phi
-            and usubjid
+            and usubjid is not None
             and (
                 self._usubjid_is_sensitive
                 or (not explicit_usubjid and self._subject_key_is_sensitive)
@@ -2059,34 +2205,36 @@ class _SdtmNormalizer:
 
         if self.include_seq and (seq_overrides or record_seqs):
             for item in group:
+                subj_counter_key = item.usubjid or ""
                 rk = item.record_id_key or _canonical_record_id_key(item.record_id)
                 if rk is not None:
                     ov_val = _lookup_scoped_seq_value(
                         seq_overrides,
                         domain=self.domain_clean,
-                        usubjid=item.usubjid,
+                        usubjid=subj_counter_key,
                         rec_id_key=rk,
                         has_scoped_keys=overrides_has_scoped,
                     )
                     if ov_val is not None:
-                        seq_counters[item.usubjid] = max(
-                            seq_counters.get(item.usubjid, 0),
+                        seq_counters[subj_counter_key] = max(
+                            seq_counters.get(subj_counter_key, 0),
                             ov_val,
                         )
                     rs_val = _lookup_scoped_seq_value(
                         record_seqs,
                         domain=self.domain_clean,
-                        usubjid=item.usubjid,
+                        usubjid=subj_counter_key,
                         rec_id_key=rk,
                         has_scoped_keys=record_seqs_has_scoped or overrides_has_scoped,
                     )
                     if rs_val is not None:
-                        seq_counters[item.usubjid] = max(
-                            seq_counters.get(item.usubjid, 0),
+                        seq_counters[subj_counter_key] = max(
+                            seq_counters.get(subj_counter_key, 0),
                             rs_val,
                         )
         rows: list[dict[str, Any]] = []
         for item in group:
+            subj_counter_key = item.usubjid or ""
             rec_id_key = item.record_id_key or _canonical_record_id_key(item.record_id)
             assigned_seq: int | None = None
             if self.include_seq:
@@ -2095,7 +2243,7 @@ class _SdtmNormalizer:
                     override_seq = _lookup_scoped_seq_value(
                         seq_overrides,
                         domain=self.domain_clean,
-                        usubjid=item.usubjid,
+                        usubjid=subj_counter_key,
                         rec_id_key=rec_id_key,
                         has_scoped_keys=overrides_has_scoped,
                     )
@@ -2103,24 +2251,24 @@ class _SdtmNormalizer:
                         override_seq = _lookup_scoped_seq_value(
                             record_seqs,
                             domain=self.domain_clean,
-                            usubjid=item.usubjid,
+                            usubjid=subj_counter_key,
                             rec_id_key=rec_id_key,
                             has_scoped_keys=record_seqs_has_scoped or overrides_has_scoped,
                         )
 
                 if override_seq is not None:
                     assigned_seq = override_seq
-                    seq_counters[item.usubjid] = max(
-                        seq_counters.get(item.usubjid, 0),
+                    seq_counters[subj_counter_key] = max(
+                        seq_counters.get(subj_counter_key, 0),
                         assigned_seq,
                     )
                 else:
-                    assigned_seq = seq_counters.get(item.usubjid, 0) + 1
-                    seq_counters[item.usubjid] = assigned_seq
+                    assigned_seq = seq_counters.get(subj_counter_key, 0) + 1
+                    seq_counters[subj_counter_key] = assigned_seq
 
                 if record_seqs is not None and rec_id_key is not None:
                     scoped_rs_key = format_scoped_seq_override_key(
-                        self.domain_clean, item.usubjid, rec_id_key
+                        self.domain_clean, subj_counter_key, rec_id_key
                     )
                     record_seqs[scoped_rs_key] = assigned_seq
                     record_seqs_has_scoped = True
@@ -2134,6 +2282,8 @@ class _SdtmNormalizer:
                     "seq_val": assigned_seq if self.include_seq else None,
                 }
             rows.append(item.row)
+        if self.domain_clean == "DM":
+            return deduplicate_sdtm_rows(rows)
         return rows
 
     def rows_to_dataframe(self, rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -2237,7 +2387,7 @@ def _iter_sorted_sdtm_frames(
         for idx, rec in enumerate(records):
             prepared = normalizer.prepare_record(rec, idx)
             if prepared is not None:
-                grouped.setdefault(prepared.usubjid, []).append(prepared)
+                grouped.setdefault(prepared.usubjid or "", []).append(prepared)
         emit_rows: list[dict[str, Any]] = []
         for usubjid in sorted(grouped):
             subj_rows = normalizer.finalize_subject_group(
@@ -2264,17 +2414,18 @@ def _iter_sorted_sdtm_frames(
         prepared = normalizer.prepare_record(rec, orig_idx)
         if prepared is None:
             continue
+        cur_subj_key = prepared.usubjid or ""
 
         if last_usubjid is None:
-            last_usubjid = prepared.usubjid
+            last_usubjid = cur_subj_key
             current_group = [prepared]
             continue
 
-        if prepared.usubjid == last_usubjid:
+        if cur_subj_key == last_usubjid:
             current_group.append(prepared)
             continue
 
-        if prepared.usubjid < last_usubjid:
+        if cur_subj_key < last_usubjid:
             raise ValueError(
                 f"Non-monotonic USUBJID order in SDTM stream with source_is_ordered=True: "
                 f"{prepared.usubjid!r} arrived after {last_usubjid!r}."
@@ -2287,7 +2438,7 @@ def _iter_sorted_sdtm_frames(
             lineage_out=lineage_out,
         )
         current_group = [prepared]
-        last_usubjid = prepared.usubjid
+        last_usubjid = cur_subj_key
         yield from _emit_subject_group_frames(
             emit_buffer,
             subj_rows,
@@ -2412,7 +2563,7 @@ class _SdtmSubjectStreamOrderer:
         norm = self._get_normalizer(dom)
         prepared = norm.prepare_record(rec, idx)
         if prepared is not None:
-            return (prepared.usubjid, dom, prepared.sort_key, idx, rec)
+            return (prepared.usubjid or "", dom, prepared.sort_key, idx, rec)
         usubj, rec_id_sk = _extract_stream_usubjid_and_id(rec)
         fallback_sk = ((1, ""), (), rec_id_sk, idx)
         return (usubj, dom, fallback_sk, idx, rec)
@@ -2678,7 +2829,7 @@ def transform_records_to_sdtm_rows(
     for idx, rec in enumerate(records):
         prepared = normalizer.prepare_record(rec, idx)
         if prepared is not None:
-            grouped.setdefault(prepared.usubjid, []).append(prepared)
+            grouped.setdefault(prepared.usubjid or "", []).append(prepared)
 
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
@@ -2691,6 +2842,8 @@ def transform_records_to_sdtm_rows(
                 lineage_out=lineage_out,
             )
         )
+    if normalizer.domain_clean == "DM":
+        return deduplicate_sdtm_rows(rows)
     return rows
 
 
@@ -2742,7 +2895,7 @@ def transform_records_to_sdtm(
     for idx, rec in enumerate(records):
         prepared = normalizer.prepare_record(rec, idx)
         if prepared is not None:
-            grouped.setdefault(prepared.usubjid, []).append(prepared)
+            grouped.setdefault(prepared.usubjid or "", []).append(prepared)
 
     rows: list[dict[str, Any]] = []
     for usubjid in sorted(grouped):
@@ -2755,6 +2908,8 @@ def transform_records_to_sdtm(
                 lineage_out=lineage_out,
             )
         )
+    if normalizer.domain_clean == "DM":
+        rows = deduplicate_sdtm_rows(rows)
 
     return normalizer.rows_to_dataframe(rows)
 
@@ -2770,14 +2925,18 @@ __all__ = [
     "_iter_sorted_sdtm_frames",
     "async_iter_subject_ordered_sdtm_records",
     "build_form_sdtm_domain_map",
+    "deduplicate_sdtm_rows",
     "extract_record_form_ref",
+    "extract_sdtm_composite_key",
     "filter_forms_by_sdtm_domain",
     "format_iso8601_dtc",
+    "format_nested_variable_name",
     "format_variable_name",
     "get_sdtm_domain_variables",
     "iter_subject_ordered_sdtm_records",
     "merge_form_ids_into_record_filter",
     "normalize_naming_convention",
+    "prefix_colliding_variable_name",
     "record_matches_sdtm_domain",
     "resolve_form_sdtm_domain",
     "resolve_sdtm_domain",

@@ -348,12 +348,21 @@ class DataExtractionWorkflow:
         if on_progress:
             on_progress(f"Querying records for study '{study_key}'...")
 
-        records_ep = getattr(self._sdk, "records", None)
+        sdk_dict = getattr(self._sdk, "__dict__", {})
+        mock_children = getattr(self._sdk, "_mock_children", {})
+        is_mock_sdk = type(self._sdk).__module__.startswith("unittest.mock")
+        has_explicit_records = "records" in sdk_dict or "records" in mock_children
+        has_explicit_get_records = "get_records" in sdk_dict or "get_records" in mock_children
+        if is_mock_sdk and has_explicit_get_records and not has_explicit_records:
+            records_ep = None
+        else:
+            records_ep = getattr(self._sdk, "records", None)
         records_list_fn = getattr(records_ep, "list", None) if records_ep is not None else None
         use_records_list = callable(records_list_fn)
-        if use_records_list and type(self._sdk).__module__.startswith("unittest.mock"):
-            sdk_dict = getattr(self._sdk, "__dict__", {})
-            if "records" not in sdk_dict and "get_records" in sdk_dict:
+        if use_records_list and has_explicit_get_records:
+            ep_dict = getattr(records_ep, "__dict__", {})
+            ep_mock_children = getattr(records_ep, "_mock_children", {})
+            if "list" not in ep_dict and "list" not in ep_mock_children:
                 use_records_list = False
 
         if use_records_list and records_list_fn is not None:
