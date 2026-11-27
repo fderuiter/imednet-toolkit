@@ -247,3 +247,36 @@ def test_strict_wire_from_json_rejects_snake_case_while_constructors_accept_it()
         assert uat_var.variable_name == "SUBJID"
         spec = UATSpecification(study_key="S1", study_name="Demo Study")
         assert spec.study_key == "S1"
+
+
+def test_from_json_pre_pydantic_2_11_fallback_preserves_wire_only_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When model_validate lacks by_alias/by_name (e.g. Pyodide), from_json still enforces wire keys."""
+    import imednet.models.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_HAS_VALIDATE_BY_ALIAS", False)
+
+    # Permissive mode ignores snake_case keys on wire input without mutating caller dict
+    monkeypatch.setenv("IMEDNET_STRICT_MODE", "0")
+    caller_payload = {"study_key": "SNAKE", "studyName": "Wire Study"}
+    snapshot = dict(caller_payload)
+    permissive_study = Study.from_json(caller_payload)
+    assert caller_payload == snapshot
+    assert permissive_study.study_key is None
+    assert permissive_study.study_name == "Wire Study"
+
+    nested_rec = Record.from_json(
+        {"recordId": 7, "keywords": [{"keyword_name": "Ignored", "keywordKey": "WIRE_KEY"}]}
+    )
+    assert nested_rec.record_id == 7
+    assert nested_rec.keywords is not None
+    assert nested_rec.keywords[0].keyword_name == ""
+    assert nested_rec.keywords[0].keyword_key == "WIRE_KEY"
+
+    # Strict mode still raises ValidationError on snake_case wire keys
+    with strict_mode_context(True):
+        with pytest.raises(ValidationError, match="unexpected fields: study_key"):
+            Study.from_json({"study_key": "S1"})
+        valid_study = Study.from_json({"studyKey": "S1", "studyName": "Strict Study"})
+        assert valid_study.study_key == "S1"

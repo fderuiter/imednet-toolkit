@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import types
 from collections.abc import Callable
@@ -180,6 +181,7 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
 _drift_reported: set[str] = set()
 _FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]] = {}
 _WIRE_FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]] = {}
+_HAS_VALIDATE_BY_ALIAS: bool = "by_alias" in inspect.signature(BaseModel.model_validate).parameters
 
 
 def _get_field_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]:
@@ -270,11 +272,16 @@ class ImednetBaseModel(BaseModel):
                 data = {}
 
         try:
+            if _HAS_VALIDATE_BY_ALIAS:
+                return cls.model_validate(
+                    data,
+                    context={"wire": True},
+                    by_alias=True,
+                    by_name=False,
+                )
             return cls.model_validate(
                 data,
                 context={"wire": True},
-                by_alias=True,
-                by_name=False,
             )
         except Exception as e:
             msg = f"Drift detected (destructive): {cls.__name__} validation failed: {e}"
@@ -339,6 +346,15 @@ class ImednetBaseModel(BaseModel):
                 if msg not in _drift_reported:
                     _drift_reported.add(msg)
                     _drift_logger.warning(msg)
+
+        if (
+            is_wire
+            and not _HAS_VALIDATE_BY_ALIAS
+            and data.keys() & (cls.model_fields.keys() - defined_fields)
+        ):
+            return {
+                k: v for k, v in data.items() if k not in cls.model_fields or k in defined_fields
+            }
 
         return data
 

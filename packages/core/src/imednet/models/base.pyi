@@ -27,6 +27,7 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
 _drift_reported: set[str]
 _FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]]
 _WIRE_FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]]
+_HAS_VALIDATE_BY_ALIAS: bool
 
 def _get_field_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]: ...
 def _get_wire_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]: ...
