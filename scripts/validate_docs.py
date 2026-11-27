@@ -3791,6 +3791,209 @@ def check_sdtm_and_phi_parity(repo_root: Path | None = None) -> bool:
     return has_errors
 
 
+_STALE_SCHEMA_CACHE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "BaseSchemaCache returns early claim",
+        re.compile(r"returns\s+early", re.IGNORECASE),
+    ),
+    (
+        "BaseSchemaCache skips required policies claim",
+        re.compile(r"skipping\s+required", re.IGNORECASE),
+    ),
+    (
+        "SchemaCache structural and scalar type checks only claim",
+        re.compile(r"structural\s+and\s+scalar\s+type\s+checks\s+only", re.IGNORECASE),
+    ),
+    (
+        "SchemaCache basic scalar types only claim",
+        re.compile(
+            r"which\s+only\s+checks\s+Form\s+existence,\s+unknown\s+Variables,\s+and\s+basic\s+scalar\s+types",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Required Variable policies marked Skipped in coverage table",
+        re.compile(r"\*\s+-\s+Required\s+Variable\s+policies[^\n]*\n\s+-\s+Skipped"),
+    ),
+    (
+        "Skipped by bullet listing Required Variable policies",
+        re.compile(
+            r"-\s+\*\*Skipped\s+by\*\*[^\n]*(?:\n\s+[^\n]+)*?Required\s+Variable",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _extract_dunder_all_from_file(init_py: Path) -> set[str] | None:
+    """Extract string literals from ``__all__ = [...]`` in ``init_py`` when present."""
+    if not init_py.is_file():
+        return None
+    try:
+        tree = ast.parse(init_py.read_text(encoding="utf-8"), filename=str(init_py))
+    except SyntaxError:
+        return set()
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)
+            and isinstance(node.value, (ast.List, ast.Tuple))
+        ):
+            return {
+                elt.value
+                for elt in node.value.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            }
+    return set()
+
+
+def check_clinical_guides_parity(repo_root: Path | None = None) -> bool:
+    """Verify BaseSchemaCache policies, ODM RangeCheck/regex bounds, datadict exports, and EnrichmentPipeline scoping."""
+    print(
+        "Checking clinical guides parity against runtime validation, datadict, and enrichment contracts..."
+    )
+    root = repo_root or REPO_ROOT
+    core_src = str(REPO_ROOT / "packages" / "core" / "src")
+    if os.environ.get("IMEDNET_TEST_WHEELS") != "1" and core_src not in sys.path:
+        sys.path.insert(0, core_src)
+
+    schema_val_rst = root / "docs" / "explanation" / "schema_validation.rst"
+    datadict_rst = root / "docs" / "how-to" / "data_dictionary.rst"
+    caching_rst = root / "docs" / "how-to" / "caching.rst"
+    record_mapping_rst = root / "docs" / "how-to" / "record_mapping.rst"
+
+    for required_guide in (schema_val_rst, datadict_rst, caching_rst, record_mapping_rst):
+        if not required_guide.is_file():
+            print(f"Error: Missing clinical guide for parity validation: {required_guide}.")
+            return True
+
+    import imednet.datadict as datadict_pkg
+    from imednet.datadict.logic import (
+        _MAX_REGEX_INPUT_LENGTH,
+        _MAX_REGEX_PATTERN_LENGTH,
+        _MAX_REGEX_REPEAT_COUNT,
+        _VALID_RANGE_COMPARATORS,
+    )
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    has_errors = False
+
+    expected_datadict_exports = ("RangeCheckConstraint", "validate_regex_pattern")
+    runtime_exports = set(getattr(datadict_pkg, "__all__", ()))
+    local_init = root / "packages" / "core" / "src" / "imednet" / "datadict" / "__init__.py"
+    parsed_exports = _extract_dunder_all_from_file(local_init)
+    effective_exports = parsed_exports if parsed_exports is not None else runtime_exports
+    for sym in expected_datadict_exports:
+        if sym not in effective_exports or not hasattr(datadict_pkg, sym):
+            print(
+                f"Error: Symbol '{sym}' must be exported in imednet.datadict.__all__ and importable from imednet.datadict."
+            )
+            has_errors = True
+
+    schema_val_text = schema_val_rst.read_text(encoding="utf-8")
+    datadict_text = datadict_rst.read_text(encoding="utf-8")
+    caching_text = caching_rst.read_text(encoding="utf-8")
+    record_mapping_text = record_mapping_rst.read_text(encoding="utf-8")
+
+    for guide_path, guide_text in (
+        (schema_val_rst, schema_val_text),
+        (datadict_rst, datadict_text),
+        (caching_rst, caching_text),
+    ):
+        for req_token in ("BaseSchemaCache", "Yes", "Auto Query"):
+            if req_token not in guide_text:
+                print(
+                    f"Error: Required BaseSchemaCache policy token '{req_token}' missing from {guide_path}."
+                )
+                has_errors = True
+        for label, pattern in _STALE_SCHEMA_CACHE_PATTERNS:
+            if pattern.search(guide_text):
+                print(f"Error: Stale SchemaCache documentation ({label}) found in {guide_path}.")
+                has_errors = True
+
+    for schema_token in (
+        f"``{MASKED_SENTINEL}``",
+        "masked_phi",
+        "``_retired_form_variables``",
+        "``deleted``",
+        "``disabled``",
+    ):
+        if schema_token not in schema_val_text:
+            print(
+                f"Error: Runtime validation token '{schema_token}' is undocumented in {schema_val_rst}."
+            )
+            has_errors = True
+
+    for sym in expected_datadict_exports:
+        if sym not in datadict_text:
+            print(f"Error: Exported symbol '{sym}' is undocumented in {datadict_rst}.")
+            has_errors = True
+
+    for comparator in sorted(_VALID_RANGE_COMPARATORS):
+        if f"``{comparator}``" not in datadict_text:
+            print(
+                f"Error: ODM RangeCheck comparator '{comparator}' is undocumented in {datadict_rst}."
+            )
+            has_errors = True
+
+    for odm_token in (
+        "``Soft``",
+        "``Hard``",
+        "range_check_soft",
+        "range_check",
+        "UTC",
+        "``MM-DD-YYYY``",
+        "``YYYY-MM-DD``",
+        "unsafe_regex",
+    ):
+        if odm_token not in datadict_text:
+            print(
+                f"Error: Data Dictionary runtime token '{odm_token}' missing from {datadict_rst}."
+            )
+            has_errors = True
+
+    for cap_label, cap_value in (
+        ("_MAX_REGEX_PATTERN_LENGTH", _MAX_REGEX_PATTERN_LENGTH),
+        ("_MAX_REGEX_REPEAT_COUNT", _MAX_REGEX_REPEAT_COUNT),
+        ("_MAX_REGEX_INPUT_LENGTH", _MAX_REGEX_INPUT_LENGTH),
+    ):
+        if f"``{cap_value}``" not in datadict_text:
+            print(
+                f"Error: Runtime regex bound {cap_label}={cap_value} is undocumented in {datadict_rst}."
+            )
+            has_errors = True
+
+    process_params = inspect.signature(EnrichmentPipeline.process).parameters
+    for param_name in ("domain", "form_key"):
+        if param_name not in process_params:
+            print(
+                f"Error: EnrichmentPipeline.process missing expected runtime parameter '{param_name}'."
+            )
+            has_errors = True
+
+    for enrichment_token in (
+        "``(domain, source_form_key, source_variable_name)``",
+        "``fallback_value``",
+        "``domain.variable``",
+        'domain="AE"',
+        'form_key="F_AE"',
+    ):
+        if enrichment_token not in record_mapping_text:
+            print(
+                f"Error: EnrichmentPipeline scoping/terminology token '{enrichment_token}' missing from {record_mapping_rst}."
+            )
+            has_errors = True
+
+    if not has_errors:
+        print(
+            "Clinical guides parity verified ("
+            f"regex bounds={_MAX_REGEX_PATTERN_LENGTH}/{_MAX_REGEX_REPEAT_COUNT}/{_MAX_REGEX_INPUT_LENGTH}, "
+            f"{len(_VALID_RANGE_COMPARATORS)} ODM comparators, {len(expected_datadict_exports)} datadict exports)."
+        )
+    return has_errors
+
+
 _DUCKDB_CREATE_REL_RE = re.compile(
     r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)",
     re.IGNORECASE,
@@ -3939,6 +4142,13 @@ _FIRST_PARTY_XREF_PREFIXES = (
     "ExportSink",
     "transform_records_to_sdtm_rows",
     "evaluate_standards_readiness",
+    "RangeCheckConstraint",
+    "validate_regex_pattern",
+    "BaseSchemaCache",
+    "SchemaCache",
+    "AsyncSchemaCache",
+    "EnrichmentPipeline",
+    "validate_record_data",
 )
 
 
@@ -3964,15 +4174,26 @@ def check_compliance_html_links(html_dir: Path | None, *, require_exists: bool =
         "how-to/record_mapping.html": (
             "transform_records_to_sdtm_rows",
             "evaluate_standards_readiness",
+            "EnrichmentPipeline",
+        ),
+        "how-to/data_dictionary.html": (
+            "RangeCheckConstraint",
+            "validate_regex_pattern",
+        ),
+        "explanation/schema_validation.html": (
+            "BaseSchemaCache",
+            "validate_record_data",
         ),
         "reference/governance.html": ("rollback_config",),
         "explanation/api_overview.html": ("AuthStrategy", "OIDCAuth", "MemoryCredentialStore"),
     }
 
     models_html = html_dir / "reference" / "api" / "imednet.models.html"
-    if not models_html.is_file():
-        print(f"Error: Missing rendered API reference page {models_html}.")
-        return True
+    datadict_html = html_dir / "reference" / "api" / "imednet.datadict.html"
+    for api_ref_html in (models_html, datadict_html):
+        if not api_ref_html.is_file():
+            print(f"Error: Missing rendered API reference page {api_ref_html}.")
+            return True
 
     parsed_cache: dict[Path, _ComplianceLinkParser] = {}
 
@@ -3990,6 +4211,15 @@ def check_compliance_html_links(html_dir: Path | None, *, require_exists: bool =
     if validate_chain_id not in models_parsed.ids:
         print(f"Error: Method anchor '{validate_chain_id}' missing from {models_html}.")
         has_errors = True
+
+    datadict_parsed = _get_parsed(datadict_html)
+    for datadict_anchor in (
+        "imednet.datadict.logic.RangeCheckConstraint",
+        "imednet.datadict.logic.validate_regex_pattern",
+    ):
+        if datadict_anchor not in datadict_parsed.ids:
+            print(f"Error: Datadict API anchor '{datadict_anchor}' missing from {datadict_html}.")
+            has_errors = True
 
     for rel_page, expected_symbols in required_page_symbols.items():
         page_path = html_dir / rel_page
@@ -4076,6 +4306,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     adr_failed = check_adr_records()
     env_vars_failed = check_env_vars_documented()
     sdtm_phi_failed = check_sdtm_and_phi_parity()
+    clinical_guides_failed = check_clinical_guides_parity()
     duckdb_parity_failed = check_duckdb_relations_parity()
     githubpages_failed = check_sphinx_githubpages_extension()
     baseurl_failed = check_sphinx_html_baseurl()
@@ -4107,6 +4338,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         or adr_failed
         or env_vars_failed
         or sdtm_phi_failed
+        or clinical_guides_failed
         or duckdb_parity_failed
         or githubpages_failed
         or baseurl_failed
