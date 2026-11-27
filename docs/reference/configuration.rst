@@ -67,7 +67,7 @@ Environment Variables
      - Filesystem path for ``FileStateProvider`` / ``ExtractionStateLedger`` incremental high-water mark checkpoints.
      - ``.imednet_workflow_state.json``
    * - IMEDNET_TRIAGE_DB_PATH
-     - SQLite database path for ``TriageStore`` operational ``Query`` triage state in ``imednet-workflows``.
+     - Base SQLite database path for ``TriageStore`` operational ``Query`` triage state in ``imednet-workflows`` prior to dynamic origin directory scoping.
      - ``~/.imednet/triage.sqlite3``
    * - IMEDNET_CLI_OUTPUT_FORMAT
      - Default output format (``table``, ``json``, or ``csv``) for ``imednet`` CLI commands when ``--format`` is omitted.

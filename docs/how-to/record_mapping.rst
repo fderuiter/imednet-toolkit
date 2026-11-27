@@ -85,6 +85,26 @@ parsed with :func:`~imednet.utils.parse_expression` and executed inside
   :func:`~imednet.spi.models.transform_records_to_sdtm_rows` applies ``EnrichmentPipeline``
   prior to CDISC SDTM domain projection, blocked or failing expressions likewise retain
   the raw ``Record`` ``Variable`` value instead of aborting the batch.
+* **Scoped** ``(domain, source_form_key, source_variable_name)`` **resolution and collision skips:**
+  :class:`~imednet.integrations.enrichment.EnrichmentPipeline` indexes each ``MappingRule``
+  by ``(domain, source_form_key, source_variable_name)``. Pass ``domain`` and ``form_key``
+  to :meth:`~imednet.integrations.enrichment.EnrichmentPipeline.process` (or include
+  ``DOMAIN`` / ``domain`` and ``formKey`` / ``form_key`` keys on a Record dictionary) when
+  a Study defines multiple Forms. If ``domain`` and ``form_key`` are omitted and more than
+  one ``MappingRule`` shares the same ``source_variable_name`` (or ``snake_case`` alias),
+  unscoped lookup returns ``None`` and skips conflicting rules rather than applying the
+  wrong Form's transformation.
+* **Scoped** ``fallback_value`` **defaults:** Missing, ``None``, or whitespace-only Variable
+  values receive ``MappingRule.fallback_value`` defaults when ``process`` runs with matching
+  ``domain`` / ``form_key`` context (populating nested ``recordData`` / ``record_data``
+  dictionaries when enriching full Record envelopes). Unscoped ``process`` calls skip
+  ``fallback_value`` rules that declare a ``source_form_key`` or collide across multiple
+  rules.
+* ``domain.variable`` **terminology lookup precedence:** When mapping coded values through
+  ``StudyConfiguration.terminology_lookups``, ``EnrichmentPipeline`` checks
+  domain-qualified ``domain.variable`` keys first (for example, ``"AE.aeSeverity"`` when
+  ``domain="AE"``), then the exact ``Variable`` key (``"aeSeverity"``), and finally its
+  normalized ``snake_case`` key (``"ae_severity"``).
 
 .. testcode::
 
@@ -137,6 +157,11 @@ parsed with :func:`~imednet.utils.parse_expression` and executed inside
 
    mapping_cfg = StudyConfiguration(
        study_key="STUDY",
+       terminology_lookups={
+           "AE.aeSeverity": {"2": " moderate "},
+           "aeSeverity": {"2": " grade 2 "},
+           "ae_outcome": {"1": "RECOVERED/RESOLVED"},
+       },
        mappings=[
            MappingRule(
                domain="AE",
@@ -146,29 +171,65 @@ parsed with :func:`~imednet.utils.parse_expression` and executed inside
                business_logic="value.strip().upper()",
            ),
            MappingRule(
+               domain="CM",
+               target_field="cmSeverity",
+               source_form_key="F_CM",
+               source_variable_name="aeSeverity",
+               business_logic="value.strip().lower()",
+           ),
+           MappingRule(
                domain="AE",
                target_field="aeTerm",
                source_form_key="F_AE",
                source_variable_name="aeTerm",
                business_logic="'{0.__class__}'.format(value)",
            ),
+           MappingRule(
+               domain="AE",
+               target_field="aeOutcome",
+               source_form_key="F_AE",
+               source_variable_name="aeOutcome",
+               fallback_value="UNKNOWN",
+           ),
        ],
    )
    enrichment = EnrichmentPipeline(mapping_cfg)
-   enriched_payload = enrichment.process(
+
+   # Unscoped call skips colliding multi-Form 'aeSeverity' rules and Form-scoped 'fallback_value'
+   unscoped_payload = enrichment.process(
        {"aeSeverity": " moderate ", "aeTerm": "Headache"},
        mask_phi=False,
+   )
+   assert unscoped_payload["aeSeverity"] == " moderate "
+   assert "aeOutcome" not in unscoped_payload
+
+   # Scoped call resolves (AE, F_AE, *), applies AE.aeSeverity terminology + snake_case lookup, and fills fallback_value
+   enriched_payload = enrichment.process(
+       {"aeSeverity": "2", "aeTerm": "Headache", "aeOutcome": ""},
+       mask_phi=False,
+       domain="AE",
+       form_key="F_AE",
    )
    assert enriched_payload["aeSeverity"] == "MODERATE"
    # Blocked .format() expression falls back to the raw Variable value
    assert enriched_payload["aeTerm"] == "Headache"
+   assert enriched_payload["aeOutcome"] == "UNKNOWN"
+
+   mapped_outcome = enrichment.process(
+       {"aeSeverity": "2", "aeTerm": "Headache", "aeOutcome": "1"},
+       mask_phi=False,
+       domain="AE",
+       form_key="F_AE",
+   )
+   assert mapped_outcome["aeOutcome"] == "RECOVERED/RESOLVED"
 
    sdtm_rows = transform_records_to_sdtm_rows(
        [
            {
                "subjectKey": "SUBJ-001",
                "recordId": 101,
-               "record_data": {"aeSeverity": " moderate ", "aeTerm": "Headache"},
+               "formKey": "F_AE",
+               "record_data": {"aeSeverity": "2", "aeTerm": "Headache"},
            }
        ],
        "AE",

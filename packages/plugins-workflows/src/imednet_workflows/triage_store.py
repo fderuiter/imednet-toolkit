@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
+from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from imednet.spi.models import (
     TriageAnnotation,
@@ -19,12 +22,189 @@ from imednet.spi.models import (
     TriageStatus,
     validate_transition,
 )
-from imednet.spi.utils import redact_sensitive_payload, redact_sensitive_text, sqlite_connection
+from imednet.spi.utils import (
+    PathTraversalValidationError,
+    SensitivityRegistry,
+    build_study_sensitivity_registry,
+    extract_sdk_security_key,
+    get_base_url_context,
+    get_security_key_context,
+    get_study_context,
+    normalize_cache_origin,
+    redact_sensitive_payload,
+    redact_sensitive_text,
+    reset_base_url_context,
+    reset_security_key_context,
+    resolve_sdk_base_url,
+    resolve_study_configuration,
+    sanitize_diagnostic_text,
+    set_base_url_context,
+    set_security_key_context,
+    sqlite_connection,
+    validate_partition_key,
+)
 
-DEFAULT_TRIAGE_DB_PATH = Path.home() / ".imednet" / "triage.sqlite3"
+DEFAULT_TRIAGE_DB_PATH = Path("~/.imednet/triage.sqlite3")
+_ORIG_PATH_HOME_FUNC = getattr(Path.home, "__func__", Path.home)
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[/\\]")
+_SAFE_SEGMENT_SUB_RE = re.compile(r"[^a-zA-Z0-9_.-]")
 _LATEST_SCHEMA_VERSION = 2
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _RETRY_BASE_DELAY_SECONDS = 0.05
+
+
+def _resolve_dynamic_home() -> Path:
+    """Resolve user home directory dynamically honoring monkeypatched ``Path.home()`` and ``HOME``."""
+    home_fn = Path.home
+    if getattr(home_fn, "__func__", home_fn) is not _ORIG_PATH_HOME_FUNC:
+        return Path(home_fn())
+    env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if env_home and env_home.strip():
+        return Path(env_home.strip())
+    return Path.home()
+
+
+def _expand_triage_path(raw_path: str | Path) -> Path:
+    """Expand leading ``~`` using dynamic home resolution."""
+    raw_str = os.fspath(raw_path)
+    if raw_str == "~":
+        return _resolve_dynamic_home()
+    if raw_str.startswith(("~/", "~\\")):
+        return _resolve_dynamic_home() / raw_str[2:]
+    return Path(raw_str).expanduser()
+
+
+def _resolve_raw_triage_db_path(db_path: str | Path | None) -> Path:
+    """Resolve unpartitioned base SQLite file path from argument, env, or dynamic home."""
+    if db_path is not None:
+        return _expand_triage_path(db_path)
+    raw_env = os.environ.get("IMEDNET_TRIAGE_DB_PATH")
+    if raw_env and raw_env.strip():
+        return _expand_triage_path(raw_env.strip())
+    return _resolve_dynamic_home() / ".imednet" / "triage.sqlite3"
+
+
+def _has_control_or_null(value: str) -> bool:
+    """Return True if *value* contains NUL or ASCII control characters."""
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def _sanitize_origin_segment(raw_url: str) -> str:
+    """Normalize and validate an origin URL into a safe single directory segment."""
+    candidate = raw_url.strip() if raw_url and raw_url.strip() else "http://localhost"
+    decoded = unquote(candidate)
+    if _has_control_or_null(candidate) or _has_control_or_null(decoded):
+        raise PathTraversalValidationError("Origin URL must not contain control characters.")
+    if "\\" in candidate or "\\" in decoded or _WINDOWS_DRIVE_RE.match(decoded):
+        raise PathTraversalValidationError(f"Unsafe path delimiters in origin URL: {raw_url!r}")
+    if candidate.startswith("/") or decoded.startswith("/"):
+        raise PathTraversalValidationError(f"Origin URL must not be a rooted path: {raw_url!r}")
+
+    probe = decoded if "://" in decoded else f"https://{decoded}"
+    parsed_probe = urlsplit(probe)
+    if parsed_probe.scheme.lower() not in {"http", "https"}:
+        raise PathTraversalValidationError(
+            f"Unsupported origin URL scheme: {parsed_probe.scheme!r}"
+        )
+    hostname = parsed_probe.hostname or ""
+    if not hostname or hostname in {".", ".."} or ".." in hostname:
+        raise PathTraversalValidationError(f"Unsafe hostname in origin URL: {raw_url!r}")
+    for part in parsed_probe.path.split("/"):
+        if part in {".", ".."}:
+            raise PathTraversalValidationError(
+                f"Relative dot-segments are not allowed in origin URL: {raw_url!r}"
+            )
+
+    normalized_origin = normalize_cache_origin(candidate)
+    parsed_norm = urlsplit(normalized_origin)
+    raw_segment = (
+        f"{parsed_norm.netloc}{parsed_norm.path}"
+        if parsed_norm.path and parsed_norm.path != "/"
+        else (parsed_norm.netloc or parsed_norm.path)
+    )
+    sanitized = _SAFE_SEGMENT_SUB_RE.sub("_", raw_segment)
+    if not sanitized or sanitized in {".", ".."}:
+        raise PathTraversalValidationError(f"Invalid sanitized origin segment: {sanitized!r}")
+    validate_partition_key(sanitized)
+    return sanitized
+
+
+def _resolve_store_origin(
+    *,
+    explicit_db_path: bool,
+    base_url: str | None,
+    sdk: Any,
+) -> str | None:
+    """Determine normalized origin URL for store scoping, or ``None`` for unscoped explicit paths."""
+    if base_url is not None:
+        return base_url if base_url.strip() else "http://localhost"
+    if sdk is not None:
+        return resolve_sdk_base_url(sdk)
+    ctx_url = get_base_url_context()
+    if ctx_url is not None:
+        return ctx_url if ctx_url.strip() else "http://localhost"
+    if explicit_db_path:
+        return None
+    env_url = os.environ.get("IMEDNET_BASE_URL")
+    if env_url is not None and env_url.strip():
+        return env_url.strip()
+    return resolve_sdk_base_url(None)
+
+
+def _compute_scoped_db_path(base_db_path: Path, origin_url: str | None) -> tuple[Path, bool]:
+    """Compute validated ``(target_db_path, is_origin_scoped)`` with traversal checks."""
+    ctx_study = get_study_context()
+    if ctx_study:
+        validate_partition_key(ctx_study)
+
+    if origin_url is None:
+        return (base_db_path, False)
+
+    segment = _sanitize_origin_segment(origin_url)
+    base_dir = base_db_path.parent
+    host_dir = base_dir / segment
+    resolved_base = base_dir.resolve()
+    resolved_host = host_dir.resolve()
+    if resolved_host == resolved_base or not resolved_host.is_relative_to(resolved_base):
+        raise PathTraversalValidationError(
+            f"Resolved target directory {resolved_host} escapes base directory {resolved_base}"
+        )
+    return (host_dir / base_db_path.name, True)
+
+
+def _ensure_secure_directory(target_dir: Path, *, harden_existing_leaf: bool) -> None:
+    """Create ``target_dir`` and enforce ``0700`` permissions on created/store directories on POSIX."""
+    missing_ancestors: list[Path] = []
+    if os.name == "posix":
+        probe = target_dir
+        while not probe.exists() and probe != probe.parent:
+            missing_ancestors.append(probe)
+            probe = probe.parent
+
+    target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "posix":
+        return
+
+    for created_dir in reversed(missing_ancestors):
+        with suppress(OSError):
+            os.chmod(created_dir, 0o700)
+    if harden_existing_leaf or target_dir.name == ".imednet":
+        with suppress(OSError):
+            os.chmod(target_dir, 0o700)
+
+
+def _precreate_and_harden_sqlite_files(db_path: Path, *, create_if_missing: bool) -> None:
+    """Ensure SQLite DB, WAL, and SHM files use ``0600`` owner-only permissions on POSIX."""
+    if os.name != "posix":
+        return
+    if create_if_missing and not db_path.exists():
+        with suppress(OSError):
+            fd = os.open(db_path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+    for candidate in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if candidate.exists():
+            with suppress(OSError):
+                os.chmod(candidate, 0o600)
 
 
 class TriageStore:
@@ -34,6 +214,8 @@ class TriageStore:
         self,
         db_path: str | Path | None = None,
         *,
+        base_url: str | None = None,
+        sdk: Any = None,
         timeout: float = 30.0,
         retry_attempts: int = 3,
     ) -> None:
@@ -41,17 +223,33 @@ class TriageStore:
 
         Args:
             db_path: Path to the SQLite database file. Defaults to
-                ``IMEDNET_TRIAGE_DB_PATH`` or ``~/.imednet/triage.sqlite3``.
+                ``IMEDNET_TRIAGE_DB_PATH`` or ``~/.imednet/<origin>/triage.sqlite3``.
+            base_url: Optional EDC origin URL to scope the store directory under.
+            sdk: Optional SDK or facade instance supplying origin and governance context.
             timeout: Maximum time to wait for a database connection.
             retry_attempts: Number of write retry attempts.
         """
-        raw_path = (
-            db_path
-            if db_path is not None
-            else os.environ.get("IMEDNET_TRIAGE_DB_PATH", DEFAULT_TRIAGE_DB_PATH)
+        raw_base_path = _resolve_raw_triage_db_path(db_path)
+        origin_url = _resolve_store_origin(
+            explicit_db_path=db_path is not None,
+            base_url=base_url,
+            sdk=sdk,
         )
-        self.db_path = Path(raw_path).expanduser()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_db_path, is_origin_scoped = _compute_scoped_db_path(raw_base_path, origin_url)
+        self._pinned_base_url: str | None = (
+            normalize_cache_origin(origin_url)
+            if origin_url is not None and origin_url.strip()
+            else origin_url
+        )
+        self._sdk_security_key: str | None = (
+            extract_sdk_security_key(sdk) if sdk is not None else get_security_key_context()
+        )
+        self._is_origin_scoped = is_origin_scoped
+        self.db_path = resolved_db_path
+        _ensure_secure_directory(
+            self.db_path.parent,
+            harden_existing_leaf=is_origin_scoped or db_path is None,
+        )
         self._timeout = timeout
         self._retry_attempts = retry_attempts
         self._lock = RLock()
@@ -60,6 +258,11 @@ class TriageStore:
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         """Context manager for a configured SQLite connection."""
+        _ensure_secure_directory(
+            self.db_path.parent,
+            harden_existing_leaf=self._is_origin_scoped,
+        )
+        _precreate_and_harden_sqlite_files(self.db_path, create_if_missing=True)
         try:
             with sqlite_connection(
                 self.db_path,
@@ -67,7 +270,11 @@ class TriageStore:
                 busy_timeout_ms=_SQLITE_BUSY_TIMEOUT_MS,
                 foreign_keys=True,
             ) as conn:
-                yield conn
+                _precreate_and_harden_sqlite_files(self.db_path, create_if_missing=False)
+                try:
+                    yield conn
+                finally:
+                    _precreate_and_harden_sqlite_files(self.db_path, create_if_missing=False)
         except sqlite3.IntegrityError:
             raise
         except sqlite3.Error as exc:
@@ -75,6 +282,41 @@ class TriageStore:
                 f"Unable to open triage store at {self._redact_sqlite_target(str(self.db_path))}: "
                 f"{self._redact_error_text(str(exc))}"
             ) from exc
+
+    def _resolve_sensitivity_registry(self, study_key: str | None) -> SensitivityRegistry:
+        """Build a study-aware ``SensitivityRegistry`` without requiring an encryption key."""
+        token_base = (
+            set_base_url_context(self._pinned_base_url)
+            if self._pinned_base_url is not None and get_base_url_context() is None
+            else None
+        )
+        token_sec = (
+            set_security_key_context(self._sdk_security_key)
+            if self._sdk_security_key is not None and get_security_key_context() is None
+            else None
+        )
+        try:
+            study_cfg = resolve_study_configuration(study_key)
+        finally:
+            if token_sec is not None:
+                reset_security_key_context(token_sec)
+            if token_base is not None:
+                reset_base_url_context(token_base)
+        phi_fields = study_cfg.phi_fields if study_cfg is not None else None
+        return build_study_sensitivity_registry(phi_fields)
+
+    def _scrub_comment(
+        self,
+        comment: str,
+        *,
+        study_key: str | None = None,
+        registry: SensitivityRegistry | None = None,
+    ) -> str:
+        """Scrub PHI expressions and credentials from a triage comment string."""
+        active_registry = (
+            registry if registry is not None else self._resolve_sensitivity_registry(study_key)
+        )
+        return sanitize_diagnostic_text(comment, registry=active_registry)
 
     def _initialize_schema(self) -> None:
         """Create database tables and indexes if they do not exist."""
@@ -160,6 +402,7 @@ class TriageStore:
     def upsert_item(self, item: TriageItem) -> None:
         """Insert or update a triage item while preserving prior annotations and history."""
         now = datetime.now(UTC).isoformat()
+        registry = self._resolve_sensitivity_registry(item.study_key)
 
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to write triage item data."""
@@ -227,7 +470,7 @@ class TriageStore:
                             annotation.annotation_id,
                             item.item_id,
                             annotation.user_id,
-                            annotation.comment,
+                            self._scrub_comment(annotation.comment, registry=registry),
                             annotation.timestamp.isoformat(),
                         )
                         for annotation in item.annotations
@@ -249,7 +492,11 @@ class TriageStore:
                             entry.from_status.value,
                             entry.to_status.value,
                             entry.user_id,
-                            entry.comment,
+                            (
+                                self._scrub_comment(entry.comment, registry=registry)
+                                if entry.comment is not None
+                                else None
+                            ),
                             entry.timestamp.isoformat(),
                         )
                         for entry in item.history
@@ -458,7 +705,7 @@ class TriageStore:
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to update item status."""
             row = conn.execute(
-                "SELECT status FROM triage_items WHERE item_id = ?",
+                "SELECT study_key, status FROM triage_items WHERE item_id = ?",
                 (item_id,),
             ).fetchone()
             if row is None:
@@ -473,6 +720,11 @@ class TriageStore:
                 return
 
             validate_transition(from_status, target_status)
+            scrubbed_comment = (
+                self._scrub_comment(normalized_comment, study_key=str(row["study_key"]))
+                if normalized_comment is not None
+                else None
+            )
 
             conn.execute(
                 """
@@ -495,7 +747,7 @@ class TriageStore:
                     from_status.value,
                     target_status.value,
                     user_id,
-                    normalized_comment,
+                    scrubbed_comment,
                     timestamp,
                 ),
             )
@@ -513,18 +765,22 @@ class TriageStore:
         def _write(conn: sqlite3.Connection) -> None:
             """Internal helper to add item annotation."""
             row = conn.execute(
-                "SELECT item_id FROM triage_items WHERE item_id = ?",
+                "SELECT study_key FROM triage_items WHERE item_id = ?",
                 (item_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"Unknown triage item: {item_id}")
 
+            scrubbed_comment = self._scrub_comment(
+                cleaned_comment,
+                study_key=str(row["study_key"]),
+            )
             conn.execute(
                 """
                 INSERT INTO triage_annotations (annotation_id, item_id, user_id, comment, timestamp)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (str(uuid.uuid4()), item_id, user_id, cleaned_comment, timestamp),
+                (str(uuid.uuid4()), item_id, user_id, scrubbed_comment, timestamp),
             )
             conn.execute(
                 "UPDATE triage_items SET updated_at = ? WHERE item_id = ?",

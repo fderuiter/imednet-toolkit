@@ -123,14 +123,27 @@ def _compare_extra_attributes(
             report.add("modified", f"{path_prefix}.{k}", old_extra[k], new_extra[k])
 
 
-def _rule_key(r: BusinessLogicRule, idx: int) -> str:
-    if r.id is not None:
+def _rule_key(r: BusinessLogicRule, occurrence_index: int = 0) -> str:
+    if r.id is not None and str(r.id).strip() != "":
         return str(r.id)
-    if r.name is not None:
-        return str(r.name)
-    if r.sequence is not None:
-        return f"seq_{r.sequence}"
-    return f"rule_{idx}"
+    rtype = r.type or ""
+    rform = r.form or ""
+    rname = r.name or ""
+    return f"{rtype}:{rform}:{rname}:{occurrence_index}"
+
+
+def _index_rules(rules: list[BusinessLogicRule]) -> dict[str, BusinessLogicRule]:
+    indexed: dict[str, BusinessLogicRule] = {}
+    unnamed_counts: dict[tuple[str, str, str], int] = {}
+    for r in rules:
+        if r.id is not None and str(r.id).strip() != "":
+            indexed[str(r.id)] = r
+        else:
+            sig = (r.type or "", r.form or "", r.name or "")
+            occ_idx = unnamed_counts.get(sig, 0)
+            unnamed_counts[sig] = occ_idx + 1
+            indexed[_rule_key(r, occ_idx)] = r
+    return indexed
 
 
 def _compare_rules(
@@ -139,8 +152,8 @@ def _compare_rules(
     path_prefix: str,
     report: DiffReport,
 ) -> None:
-    old_by_id = {_rule_key(r, idx): r for idx, r in enumerate(old_rules)}
-    new_by_id = {_rule_key(r, idx): r for idx, r in enumerate(new_rules)}
+    old_by_id = _index_rules(old_rules)
+    new_by_id = _index_rules(new_rules)
 
     for rid, old_r in old_by_id.items():
         if rid not in new_by_id:
@@ -151,7 +164,7 @@ def _compare_rules(
             report.add("added", f"{path_prefix}.rule[{rid}]", new_val=new_r.name or rid)
         else:
             old_r = old_by_id[rid]
-            for attr in ("name", "status", "type", "logic", "logicRawXml"):
+            for attr in ("name", "status", "type", "form", "sequence", "logic", "logicRawXml"):
                 ov = getattr(old_r, attr)
                 nv = getattr(new_r, attr)
                 if ov != nv:
