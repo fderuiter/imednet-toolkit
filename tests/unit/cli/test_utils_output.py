@@ -923,3 +923,68 @@ def test_sync_worker_cli_interval_bounds_and_non_interactive_telemetry_and_fatal
             assert leaked not in res_err.stderr
             assert leaked not in res_err.stdout
         sdk_inst.close.assert_called_once()
+
+
+def test_emit_json_and_display_list_masked_non_string_model_fields_emit_no_warnings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Masked non-string Pydantic fields serialize cleanly without Pydantic warnings."""
+    import json
+    import warnings
+
+    from imednet.cli.utils.output import display_list, emit_json
+    from imednet.models.record_revisions import RecordRevision
+    from imednet.models.records import Record
+
+    rec = Record.model_validate(
+        {
+            "studyKey": "STUDY",
+            "recordId": 601,
+            "recordOid": "REC-601",
+            "subjectKey": "SUBJ-001",
+            "siteId": 201,
+            "formKey": "F_AE",
+            "recordData": {"V_AGE": 48, "aeTerm": "Nausea"},
+        }
+    ).model_copy(
+        update={
+            "record_oid": "***MASKED***",
+            "site_id": "***MASKED***",
+            "record_data": {"V_AGE": "***MASKED***", "aeTerm": "***MASKED***"},
+        }
+    )
+    rev = RecordRevision.model_validate(
+        {
+            "studyKey": "STUDY",
+            "recordRevisionId": 9001,
+            "recordId": 601,
+            "recordOid": "REC-601",
+            "subjectKey": "SUBJ-001",
+            "siteId": 201,
+            "intervalId": 401,
+            "recordRevision": 1,
+            "dataRevision": 1,
+        }
+    ).model_copy(
+        update={
+            "record_oid": "***MASKED***",
+            "site_id": "***MASKED***",
+            "interval_id": "***MASKED***",
+        }
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        emit_json([rec, rev], "records")
+        json_out = capsys.readouterr().out
+        display_list([rev], "revisions", interactive=False)
+        table_out = capsys.readouterr().out
+
+    assert caught == []
+    parsed = json.loads(json_out)
+    assert parsed["items"][0]["siteId"] == "***MASKED***"
+    assert parsed["items"][0]["recordOid"] == "***MASKED***"
+    assert parsed["items"][0]["recordData"]["V_AGE"] == "***MASKED***"
+    assert parsed["items"][0]["recordData"]["aeTerm"] == "***MASKED***"
+    assert parsed["items"][1]["siteId"] == "***MASKED***"
+    assert "***MASKED***" in table_out

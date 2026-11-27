@@ -642,3 +642,364 @@ def test_duckdb_replace_study_isolation_phi_masking_and_history_transition_diffs
         finally:
             workflow.close()
             workflow.close()  # Idempotent close()
+
+    def test_init_defaults_and_17_attribute_bronze_schema_preserved(self) -> None:
+        """DuckDBIngestionWorkflow and AsyncDuckDBIngestionWorkflow keep db_path=':memory:' and 17 columns."""
+        import inspect
+
+        assert (
+            inspect.signature(DuckDBIngestionWorkflow.__init__).parameters["db_path"].default
+            == ":memory:"
+        )
+        assert (
+            inspect.signature(AsyncDuckDBIngestionWorkflow.__init__).parameters["db_path"].default
+            == ":memory:"
+        )
+
+        sdk = MagicMock()
+        sdk.is_async = False
+        with DuckDBIngestionWorkflow(sdk) as workflow:
+            workflow._ensure_bronze_table()
+            cols = [
+                (row[1], row[2])
+                for row in workflow._connection.execute(
+                    "PRAGMA table_info('bronze_revisions')"
+                ).fetchall()
+            ]
+            assert len(cols) == 17
+            assert ("site_id", "BIGINT") in cols
+            assert ("interval_id", "BIGINT") in cols
+
+    def test_silver_records_history_window_baseline_and_initial_created_labels(self) -> None:
+        """Unanchored revisions > 1 emit window_baseline with null data_changed and zero extra REST calls."""
+        sdk = MagicMock()
+        sdk.is_async = False
+        bounded_revs = [
+            RecordRevision(
+                study_key="STUDY",
+                record_revision_id=1002,
+                record_id=10,
+                record_revision=2,
+                data_revision=1,
+                record_status="Verified",
+                deleted=False,
+                date_created=datetime(2026, 1, 12, 9, 0, tzinfo=timezone.utc),
+            ),
+            RecordRevision(
+                study_key="STUDY",
+                record_revision_id=1003,
+                record_id=10,
+                record_revision=3,
+                data_revision=2,
+                record_status="Verified",
+                deleted=False,
+                date_created=datetime(2026, 1, 13, 9, 0, tzinfo=timezone.utc),
+            ),
+            RecordRevision(
+                study_key="STUDY",
+                record_revision_id=2001,
+                record_id=20,
+                record_revision=1,
+                data_revision=1,
+                record_status="Complete",
+                deleted=False,
+                date_created=datetime(2026, 1, 12, 10, 0, tzinfo=timezone.utc),
+            ),
+            RecordRevision.model_construct(
+                study_key="STUDY",
+                record_revision_id=3001,
+                record_id=30,
+                record_revision=None,
+                data_revision=0,
+                record_status="Incomplete",
+                deleted=False,
+                date_created=datetime(2026, 1, 12, 11, 0, tzinfo=timezone.utc),
+            ),
+        ]
+        sdk.get_record_revisions.return_value = bounded_revs
+
+        with DuckDBIngestionWorkflow(sdk) as workflow:
+            inserted = workflow.ingest_revisions("STUDY", start_date="2026-01-12")
+            assert inserted == 4
+            workflow.build_silver_view("STUDY")
+            assert sdk.get_record_revisions.call_count == 1
+
+            rows = workflow._connection.execute(
+                "SELECT record_id, record_revision, data_changed, change_type "
+                "FROM silver_records_history WHERE study_key = 'STUDY' "
+                "ORDER BY record_id ASC, record_revision ASC NULLS FIRST"
+            ).fetchall()
+            assert rows == [
+                (10, 2, None, "window_baseline"),
+                (10, 3, True, "data_updated"),
+                (20, 1, True, "created"),
+                (30, None, False, "created"),
+            ]
+
+    @pytest.mark.asyncio
+    async def test_validate_chain_single_fetch_and_rollback_sync_and_async(self) -> None:
+        """Sync and async ingest_revisions(validate_chain=True) fetch once and roll back tombstone violations."""
+        rev_deleted = RecordRevision(
+            study_key="STUDY",
+            record_revision_id=502,
+            record_id=50,
+            record_revision=2,
+            data_revision=1,
+            record_status="Verified",
+            deleted=True,
+            date_created=datetime(2026, 1, 10, 10, 0, tzinfo=timezone.utc),
+        )
+        rev_resurrected = RecordRevision(
+            study_key="STUDY",
+            record_revision_id=505,
+            record_id=50,
+            record_revision=5,
+            data_revision=1,
+            record_status="Verified",
+            deleted=False,
+            date_created=datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc),
+        )
+
+        # 1. Synchronous workflow
+        sync_sdk = MagicMock()
+        sync_sdk.is_async = False
+        sync_sdk.get_record_revisions.return_value = [rev_deleted]
+        with DuckDBIngestionWorkflow(sync_sdk) as sync_wf:
+            assert sync_wf.ingest_revisions("STUDY", start_date="2026-01-10") == 1
+            sync_sdk.get_record_revisions.reset_mock()
+            sync_sdk.get_record_revisions.return_value = [rev_resurrected]
+            with pytest.raises(ValueError, match="Irreversible deletion"):
+                sync_wf.ingest_revisions(
+                    "STUDY",
+                    start_date="2026-01-15",
+                    validate_chain=True,
+                )
+            assert sync_sdk.get_record_revisions.call_count == 1
+            persisted = sync_wf._connection.execute(
+                "SELECT record_revision, deleted FROM bronze_revisions WHERE study_key = 'STUDY'"
+            ).fetchall()
+            assert persisted == [(2, True)]
+
+        # 2. Asynchronous workflow
+        async_sdk = MagicMock()
+        async_sdk.is_async = True
+        async_sdk.get_record_revisions = AsyncMock(return_value=[rev_deleted])
+        async with AsyncDuckDBIngestionWorkflow(async_sdk) as async_wf:
+            assert await async_wf.ingest_revisions("STUDY", start_date="2026-01-10") == 1
+            async_sdk.get_record_revisions.reset_mock()
+            async_sdk.get_record_revisions.return_value = [rev_resurrected]
+            with pytest.raises(ValueError, match="Irreversible deletion"):
+                await async_wf.ingest_revisions(
+                    "STUDY",
+                    start_date="2026-01-15",
+                    validate_chain=True,
+                )
+            assert async_sdk.get_record_revisions.call_count == 1
+            persisted_async = async_wf._connection.execute(
+                "SELECT record_revision, deleted FROM bronze_revisions WHERE study_key = 'STUDY'"
+            ).fetchall()
+            assert persisted_async == [(2, True)]
+
+    @pytest.mark.asyncio
+    async def test_training_origin_phi_redacts_mixed_case_and_site_id_sync_and_async(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Training base_url PHI config redacts recordOid, siteId, V_AGE, and aeTerm across sync/async DuckDB."""
+        from imednet import AsyncImednetSDK, ImednetSDK
+        from imednet.models.study_config import StudyConfiguration
+        from imednet.simulation import SimulationState, create_simulation_transport
+        from imednet_workflows.config_version_control import ConfigVersionStore
+
+        monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+        monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+        monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+        monkeypatch.setenv("IMEDNET_CONFIG_DB_PATH", str(tmp_path / "origin_cfg" / "store.sqlite3"))
+
+        state = SimulationState()
+        transport = create_simulation_transport(state)
+        trn_sdk = ImednetSDK(
+            api_key="trn-api-key",  # pragma: allowlist secret
+            security_key="trn-sec-key",  # pragma: allowlist secret
+            base_url="https://edc.trn.imednetapi.com",
+            transport=transport,
+            simulation_mode=True,
+        )
+        ConfigVersionStore(sdk=trn_sdk).commit_config(
+            "STUDY",
+            StudyConfiguration(
+                study_key="STUDY",
+                phi_fields=["V_AGE", "aeTerm", "recordOid", "siteId", "subjectKey"],
+            ),
+            desc="Commit training PHI rules",
+            sdk=trn_sdk,
+        )
+
+        rev = RecordRevision(
+            study_key="STUDY",
+            record_revision_id=801,
+            record_id=601,
+            record_oid="REC-OID-77",
+            subject_key="SUBJ-77",
+            site_id=201,
+            interval_id=401,
+            form_key="F_AE",
+            record_status="Verified",
+            record_revision=1,
+            data_revision=1,
+            user="crc_trn",
+            role="CRC",
+            reason_for_change="Captured V_AGE=61 aeTerm=Rash recordOid=REC-OID-77 siteId=201",
+            deleted=False,
+            date_created=datetime(2026, 2, 10, 8, 0, tzinfo=timezone.utc),
+        )
+
+        with trn_sdk, DuckDBIngestionWorkflow(trn_sdk) as sync_wf:
+            with patch.object(
+                DataExtractionWorkflow,
+                "extract_audit_trail",
+                return_value=[rev],
+            ):
+                assert sync_wf.ingest_revisions("STUDY") == 1
+            row = sync_wf._connection.execute(
+                "SELECT record_id, record_oid, subject_key, site_id, interval_id, reason_for_change "
+                "FROM bronze_revisions WHERE study_key = 'STUDY'"
+            ).fetchone()
+            assert row is not None
+            assert row[0] == 601
+            assert row[1] == "***MASKED***"
+            assert row[2] == "SUBJ-77"
+            assert row[3] is None
+            assert row[4] == 401
+            for secret in ("61", "Rash", "REC-OID-77", "201"):
+                assert secret not in row[5]
+
+        trn_async_sdk = AsyncImednetSDK(
+            api_key="trn-api-key",  # pragma: allowlist secret
+            security_key="trn-sec-key",  # pragma: allowlist secret
+            base_url="https://edc.trn.imednetapi.com",
+            transport=transport,
+            simulation_mode=True,
+        )
+        async with trn_async_sdk, AsyncDuckDBIngestionWorkflow(trn_async_sdk) as async_wf:
+            with patch.object(
+                AsyncDataExtractionWorkflow,
+                "extract_audit_trail",
+                AsyncMock(return_value=[rev]),
+            ):
+                assert await async_wf.ingest_revisions("STUDY") == 1
+            async_row = async_wf._connection.execute(
+                "SELECT record_oid, subject_key, site_id, reason_for_change "
+                "FROM bronze_revisions WHERE study_key = 'STUDY'"
+            ).fetchone()
+            assert async_row is not None
+            assert async_row[0] == "***MASKED***"
+            assert async_row[1] == "SUBJ-77"
+            assert async_row[2] is None
+            for secret in ("61", "Rash", "REC-OID-77", "201"):
+                assert secret not in async_row[3]
+
+        # Unconfigured production origin must remain isolated from training PHI rules
+        prod_sdk = ImednetSDK(
+            api_key="prod-api-key",  # pragma: allowlist secret
+            security_key="prod-sec-key",  # pragma: allowlist secret
+            base_url="https://edc.prod.imednetapi.com",
+            transport=transport,
+            simulation_mode=True,
+        )
+        with prod_sdk, DuckDBIngestionWorkflow(prod_sdk) as prod_wf:
+            with patch.object(
+                DataExtractionWorkflow,
+                "extract_audit_trail",
+                return_value=[rev],
+            ):
+                assert prod_wf.ingest_revisions("STUDY") == 1
+            prod_row = prod_wf._connection.execute(
+                "SELECT record_oid, site_id FROM bronze_revisions WHERE study_key = 'STUDY'"
+            ).fetchone()
+            assert prod_row == ("REC-OID-77", 201)
+
+
+@pytest.mark.asyncio
+async def test_async_ingest_revisions_validate_chain_rolls_back_and_builds_window_baseline() -> (
+    None
+):
+    """AsyncDuckDBIngestionWorkflow validates merged chains after one fetch and builds window_baseline."""
+    pytest.importorskip("duckdb")
+    from unittest.mock import AsyncMock
+
+    from imednet_workflows.data_extraction import AsyncDataExtractionWorkflow
+    from imednet_workflows.duckdb_centralizer import AsyncDuckDBIngestionWorkflow
+
+    initial_window = [
+        RecordRevision(
+            record_revision_id=501,
+            study_key="STUDY",
+            record_id=55,
+            form_key="DEMO",
+            record_revision=3,
+            deleted=False,
+            user="alice",
+            reason_for_change="Baseline rev 3",
+            date_created="2024-03-01T10:00:00Z",
+        ),
+        RecordRevision(
+            record_revision_id=502,
+            study_key="STUDY",
+            record_id=55,
+            form_key="DEMO",
+            record_revision=4,
+            deleted=True,
+            user="bob",
+            reason_for_change="Voided",
+            date_created="2024-03-02T10:00:00Z",
+        ),
+    ]
+    resurrected = [
+        RecordRevision(
+            record_revision_id=503,
+            study_key="STUDY",
+            record_id=55,
+            form_key="DEMO",
+            record_revision=5,
+            deleted=False,
+            user="mallory",
+            reason_for_change="Resurrected",
+            date_created="2024-03-03T10:00:00Z",
+        ),
+    ]
+
+    async with AsyncDuckDBIngestionWorkflow(MagicMock()) as async_wf:
+        first_mock = AsyncMock(return_value=initial_window)
+        with patch.object(AsyncDataExtractionWorkflow, "extract_audit_trail", first_mock):
+            inserted = await async_wf.ingest_revisions(
+                "STUDY",
+                start_date="2024-03-01T00:00:00Z",
+                validate_chain=True,
+            )
+        assert inserted == 2
+        assert first_mock.await_count == 1
+
+        second_mock = AsyncMock(return_value=resurrected)
+        with patch.object(AsyncDataExtractionWorkflow, "extract_audit_trail", second_mock):
+            with pytest.raises(ValueError, match="deleted"):
+                await async_wf.ingest_revisions(
+                    "STUDY",
+                    start_date="2024-03-03T00:00:00Z",
+                    validate_chain=True,
+                )
+        assert second_mock.await_count == 1
+        assert (
+            async_wf._connection.execute(
+                "SELECT COUNT(*) FROM bronze_revisions WHERE study_key = 'STUDY'"
+            ).fetchone()[0]
+            == 2
+        )
+
+        await async_wf.build_silver_view("STUDY", include_deleted=True)
+        rows = async_wf._connection.execute(
+            "SELECT record_revision, change_type, data_changed "
+            "FROM silver_records_history WHERE study_key = 'STUDY' ORDER BY record_revision"
+        ).fetchall()
+        assert rows == [(3, "window_baseline", None), (4, "deleted", False)]
