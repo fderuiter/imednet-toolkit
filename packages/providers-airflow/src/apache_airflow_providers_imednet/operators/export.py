@@ -325,7 +325,12 @@ class ImednetExportOperator(BaseOperator):
         self.min_schema_readiness_score = min_schema_readiness_score
         self.domain = domain
         self.sdtm_domain = sdtm_domain if sdtm_domain is not None else domain
-        self.as_sdtm = bool(as_sdtm or self.sdtm_domain is not None)
+        explicit_opts: frozenset[str] = getattr(self, "_explicit_tabular_options", frozenset())
+        self.as_sdtm = (
+            bool(as_sdtm)
+            if "as_sdtm" in explicit_opts and as_sdtm is not None
+            else bool(as_sdtm or self.sdtm_domain is not None)
+        )
         self.standards_profile = standards_profile
         self.min_standards_score = min_standards_score
         self.naming_convention = naming_convention
@@ -515,10 +520,12 @@ class ImednetExportOperator(BaseOperator):
             or getattr(self, "sdtm_domain", None)
             or getattr(self, "domain", None)
         )
-        effective_as_sdtm = bool(
-            runtime_kwargs.get("as_sdtm", getattr(self, "as_sdtm", False))
-            or resolved_domain is not None
-        )
+        if "as_sdtm" in runtime_kwargs and runtime_kwargs["as_sdtm"] is not None:
+            effective_as_sdtm = bool(runtime_kwargs["as_sdtm"])
+        elif "as_sdtm" in explicit:
+            effective_as_sdtm = bool(getattr(self, "as_sdtm", False))
+        else:
+            effective_as_sdtm = bool(getattr(self, "as_sdtm", False) or resolved_domain is not None)
         if effective_as_sdtm or "as_sdtm" in runtime_kwargs or "as_sdtm" in explicit:
             opts["as_sdtm"] = effective_as_sdtm
         if resolved_domain is not None:

@@ -389,13 +389,13 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
      - Pre-configured :class:`~imednet.spi.sink_base.StateProviderProtocol` instance overriding entry-point discovery.
    * - ``as_sdtm``
      - ``False``
-     - Transform exported ``Record`` payloads into standardized CDISC SDTM domain rows via :func:`~imednet.spi.models.transform_records_to_sdtm_rows` (automatically enabled when ``sdtm_domain`` is supplied).
+     - Transform exported ``Record`` payloads into standardized CDISC SDTM domain rows via :func:`~imednet.spi.models.transform_records_to_sdtm_rows` (automatically enabled when ``sdtm_domain`` is supplied unless ``as_sdtm=False`` is passed explicitly).
    * - ``sdtm_domain``
      - ``None``
-     - Optional 2-character CDISC SDTM domain code (for example ``"AE"``, ``"DM"``, or ``"VS"``) selecting the target domain for ``as_sdtm`` transformation.
+     - Optional 2-character CDISC SDTM domain code (for example ``"AE"``, ``"DM"``, or ``"VS"``) selecting the target domain for ``as_sdtm`` transformation or ``naming_convention="sdtm"`` alias resolution.
    * - ``preserve_record_id``
      - ``None``
-     - Optional override controlling whether ``RECORD_ID`` is retained on ``as_sdtm=True`` projections (defaults to ``True`` for idempotent and incremental exports so baseline and delta syncs merge and reconcile voided ``Record`` items deterministically; set ``False`` to opt into strict ``RECORD_ID``-free SDTM projections).
+     - Optional override controlling whether ``RECORD_ID`` is retained on ``as_sdtm=True`` projections (defaults to ``True`` only for incremental exports — when ``incremental=True``, ``modified_since`` is set, or ``state_provider`` is supplied — so delta syncs merge and reconcile voided ``Record`` items deterministically while full baseline SDTM exports omit EDC ``RECORD_ID`` columns by default; set ``True`` or ``False`` to override explicitly).
    * - ``standards_profile``
      - ``None``
      - Optional CDISC standards validation profile name (for example ``"drug"``, ``"device"``, or ``"general"``) or :class:`~imednet.models.standards.StandardsProfile` evaluated before sink writes.

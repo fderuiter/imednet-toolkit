@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from unittest.mock import NonCallableMock
 
+from imednet.errors import ExportConfigurationError
 from imednet.integrations._export_contracts import (
     filter_records_by_form_whitelist,
     install_callable_export_module,
@@ -72,7 +73,11 @@ from imednet.integrations.sink_base import (
     should_preserve_sdtm_record_id,
     stamp_tabular_batch,
 )
-from imednet.models.sdtm import format_iso8601_dtc
+from imednet.models.sdtm import (
+    format_iso8601_dtc,
+    format_nested_variable_name,
+    prefix_colliding_variable_name,
+)
 from imednet.models.standards import (
     format_variable_name,
     get_sdtm_domain_variables,
@@ -229,7 +234,29 @@ def _dedup_case_insensitive_columns(
             out.columns = out.columns.astype(str)
         prior_stamp = None
     if has_dups and dup_mask is not None:
-        out = out.loc[:, ~dup_mask]
+        out = out.copy()
+        cols_list = list(out.columns)
+        all_upper = all(
+            isinstance(c, str) and c == c.upper() and any(ch.isalpha() for ch in c)
+            for c in cols_list
+            if isinstance(c, str)
+        )
+        dedup_conv = "sdtm" if (was_sdtm_redacted or all_upper) else None
+        used_lower: set[str] = set()
+        new_cols: list[Any] = []
+        for c in cols_list:
+            if not isinstance(c, str):
+                new_cols.append(c)
+                continue
+            new_cols.append(
+                prefix_colliding_variable_name(
+                    c,
+                    convention=dedup_conv,
+                    used_lower=used_lower,
+                )
+            )
+        out.columns = pd.Index(new_cols)
+        prior_stamp = None
 
     if was_sdtm_redacted:
         out.attrs["imednet_sdtm_redacted"] = True
@@ -1020,9 +1047,10 @@ def _dedupe_df_by_record_id(
     df: pd.DataFrame,
     *,
     exclude_ids: set[str] | None = None,
+    exclude_sdtm_keys: set[SdtmKeyTuple] | None = None,
     study_key: str | None = None,
 ) -> tuple[pd.DataFrame, set[str]]:
-    """Keep the latest row per canonical ``(STUDYID, RECORD_ID)`` and optionally drop ``exclude_ids``."""
+    """Keep the latest row per canonical ``(STUDYID, RECORD_ID)`` (or ``(STUDYID, 'DM', USUBJID)`` for DM) and optionally drop excluded keys."""
     if df.empty:
         return df, set()
     id_col = _find_df_record_id_col(df)
@@ -1031,15 +1059,27 @@ def _dedupe_df_by_record_id(
         return deduped_unkeyed, set()
 
     excluded = exclude_ids or set()
+    excluded_sdtm = exclude_sdtm_keys or set()
     study_col = _find_df_study_col(df)
     raw_ids = df[id_col].tolist()
     raw_studies = df[study_col].tolist() if study_col is not None else None
-    seen_composite: set[tuple[str, str]] = set()
+    has_sdtm_cols = {"STUDYID", "DOMAIN", "USUBJID"} <= set(df.columns)
+    row_sdtm_keys = _df_sdtm_keys(df) if has_sdtm_cols else None
+    seen_composite: set[tuple[Any, ...]] = set()
     seen_cids_for_study: set[str] = set()
     kept_rev: list[int] = []
     for idx in range(len(raw_ids) - 1, -1, -1):
         cid = _canonical_record_id(raw_ids[idx])
+        skey = row_sdtm_keys[idx] if row_sdtm_keys is not None else None
+        is_dm_row = skey is not None and skey[1] == "DM"
+        if is_dm_row and skey in excluded_sdtm:
+            continue
         if cid is None:
+            if is_dm_row:
+                dm_comp: tuple[Any, ...] = ("__SDTM_DM__", skey)
+                if dm_comp in seen_composite:
+                    continue
+                seen_composite.add(dm_comp)
             kept_rev.append(idx)
             continue
         row_study = (
@@ -1050,7 +1090,7 @@ def _dedupe_df_by_record_id(
         matches_target_study = study_key is None or row_study is None or row_study == study_key
         if cid in excluded and matches_target_study:
             continue
-        comp_key = (row_study or "", cid)
+        comp_key: tuple[Any, ...] = ("__SDTM_DM__", skey) if is_dm_row else (row_study or "", cid)
         if comp_key in seen_composite:
             continue
         seen_composite.add(comp_key)
@@ -1618,6 +1658,7 @@ class TabularCSVSink(ExportSink):
             dedup_delta, delta_ids = _dedupe_df_by_record_id(
                 combined_delta,
                 exclude_ids=self._voided_ids,
+                exclude_sdtm_keys=self._voided_sdtm_keys if self._cfg.as_sdtm else None,
                 study_key=self._cfg.study_key,
             )
             if self._cfg.as_sdtm:
@@ -1677,17 +1718,24 @@ class TabularCSVSink(ExportSink):
                 for row in reader:
                     row_cid = _extract_row_canonical_id(row)
                     row_study = _extract_row_study_key(row)
-                    if row_cid is not None:
-                        if row_cid in exclude_ids and (
+                    if self._cfg.as_sdtm:
+                        row_skey = _extract_row_sdtm_key(row)
+                        if (
+                            row_skey is not None
+                            and row_skey in exclude_sdtm
+                            and (row_cid is None or row_skey[1] == "DM")
+                        ):
+                            continue
+                    if (
+                        row_cid is not None
+                        and row_cid in exclude_ids
+                        and (
                             not self._cfg.study_key
                             or row_study is None
                             or row_study == self._cfg.study_key
-                        ):
-                            continue
-                    elif self._cfg.as_sdtm:
-                        row_skey = _extract_row_sdtm_key(row)
-                        if row_skey is not None and row_skey in exclude_sdtm:
-                            continue
+                        )
+                    ):
+                        continue
                     writer.writerow({k: (row.get(k) or "") for k in unified_fields})
                 for d_row in delta_rows:
                     writer.writerow({k: (d_row.get(k) or "") for k in unified_fields})
@@ -1884,36 +1932,68 @@ def _apply_naming_convention_to_df(
     meta_cols: set[str] | None = None,
     study_key: str | None = None,
 ) -> pd.DataFrame:
-    """Rename DataFrame metadata and variable columns according to ``convention``."""
+    """Rename DataFrame metadata and variable columns according to ``convention`` while preserving colliding variables."""
     canonical_conv = normalize_naming_convention(convention)
     if canonical_conv is None or (df.empty and len(df.columns) == 0):
         return df
     meta_lookup = {
         m.lower() for m in (meta_cols or {k for k, _ in _RECORD_META_CONTRACT_TYPES})
     } | {"studykey", "study_key", "studyid"}
-    renamed_cols = [
+    study_col = (
         format_variable_name(
-            str(col),
-            canonical_conv,
-            domain=domain,
-            is_metadata=(str(col).lower() in meta_lookup),
-        )
-        for col in df.columns
-    ]
-    out = df.copy()
-    out.columns = pd.Index(renamed_cols)
-    if study_key:
-        study_col = format_variable_name(
             "study_key",
             canonical_conv,
             domain=domain,
             is_metadata=True,
         )
-        if study_col.lower() not in {str(c).lower() for c in out.columns}:
-            out.insert(0, study_col, study_key)
-    dup_mask = out.columns.astype(str).str.lower().duplicated()
-    if bool(dup_mask.any()):
-        out = out.loc[:, ~dup_mask]
+        if study_key
+        else None
+    )
+    has_study_meta_col = any(
+        str(c).lower() in {"studykey", "study_key", "studyid"} for c in df.columns
+    )
+    used_lower: set[str] = set()
+    reserved_meta_lower: set[str] = set()
+    if study_col is not None and not has_study_meta_col:
+        used_lower.add(study_col.lower())
+        reserved_meta_lower.add(study_col.lower())
+
+    seen_source_meta_lower: set[str] = set()
+    renamed_cols: list[str] = []
+    for col in df.columns:
+        col_str = str(col)
+        col_low = col_str.lower()
+        is_meta = col_low in meta_lookup and col_low not in seen_source_meta_lower
+        if is_meta:
+            seen_source_meta_lower.add(col_low)
+            formatted = format_variable_name(
+                col_str,
+                canonical_conv,
+                domain=domain,
+                is_metadata=True,
+            )
+            if formatted.lower() not in used_lower:
+                used_lower.add(formatted.lower())
+                reserved_meta_lower.add(formatted.lower())
+                renamed_cols.append(formatted)
+                continue
+        base_var = format_nested_variable_name(
+            col_str,
+            canonical_conv,
+            domain=domain,
+        )
+        unique_var = prefix_colliding_variable_name(
+            base_var,
+            reserved_meta_lower,
+            convention=canonical_conv,
+            used_lower=used_lower,
+        )
+        renamed_cols.append(unique_var)
+
+    out = df.copy()
+    out.columns = pd.Index(renamed_cols)
+    if study_col is not None and not has_study_meta_col:
+        out.insert(0, study_col, study_key)
     return out
 
 
@@ -1942,7 +2022,8 @@ def _build_tabular_contract_types(
                 meta_name, canonical_conv, domain=sdtm_domain, is_metadata=True
             )
             contract.setdefault(formatted_meta, meta_type)
-    seen_lower: set[str] = {name.lower() for name in contract}
+    reserved_meta_lower: set[str] = {name.lower() for name in contract}
+    seen_lower: set[str] = set(reserved_meta_lower)
     active_phi_keys = (
         phi_keys
         if phi_keys is not None
@@ -1971,15 +2052,17 @@ def _build_tabular_contract_types(
 
     for key in effective_keys:
         raw_col_name = str(label_map.get(key, key) if use_labels_as_columns else key)
-        col_name = (
-            format_variable_name(raw_col_name, canonical_conv, domain=sdtm_domain)
+        base_col_name = (
+            format_nested_variable_name(raw_col_name, canonical_conv, domain=sdtm_domain)
             if canonical_conv is not None
             else raw_col_name
         )
-        col_lower = col_name.lower()
-        if col_lower in seen_lower:
-            continue
-        seen_lower.add(col_lower)
+        col_name = prefix_colliding_variable_name(
+            base_col_name,
+            reserved_meta_lower,
+            convention=canonical_conv,
+            used_lower=seen_lower,
+        )
         if mask_phi and (
             global_sensitivity_registry.is_sensitive(key)
             or global_sensitivity_registry.is_sensitive(raw_col_name)
@@ -2676,6 +2759,7 @@ class TabularParquetSink(ExportSink):
             return
 
         remaining = dict(self._delta_id_counts)
+        remaining_sdtm = dict(self._delta_sdtm_key_counts)
         for record_batch in delta_pf.iter_batches(batch_size=max(1, self._cfg.batch_size)):
             tbl = pa.Table.from_batches([record_batch])
             id_col = next(
@@ -2686,14 +2770,36 @@ class TabularParquetSink(ExportSink):
                 (c for c in ("STUDYID", "study_key", "studyKey") if c in tbl.column_names),
                 None,
             )
-            if id_col is not None and tbl.num_rows > 0:
+            has_sdtm_cols = self._cfg.as_sdtm and (
+                {"STUDYID", "DOMAIN", "USUBJID"} <= set(tbl.column_names)
+            )
+            if (id_col is not None or has_sdtm_cols) and tbl.num_rows > 0:
                 mask: list[bool] = []
+                py_rows = tbl.to_pylist() if has_sdtm_cols else None
+                id_vals = tbl[id_col].to_pylist() if id_col is not None else [None] * tbl.num_rows
                 study_vals = (
                     tbl[study_col].to_pylist() if study_col is not None else [None] * tbl.num_rows
                 )
-                for val, sval in zip(tbl[id_col].to_pylist(), study_vals, strict=False):
+                for row_idx, (val, sval) in enumerate(zip(id_vals, study_vals, strict=False)):
                     cid = _canonical_record_id(val)
-                    if cid is None:
+                    skey = _extract_row_sdtm_key(py_rows[row_idx]) if py_rows is not None else None
+                    if skey is not None and skey[1] == "DM":
+                        remaining_sdtm[skey] = remaining_sdtm.get(skey, 1) - 1
+                        skey_st = _canonical_study_key(sval, self._cfg.study_key) or ""
+                        if cid is not None:
+                            comp_key = (skey_st, cid)
+                            remaining[comp_key] = remaining.get(comp_key, 1) - 1
+                        is_voided_id = (
+                            cid is not None
+                            and cid in self._voided_ids
+                            and (not self._cfg.study_key or skey_st == self._cfg.study_key)
+                        )
+                        mask.append(
+                            not is_voided_id
+                            and skey not in self._voided_sdtm_keys
+                            and remaining_sdtm[skey] == 0
+                        )
+                    elif cid is None:
                         mask.append(True)
                     else:
                         skey_st = _canonical_study_key(sval, self._cfg.study_key) or ""
@@ -2738,8 +2844,14 @@ class TabularParquetSink(ExportSink):
             ) or bool(self._voided_sdtm_keys & set(self._delta_sdtm_key_counts))
             delta_count = len(self._delta_sdtm_key_counts)
         else:
-            needs_delta_filter = any(cnt > 1 for cnt in self._delta_id_counts.values()) or bool(
-                self._voided_ids & delta_cids_for_study
+            dm_key_counts = {
+                k: cnt for k, cnt in self._delta_sdtm_key_counts.items() if k[1] == "DM"
+            }
+            needs_delta_filter = (
+                any(cnt > 1 for cnt in self._delta_id_counts.values())
+                or any(cnt > 1 for cnt in dm_key_counts.values())
+                or bool(self._voided_ids & delta_cids_for_study)
+                or bool(self._voided_sdtm_keys & set(dm_key_counts))
             )
             delta_count = len(self._delta_id_counts)
 
@@ -2802,6 +2914,14 @@ class TabularParquetSink(ExportSink):
                                 exclude_prev_ids,
                                 study_key=self._cfg.study_key,
                             )
+                            if self._cfg.as_sdtm and kept_tbl.num_rows > 0:
+                                dm_exclude = {k for k in exclude_prev_sdtm if k[1] == "DM"}
+                                if dm_exclude:
+                                    kept_tbl = _filter_arrow_table_excluding_sdtm_keys(
+                                        pa,
+                                        kept_tbl,
+                                        dm_exclude,
+                                    )
                         else:
                             kept_tbl = _filter_arrow_table_excluding_sdtm_keys(
                                 pa,
@@ -3205,10 +3325,15 @@ class TabularSQLSink(ExportSink):
                             ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
                             deleted_by_id = self._delete_existing_record_ids(ids)
                             break
-                    if deleted_by_id == 0 and self._cfg.as_sdtm:
+                    if self._cfg.as_sdtm:
                         skeys = [k for k in _df_sdtm_keys(df) if k is not None]
-                        if skeys:
-                            self._delete_existing_sdtm_keys(skeys)
+                        if deleted_by_id == 0:
+                            if skeys:
+                                self._delete_existing_sdtm_keys(skeys)
+                        else:
+                            dm_skeys = [k for k in skeys if k[1] == "DM"]
+                            if dm_skeys:
+                                self._delete_existing_sdtm_keys(dm_skeys)
 
                 inspector = sa_inspect(self.engine)
                 part_entries = (
@@ -3293,8 +3418,13 @@ class TabularSQLSink(ExportSink):
 
         def _do_delete() -> int:
             deleted = self._delete_existing_record_ids(record_ids) if record_ids else 0
-            if deleted == 0 and skeys:
-                deleted = self._delete_existing_sdtm_keys(skeys)
+            if skeys:
+                if deleted == 0:
+                    deleted = self._delete_existing_sdtm_keys(skeys)
+                else:
+                    dm_skeys = [k for k in skeys if k[1] == "DM"]
+                    if dm_skeys:
+                        self._delete_existing_sdtm_keys(dm_skeys)
             return deleted
 
         return self._execute_with_retry(
@@ -3490,10 +3620,15 @@ class TabularDuckDBSink(ExportSink):
                                 ids = [rid for rid in df[candidate_col].tolist() if pd.notna(rid)]
                                 deleted_by_id = self._delete_record_ids(ids)
                                 break
-                        if deleted_by_id == 0 and self._cfg.as_sdtm:
+                        if self._cfg.as_sdtm:
                             skeys = [k for k in _df_sdtm_keys(df) if k is not None]
-                            if skeys:
-                                self._delete_sdtm_keys(skeys)
+                            if deleted_by_id == 0:
+                                if skeys:
+                                    self._delete_sdtm_keys(skeys)
+                            else:
+                                dm_skeys = [k for k in skeys if k[1] == "DM"]
+                                if dm_skeys:
+                                    self._delete_sdtm_keys(dm_skeys)
                     self._conn.execute(
                         f"INSERT INTO {quoted_tbl} BY NAME SELECT * FROM {quoted_alias}"
                     )
@@ -3516,8 +3651,13 @@ class TabularDuckDBSink(ExportSink):
 
         def _do_delete() -> int:
             deleted = self._delete_record_ids(record_ids) if record_ids else 0
-            if deleted == 0 and skeys:
-                deleted = self._delete_sdtm_keys(skeys)
+            if skeys:
+                if deleted == 0:
+                    deleted = self._delete_sdtm_keys(skeys)
+                else:
+                    dm_skeys = [k for k in skeys if k[1] == "DM"]
+                    if dm_skeys:
+                        self._delete_sdtm_keys(dm_skeys)
             return deleted
 
         return self._execute_with_retry(
@@ -3937,7 +4077,7 @@ def _make_mapper_records_source(
     merged_filter = _merge_form_whitelist_into_filter(config.record_filter, active_whitelist)
     is_mock = _is_mock_mapper(mapper)
     allowed_id_set = set(active_whitelist) if active_whitelist is not None else None
-    target_sdtm_domain = config.sdtm_domain
+    target_sdtm_domain = config.sdtm_domain if config.as_sdtm else None
     sdtm_sort = _SDTM_RECORDS_SORT if config.as_sdtm else None
 
     def _filter_by_allowed_forms(stream: Iterable[Any]) -> Iterator[Any]:
@@ -4038,14 +4178,14 @@ def _resolve_study_forms_and_sdtm_filter(
     config: TabularSinkConfig,
 ) -> tuple[list[Any], dict[Any, str], list[int] | None, set[str] | None, bool]:
     """Return ``(study_forms, form_domain_map, effective_form_whitelist, allowed_form_keys, no_matching_domain)``."""
-    needs_forms = bool(config.as_sdtm or config.sdtm_domain is not None)
+    needs_forms = bool(config.as_sdtm)
     study_forms = _try_fetch_study_forms(sdk, study_key) if needs_forms else []
     form_domain_map = (
         build_form_sdtm_domain_map(study_forms, study_key=study_key) if needs_forms else {}
     )
     effective_whitelist = config.form_whitelist
     allowed_keys: set[str] | None = None
-    if config.sdtm_domain is not None and study_forms:
+    if config.as_sdtm and config.sdtm_domain is not None and study_forms:
         matched_forms = filter_forms_by_sdtm_domain(
             study_forms,
             config.sdtm_domain,
@@ -4748,6 +4888,7 @@ def export_to_excel(
             dedup_delta, delta_ids = _dedupe_df_by_record_id(
                 combined,
                 exclude_ids=voided_ids,
+                exclude_sdtm_keys=voided_sdtm if config.as_sdtm else None,
                 study_key=study_key,
             )
             if config.as_sdtm:
@@ -4766,6 +4907,10 @@ def export_to_excel(
                     delta_ids | voided_ids,
                     study_key=study_key,
                 )
+                if config.as_sdtm and not prev_kept.empty:
+                    dm_exclude = {k for k in (delta_sdtm | voided_sdtm) if k[1] == "DM"}
+                    if dm_exclude:
+                        prev_kept = _filter_df_excluding_sdtm_keys(prev_kept, dm_exclude)
             else:
                 prev_kept = _filter_df_excluding_sdtm_keys(prev_df, delta_sdtm | voided_sdtm)
 
@@ -4972,15 +5117,21 @@ def _merge_flat_json_records(
     delta_records: list[dict[str, Any]],
     voided_ids: set[str],
     *,
+    voided_sdtm_keys: set[SdtmKeyTuple] | None = None,
     mask_historical_phi: bool = False,
     phi_keys: set[str] | None = None,
     study_key: str | None = None,
     as_sdtm: bool = False,
 ) -> list[Any]:
-    """Upsert ``delta_records`` by canonical ``(STUDYID, RECORD_ID)`` and drop ``voided_ids``."""
-    delta_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    """Upsert ``delta_records`` by canonical ``(STUDYID, RECORD_ID)`` (or ``(STUDYID, 'DM', USUBJID)`` for DM) and drop voided rows."""
+    voided_sdtm = voided_sdtm_keys or set()
+    delta_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
     unkeyed_delta: list[dict[str, Any]] = []
     for drec in delta_records:
+        skey = _extract_row_sdtm_key(drec) if as_sdtm else None
+        if skey is not None and skey[1] == "DM":
+            delta_by_key[("__SDTM_DM__", skey)] = drec
+            continue
         cid = _extract_row_canonical_id(drec)
         if cid is not None:
             dstudy = _extract_row_study_key(drec) or study_key or ""
@@ -4990,12 +5141,18 @@ def _merge_flat_json_records(
 
     key_cache: dict[str, bool] = {}
     merged: list[Any] = []
-    placed_keys: set[tuple[str, str]] = set()
+    placed_keys: set[tuple[Any, ...]] = set()
     for erec in existing_records:
         if isinstance(erec, Mapping):
+            skey = _extract_row_sdtm_key(erec) if as_sdtm else None
+            is_dm = skey is not None and skey[1] == "DM"
+            if is_dm and skey in voided_sdtm:
+                continue
             cid = _extract_row_canonical_id(erec)
             estudy = _extract_row_study_key(erec) or study_key or ""
-            comp_key = (estudy, cid) if cid is not None else None
+            comp_key: tuple[Any, ...] | None = (
+                ("__SDTM_DM__", skey) if is_dm else ((estudy, cid) if cid is not None else None)
+            )
             if (
                 cid is not None
                 and cid in voided_ids
@@ -5020,8 +5177,19 @@ def _merge_flat_json_records(
         merged.append(erec)
 
     for comp_key, drec in delta_by_key.items():
-        skey, cid = comp_key
-        is_voided = cid in voided_ids and (not study_key or not skey or skey == study_key)
+        if comp_key[0] == "__SDTM_DM__":
+            is_voided = comp_key[1] in voided_sdtm
+            cid_d = _extract_row_canonical_id(drec)
+            skey_d = _extract_row_study_key(drec) or study_key or ""
+            if (
+                cid_d is not None
+                and cid_d in voided_ids
+                and (not study_key or not skey_d or skey_d == study_key)
+            ):
+                is_voided = True
+        else:
+            skey_d, cid_d = comp_key
+            is_voided = cid_d in voided_ids and (not study_key or not skey_d or skey_d == study_key)
         if comp_key not in placed_keys and not is_voided:
             merged.append(drec)
     merged.extend(unkeyed_delta)
@@ -5078,6 +5246,117 @@ def _merge_sdtm_json_records(
     return merged
 
 
+def _resolve_hierarchy_envelope_keys(
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
+) -> tuple[str, str, str, str, str, str]:
+    """Return ``(subj_k, visits_k, visit_id_k, forms_k, form_id_k, records_k)`` for hierarchy nodes."""
+    canonical_conv = normalize_naming_convention(naming_convention)
+    if canonical_conv is None:
+        return ("subject_key", "visits", "visit_id", "forms", "form_id", "records")
+    return (
+        format_variable_name("subject_key", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("visits", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("visit_id", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("forms", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("form_id", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("records", canonical_conv, domain=sdtm_domain, is_metadata=True),
+    )
+
+
+def _format_legacy_hierarchy_tree(
+    tree: Any,
+    *,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
+    use_labels_as_keys: bool = False,
+) -> Any:
+    """Format a mock-mapper hierarchy tree when ``mapper.build_hierarchy`` lacks ``naming_convention``."""
+    canonical_conv = normalize_naming_convention(naming_convention)
+    if canonical_conv is None or not isinstance(tree, list):
+        return tree
+    subj_k, visits_k, visit_id_k, forms_k, form_id_k, records_k = _resolve_hierarchy_envelope_keys(
+        canonical_conv, sdtm_domain
+    )
+    meta_lookup = {m.lower() for m, _ in _RECORD_META_CONTRACT_TYPES} | {
+        "parent_record_id",
+        "parentrecordid",
+        "studykey",
+        "study_key",
+        "studyid",
+    }
+
+    def _fmt_rec(rec: Any) -> Any:
+        if not isinstance(rec, Mapping):
+            return rec
+        out_r: dict[str, Any] = {}
+        used_low: set[str] = set()
+        reserved_meta: set[str] = set()
+        for k, v in rec.items():
+            ks = str(k)
+            if ks.lower() in meta_lookup:
+                mk = format_variable_name(ks, canonical_conv, domain=sdtm_domain, is_metadata=True)
+                if mk.lower() not in used_low:
+                    used_low.add(mk.lower())
+                    reserved_meta.add(mk.lower())
+                    out_r[mk] = v
+                    continue
+            if use_labels_as_keys:
+                base_vk = ks
+            else:
+                base_vk = format_nested_variable_name(ks, canonical_conv, domain=sdtm_domain)
+            uk = prefix_colliding_variable_name(
+                base_vk,
+                reserved_meta,
+                convention=canonical_conv,
+                used_lower=used_low,
+            )
+            out_r[uk] = v
+        return out_r
+
+    def _fmt_forms(forms_list: Any) -> list[dict[str, Any]]:
+        out_forms: list[dict[str, Any]] = []
+        for fnode in forms_list or []:
+            if not isinstance(fnode, Mapping):
+                continue
+            fid = next(
+                (fnode[c] for c in ("form_id", "formId", "FORM_ID") if c in fnode),
+                None,
+            )
+            raw_recs: Any = next(
+                (fnode[c] for c in ("records", "RECORDS") if c in fnode),
+                [],
+            )
+            out_forms.append({form_id_k: fid, records_k: [_fmt_rec(r) for r in (raw_recs or [])]})
+        return out_forms
+
+    out_tree: list[dict[str, Any]] = []
+    for subj in tree:
+        if not isinstance(subj, Mapping):
+            continue
+        sk = next(
+            (subj[c] for c in ("subject_key", "subjectKey", "USUBJID") if c in subj),
+            None,
+        )
+        raw_visits: Any = next((subj[c] for c in ("visits", "VISITS") if c in subj), [])
+        out_visits: list[dict[str, Any]] = []
+        for vnode in raw_visits or []:
+            if not isinstance(vnode, Mapping):
+                continue
+            vid = next(
+                (vnode[c] for c in ("visit_id", "visitId", "VISITNUM") if c in vnode),
+                None,
+            )
+            v_forms: Any = next((vnode[c] for c in ("forms", "FORMS") if c in vnode), [])
+            out_visits.append({visit_id_k: vid, forms_k: _fmt_forms(v_forms)})
+        out_subj: dict[str, Any] = {subj_k: sk, visits_k: out_visits}
+        raw_unsched = next((subj[c] for c in ("forms", "FORMS") if c in subj), None)
+        if raw_unsched:
+            out_subj[forms_k] = _fmt_forms(raw_unsched)
+        out_tree.append(out_subj)
+    return out_tree
+
+
 def _merge_hierarchical_archives(
     existing_tree: list[Any],
     delta_tree: list[dict[str, Any]],
@@ -5085,10 +5364,21 @@ def _merge_hierarchical_archives(
     *,
     mask_historical_phi: bool = False,
     phi_keys: set[str] | None = None,
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
 ) -> list[dict[str, Any]]:
     """Merge hierarchical Subject->Visit->Form trees by ``recordId`` and prune voided records."""
+    subj_k, visits_k, visit_id_k, forms_k, form_id_k, records_k = _resolve_hierarchy_envelope_keys(
+        naming_convention, sdtm_domain
+    )
     subjects: dict[Any, dict[str, Any]] = {}
     key_cache: dict[str, bool] = {}
+
+    def _get_first(node: Mapping[str, Any], candidates: tuple[str, ...]) -> Any:
+        for cand in candidates:
+            if cand in node:
+                return node[cand]
+        return None
 
     def _keep_hist_records(raw_records: Any) -> list[dict[str, Any]]:
         kept_list: list[dict[str, Any]] = []
@@ -5106,26 +5396,26 @@ def _merge_hierarchical_archives(
     for subj in existing_tree:
         if not isinstance(subj, Mapping):
             continue
-        sk = subj.get("subject_key")
+        sk = _get_first(subj, (subj_k, "subject_key", "subjectKey", "USUBJID"))
         visits_map: dict[Any, dict[Any, list[dict[str, Any]]]] = {}
-        for visit in subj.get("visits") or []:
+        for visit in _get_first(subj, (visits_k, "visits", "VISITS")) or []:
             if not isinstance(visit, Mapping):
                 continue
-            vid = visit.get("visit_id")
-            for fnode in visit.get("forms") or []:
+            vid = _get_first(visit, (visit_id_k, "visit_id", "visitId", "VISITNUM"))
+            for fnode in _get_first(visit, (forms_k, "forms", "FORMS")) or []:
                 if not isinstance(fnode, Mapping):
                     continue
-                fid = fnode.get("form_id")
-                kept = _keep_hist_records(fnode.get("records"))
+                fid = _get_first(fnode, (form_id_k, "form_id", "formId", "FORM_ID"))
+                kept = _keep_hist_records(_get_first(fnode, (records_k, "records", "RECORDS")))
                 if kept:
                     visits_map.setdefault(vid, {}).setdefault(fid, []).extend(kept)
 
         unsched_map: dict[Any, list[dict[str, Any]]] = {}
-        for fnode in subj.get("forms") or []:
+        for fnode in _get_first(subj, (forms_k, "forms", "FORMS")) or []:
             if not isinstance(fnode, Mapping):
                 continue
-            fid = fnode.get("form_id")
-            kept = _keep_hist_records(fnode.get("records"))
+            fid = _get_first(fnode, (form_id_k, "form_id", "formId", "FORM_ID"))
+            kept = _keep_hist_records(_get_first(fnode, (records_k, "records", "RECORDS")))
             if kept:
                 unsched_map.setdefault(fid, []).extend(kept)
 
@@ -5139,26 +5429,26 @@ def _merge_hierarchical_archives(
     for subj in delta_tree:
         if not isinstance(subj, Mapping):
             continue
-        sk = subj.get("subject_key")
+        sk = _get_first(subj, (subj_k, "subject_key", "subjectKey", "USUBJID"))
         entry = subjects.setdefault(sk, {"visits": {}, "forms": {}})
-        for visit in subj.get("visits") or []:
+        for visit in _get_first(subj, (visits_k, "visits", "VISITS")) or []:
             if not isinstance(visit, Mapping):
                 continue
-            vid = visit.get("visit_id")
-            for fnode in visit.get("forms") or []:
+            vid = _get_first(visit, (visit_id_k, "visit_id", "visitId", "VISITNUM"))
+            for fnode in _get_first(visit, (forms_k, "forms", "FORMS")) or []:
                 if not isinstance(fnode, Mapping):
                     continue
-                fid = fnode.get("form_id")
-                recs = [
-                    dict(rec) for rec in (fnode.get("records") or []) if isinstance(rec, Mapping)
-                ]
+                fid = _get_first(fnode, (form_id_k, "form_id", "formId", "FORM_ID"))
+                raw_recs = _get_first(fnode, (records_k, "records", "RECORDS")) or []
+                recs = [dict(rec) for rec in raw_recs if isinstance(rec, Mapping)]
                 if recs:
                     entry["visits"].setdefault(vid, {}).setdefault(fid, []).extend(recs)
-        for fnode in subj.get("forms") or []:
+        for fnode in _get_first(subj, (forms_k, "forms", "FORMS")) or []:
             if not isinstance(fnode, Mapping):
                 continue
-            fid = fnode.get("form_id")
-            recs = [dict(rec) for rec in (fnode.get("records") or []) if isinstance(rec, Mapping)]
+            fid = _get_first(fnode, (form_id_k, "form_id", "formId", "FORM_ID"))
+            raw_recs = _get_first(fnode, (records_k, "records", "RECORDS")) or []
+            recs = [dict(rec) for rec in raw_recs if isinstance(rec, Mapping)]
             if recs:
                 entry["forms"].setdefault(fid, []).extend(recs)
 
@@ -5167,18 +5457,18 @@ def _merge_hierarchical_archives(
         subj_visits: list[dict[str, Any]] = []
         for vid, forms_dict in entry["visits"].items():
             visit_forms = [
-                {"form_id": fid, "records": recs} for fid, recs in forms_dict.items() if recs
+                {form_id_k: fid, records_k: recs} for fid, recs in forms_dict.items() if recs
             ]
             if visit_forms:
-                subj_visits.append({"visit_id": vid, "forms": visit_forms})
+                subj_visits.append({visit_id_k: vid, forms_k: visit_forms})
         unsched_forms = [
-            {"form_id": fid, "records": recs} for fid, recs in entry["forms"].items() if recs
+            {form_id_k: fid, records_k: recs} for fid, recs in entry["forms"].items() if recs
         ]
         if not subj_visits and not unsched_forms:
             continue
-        out_subj: dict[str, Any] = {"subject_key": sk, "visits": subj_visits}
+        out_subj: dict[str, Any] = {subj_k: sk, visits_k: subj_visits}
         if unsched_forms:
-            out_subj["forms"] = unsched_forms
+            out_subj[forms_k] = unsched_forms
         merged_tree.append(out_subj)
 
     return merged_tree
@@ -5280,6 +5570,16 @@ class _HierarchicalJSONSink(ExportSink):
                 mask_phi=self._cfg.mask_phi,
                 config=self._cfg,
             )
+            if (
+                self._cfg.naming_convention is not None
+                and "naming_convention" not in self._hier_kwargs
+            ):
+                delta_data = _format_legacy_hierarchy_tree(
+                    delta_data,
+                    naming_convention=self._cfg.naming_convention,
+                    sdtm_domain=self._cfg.sdtm_domain,
+                    use_labels_as_keys=self._cfg.use_labels_as_columns,
+                )
 
         if self._is_incremental_sync and self._cfg.idempotent and dest_exists:
             delta_sanitized = _sanitize_json_value(delta_data)
@@ -5308,6 +5608,8 @@ class _HierarchicalJSONSink(ExportSink):
                 exclude_ids,
                 mask_historical_phi=self._cfg.mask_phi,
                 phi_keys=phi_keys,
+                naming_convention=self._cfg.naming_convention,
+                sdtm_domain=self._cfg.sdtm_domain,
             )
             return _dump_json_payload(self.path, final_data, self._cfg, skip_sanitize=True)
 
@@ -5370,7 +5672,13 @@ def export_to_json(
         mask_phi=mask_phi,
     )
 
-    if hierarchical and not config.as_sdtm:
+    if hierarchical:
+        if config.as_sdtm:
+            raise ExportConfigurationError(
+                "Hierarchical JSON export cannot be combined with SDTM domain transformation "
+                "(as_sdtm=True)."
+            )
+        canonical_hier_conv = normalize_naming_convention(config.naming_convention)
         mapper = _create_record_mapper(sdk, mask_phi=config.mask_phi)
         is_mock_hier_mapper = _is_mock_mapper(mapper) or not callable(
             getattr(mapper, "_get_enrichment_pipeline", None)
@@ -5384,6 +5692,18 @@ def export_to_json(
             hier_kwargs["include_deleted"] = config.include_deleted
         if not config.mask_phi and not _is_mock_mapper(mapper):
             hier_kwargs["mask_phi"] = False
+        if canonical_hier_conv is not None:
+            try:
+                hier_sig = inspect.signature(mapper.build_hierarchy)
+                accepts_hier_conv = "naming_convention" in hier_sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in hier_sig.parameters.values()
+                )
+            except (TypeError, ValueError):
+                accepts_hier_conv = False
+            if accepts_hier_conv:
+                hier_kwargs["naming_convention"] = canonical_hier_conv
+                if config.sdtm_domain is not None:
+                    hier_kwargs["domain"] = config.sdtm_domain
 
         if is_mock_hier_mapper and not _config_has_streaming_options(config):
             with sdk_governance_context(sdk):
@@ -5396,6 +5716,13 @@ def export_to_json(
                     mask_phi=config.mask_phi,
                     config=config,
                 )
+                if canonical_hier_conv is not None and "naming_convention" not in hier_kwargs:
+                    data = _format_legacy_hierarchy_tree(
+                        data,
+                        naming_convention=canonical_hier_conv,
+                        sdtm_domain=config.sdtm_domain,
+                        use_labels_as_keys=config.use_labels_as_columns,
+                    )
             with _TabularCallableSink(
                 config,
                 "export_json",
@@ -5493,6 +5820,7 @@ def export_to_json(
             dedup_delta, _ = _dedupe_df_by_record_id(
                 combined,
                 exclude_ids=voided_ids,
+                exclude_sdtm_keys=voided_sdtm if config.as_sdtm else None,
                 study_key=study_key,
             )
         else:
@@ -5546,6 +5874,7 @@ def export_to_json(
                 existing_records,
                 delta_records,
                 voided_ids,
+                voided_sdtm_keys=voided_sdtm if config.as_sdtm else None,
                 mask_historical_phi=config.mask_phi,
                 phi_keys=phi_keys,
                 study_key=study_key,
@@ -5788,13 +6117,13 @@ def _build_form_export_contexts(
 ) -> tuple[list[_FormExportContext], list[Any]]:
     """Fetch study forms and variables once and build per-form export contexts."""
     forms = list(sdk.forms.list(study_key=study_key))
-    if sdtm_domain is not None and forms:
+    if as_sdtm and sdtm_domain is not None and forms:
         forms = filter_forms_by_sdtm_domain(forms, sdtm_domain, study_key=study_key)
     form_filter: dict[str, Any] = {"formId": form_whitelist} if form_whitelist else {}
     all_variables = (
         []
         if (form_whitelist is not None and len(form_whitelist) == 0)
-        or (sdtm_domain is not None and not forms)
+        or (as_sdtm and sdtm_domain is not None and not forms)
         else list(sdk.variables.list(study_key=study_key, **form_filter))
     )
     variables_by_form: dict[int, list[Any]] = {}
@@ -5989,7 +6318,10 @@ def _stream_records_across_forms(
 
         effective_form_whitelist = (
             [ctx.form_id for ctx in contexts]
-            if (config.form_whitelist is not None or config.sdtm_domain is not None)
+            if (
+                config.form_whitelist is not None
+                or (config.as_sdtm and config.sdtm_domain is not None)
+            )
             else None
         )
         merged_filter = _merge_form_whitelist_into_filter(
@@ -6656,6 +6988,23 @@ def export_to_sql_by_form(
         )
 
 
+def _resolve_long_sql_column_names(
+    naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
+) -> tuple[str, str, str, str, str]:
+    """Return ``(rec_id_col, form_id_col, var_name_col, val_col, ts_col)`` for long-format SQL."""
+    canonical_conv = normalize_naming_convention(naming_convention)
+    if canonical_conv is None:
+        return ("record_id", "form_id", "variable_name", "value", "timestamp")
+    return (
+        format_variable_name("record_id", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("form_id", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("variable_name", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("value", canonical_conv, domain=sdtm_domain, is_metadata=True),
+        format_variable_name("timestamp", canonical_conv, domain=sdtm_domain, is_metadata=True),
+    )
+
+
 def _unpack_long_sql_rows(
     records: Iterable[Any],
     *,
@@ -6668,6 +7017,10 @@ def _unpack_long_sql_rows(
     form_whitelist: Sequence[int] | set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Unpack ``Record`` envelopes into normalized long-format variable rows with PHI masking."""
+    canonical_conv = normalize_naming_convention(naming_convention)
+    rec_col, form_col, var_col, val_col, ts_col = _resolve_long_sql_column_names(
+        canonical_conv, sdtm_domain
+    )
     allowed_forms = set(form_whitelist) if form_whitelist is not None else None
     allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
     if (allowed_forms is not None and not allowed_forms) or (
@@ -6693,15 +7046,22 @@ def _unpack_long_sql_rows(
         rec_payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
         if pipeline is not None and rec_payload:
             rec_payload = pipeline.process(rec_payload, mask_phi=mask_phi)
+        seen_var_lower: set[str] = set()
         for name, value in rec_payload.items():
-            formatted_var_name = (
-                format_variable_name(name, naming_convention, domain=sdtm_domain)
-                if naming_convention is not None
+            base_var_name = (
+                format_nested_variable_name(name, canonical_conv, domain=sdtm_domain)
+                if canonical_conv is not None
                 else name
+            )
+            formatted_var_name = prefix_colliding_variable_name(
+                base_var_name,
+                convention=canonical_conv,
+                used_lower=seen_var_lower,
             )
             if (
                 allowed_vars is not None
                 and name not in allowed_vars
+                and base_var_name not in allowed_vars
                 and formatted_var_name not in allowed_vars
             ):
                 continue
@@ -6717,11 +7077,11 @@ def _unpack_long_sql_rows(
                     masked_value = mask_custom_phi_recursive(masked_value, phi_keys)
             long_rows.append(
                 {
-                    "record_id": rec_id,
-                    "form_id": form_id,
-                    "variable_name": formatted_var_name,
-                    "value": masked_value,
-                    "timestamp": timestamp,
+                    rec_col: rec_id,
+                    form_col: form_id,
+                    var_col: formatted_var_name,
+                    val_col: masked_value,
+                    ts_col: timestamp,
                 }
             )
     return long_rows
@@ -6770,7 +7130,7 @@ class _LongSQLSink(ExportSink):
         return _execute_chunked_sql_id_delete(
             self.engine,
             self.table,
-            ("record_id",),
+            ("recordId", "record_id", "RECORD_ID"),
             record_ids,
         )
 
@@ -6861,7 +7221,12 @@ class _LongSQLSink(ExportSink):
             and not isinstance(self.engine, NonCallableMock)
         ):
             empty_df = pd.DataFrame(
-                columns=["record_id", "form_id", "variable_name", "value", "timestamp"]
+                columns=list(
+                    _resolve_long_sql_column_names(
+                        self._cfg.naming_convention,
+                        self._cfg.sdtm_domain,
+                    )
+                )
             )
             empty_df.to_sql(self.table, self.engine, if_exists="replace", index=False)
             self._is_first_write = False
@@ -6941,6 +7306,8 @@ def export_to_long_sql(
                 mask_phi=config.mask_phi,
                 pipeline=pipeline,
                 phi_keys=phi_keys,
+                naming_convention=config.naming_convention,
+                sdtm_domain=config.sdtm_domain,
                 variable_whitelist=config.variable_whitelist,
                 form_whitelist=config.form_whitelist,
             )
@@ -6959,7 +7326,12 @@ def export_to_long_sql(
                 first = False
             if first and config.idempotent and not isinstance(engine, NonCallableMock):
                 empty_df = pd.DataFrame(
-                    columns=["record_id", "form_id", "variable_name", "value", "timestamp"]
+                    columns=list(
+                        _resolve_long_sql_column_names(
+                            config.naming_convention,
+                            config.sdtm_domain,
+                        )
+                    )
                 )
                 empty_df.to_sql(table_name, engine, if_exists="replace", index=False)
         finally:
