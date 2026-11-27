@@ -41,14 +41,14 @@ class RetryPolicy(Protocol):
 class DefaultRetryPolicy:
     """Retry policy with idempotency-aware retry logic.
 
-    - **Network errors** (``httpx.RequestError``) and **server errors** (HTTP
-      500-599) are only retried for idempotent HTTP methods:
-      ``GET``, ``PUT``, ``DELETE``, ``HEAD``, and ``OPTIONS``.
+    - **Network errors** (``httpx.RequestError``), **request timeouts** (HTTP
+      408), and **server errors** (HTTP 500-599) are only retried for idempotent
+      HTTP methods: ``GET``, ``PUT``, ``DELETE``, ``HEAD``, and ``OPTIONS``.
     - **Rate-limit responses** (HTTP 429) are retried for *all* methods because
       the server rejected the request before processing the payload, so there is
       no risk of duplicate side-effects.
     - Requests with an unknown or missing method are treated as non-idempotent
-      (fail-safe default): they are *not* retried on network errors or 5xx
+      (fail-safe default): they are *not* retried on network errors, 408, or 5xx
       responses.
 
     **Overriding this behaviour**
@@ -88,7 +88,9 @@ class DefaultRetryPolicy:
         if isinstance(response, httpx.Response):
             if response.status_code == 429:
                 return True
-            return is_idempotent and 500 <= response.status_code < 600
+            return is_idempotent and (
+                response.status_code == 408 or 500 <= response.status_code < 600
+            )
 
         return False
 
