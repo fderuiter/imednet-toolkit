@@ -1398,6 +1398,57 @@ def _validate_text_length(
         )
 
 
+def _resolve_multiselect_indicator(
+    key: str,
+    known_variables: Mapping[str, Any],
+) -> tuple[str, Any, str] | None:
+    """Resolve a REDCap ``var___<code>`` checkbox indicator to ``(parent_name, var_obj, code)``."""
+    if "___" not in key:
+        return None
+    for parent_name, _, suffix in (key.rpartition("___"), key.partition("___")):
+        if not parent_name or parent_name not in known_variables:
+            continue
+        parent_var = known_variables[parent_name]
+        parent_vtype = _normalize_variable_type_key(_effective_variable_type(parent_var))
+        if parent_vtype in _MULTI_CHOICE_TYPE_KEYS:
+            return parent_name, parent_var, suffix
+    return None
+
+
+def _validate_checkbox_indicator_value(value: Any) -> None:
+    """Validate that a REDCap ``var___<code>`` indicator holds a binary flag (bool, 0/1, '0'/'1')."""
+    if isinstance(value, bool):
+        return
+    if isinstance(value, int) and value in (0, 1):
+        return
+    if isinstance(value, str) and value.strip() in ("0", "1"):
+        return
+    raise ValidationError("Checkbox indicator value must be a boolean, 0, or 1")
+
+
+def _is_checked_indicator_value(value: Any) -> bool:
+    """Return True when a REDCap ``var___<code>`` indicator is checked (True, 1, or '1')."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip() == "1"
+    return False
+
+
+def _has_checked_multiselect_indicator(
+    parent_name: str,
+    data: Mapping[str, Any],
+    resolved_indicators: Mapping[str, tuple[str, Any, str]],
+) -> bool:
+    """Return True if any ``parent_name___<code>`` indicator in ``data`` is checked."""
+    return any(
+        p_name == parent_name and ind_key in data and _is_checked_indicator_value(data[ind_key])
+        for ind_key, (p_name, _, _) in resolved_indicators.items()
+    )
+
+
 def _check_required_variables_only(
     variables: Mapping[str, Any],
     form_key: str,
@@ -1407,13 +1458,17 @@ def _check_required_variables_only(
     record_index: int,
     errors: list[RecordValidationIssue],
     warnings: list[RecordValidationIssue],
+    resolved_indicators: Mapping[str, tuple[str, Any, str]] | None = None,
 ) -> None:
     """Enforce ``required`` variable flags on API ``BaseSchemaCache`` schemas."""
+    indicators = resolved_indicators or {}
     for name, var_obj in variables.items():
         constraints = extract_variable_constraints(var_obj)
         if constraints.required_policy == "no":
             continue
-        if name not in data or _is_empty_value(data[name]):
+        if (name not in data or _is_empty_value(data[name])) and not (
+            indicators and _has_checked_multiselect_indicator(name, data, indicators)
+        ):
             msg = f"Required variable '{name}' on form '{form_key}' is missing or empty"
             if constraints.required_policy == "yes":
                 if not collect_errors:
@@ -1553,7 +1608,16 @@ def validate_record_data(
             _record_error(f"Unknown form {form_key}", rule_id="unknown_form")
             return _finish()
 
-    unknown = [k for k in data if k not in known_variables]
+    resolved_indicators: dict[str, tuple[str, Any, str]] = {}
+    unknown: list[str] = []
+    for k in data:
+        if k in known_variables:
+            continue
+        resolved = _resolve_multiselect_indicator(k, known_variables)
+        if resolved is not None:
+            resolved_indicators[k] = resolved
+        else:
+            unknown.append(k)
     if unknown:
         _record_error(
             f"Unknown variables for form {form_key}: {', '.join(unknown)}",
@@ -1572,6 +1636,28 @@ def validate_record_data(
                 variable_name=name,
                 rule_id="masked_phi",
             )
+            continue
+        if name in resolved_indicators:
+            parent_name, parent_var, suffix = resolved_indicators[name]
+            if value is not None and value != "":
+                try:
+                    _validate_checkbox_indicator_value(value)
+                except ValidationError as exc:
+                    type_failed_vars.add(name)
+                    _record_error(exc.message, variable_name=name, rule_id="type", exc=exc)
+            if not isinstance(schema, BaseSchemaCache):
+                parent_constraints = extract_variable_constraints(parent_var)
+                if not suffix or suffix not in set(parent_constraints.choices):
+                    is_sens = global_sensitivity_registry.is_sensitive(
+                        name
+                    ) or global_sensitivity_registry.is_sensitive(parent_name)
+                    shown_suffix = MASKED_SENTINEL if is_sens else suffix
+                    _record_error(
+                        f"Invalid choice '{shown_suffix}' for variable '{name}' on form '{form_key}'. "
+                        f"Allowed values: {parent_constraints.choices}",
+                        variable_name=name,
+                        rule_id="choice",
+                    )
             continue
         if name not in known_variables:
             continue
@@ -1593,6 +1679,7 @@ def validate_record_data(
             record_index=record_index,
             errors=errors,
             warnings=warnings,
+            resolved_indicators=resolved_indicators,
         )
         return _finish()
 
@@ -1602,6 +1689,10 @@ def validate_record_data(
         constraints = extract_variable_constraints(var_obj)
         is_missing = name not in data or _is_empty_value(data[name])
         if is_missing:
+            if resolved_indicators and _has_checked_multiselect_indicator(
+                name, data, resolved_indicators
+            ):
+                continue
             if constraints.required_policy == "yes":
                 _record_error(
                     f"Required variable '{name}' on form '{form_key}' is missing or empty",

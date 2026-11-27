@@ -209,13 +209,14 @@ Data Dictionary commands
 ------------------------
 
 The ``imednet datadict`` subcommands convert Study metadata across 4-file CSV exports,
-CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON
-files, export the JSON Schema, and compute structural revision diffs (see
+CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate offline sources
+(``.json``, ``.xml``, REDCap ``.csv``, ``.zip``, or 4-file CSV directories), export the
+JSON Schema or CDISC ODM XML, and compute structural revision diffs across formats (see
 :doc:`/how-to/data_dictionary` for Python equivalents and Record validation):
 
 .. code-block:: bash
 
-   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-csv ./datadict_export.zip --study-key STUDY -o study_dd.json --strict --no-raw-xml
    imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
    imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
    imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json

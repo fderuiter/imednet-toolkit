@@ -988,3 +988,123 @@ def test_load_offline_schema_supports_zip_archive_and_is_file_target(tmp_path: P
     assert isinstance(dd, DataDictionary)
     assert dd.metadata.studyKey == "ZIP_STUDY"
     assert {f.formKey for f in dd.forms} == {"AE", "AEACTEL", "AESDC"}
+
+
+def test_redcap_record_validation_decimals_slider_date_dmy_descriptive_and_checkbox_indicators() -> (
+    None
+):
+    """validate_record_data validates REDCap number_2dp, slider, date_dmy, descriptive, and var___<code>."""
+    from imednet.datadict import load_from_redcap
+    from imednet.utils.tabular import MASKED_SENTINEL
+
+    redcap_csv = (
+        '"Variable / Field Name","Form Name","Field Type","Field Label",'
+        '"Choices, Calculations, OR Slider Labels",'
+        '"Text Validation Type OR Show Slider Number","Text Validation Min",'
+        '"Text Validation Max","Required Field?"\n'
+        '"weight_kg","exam","text","Weight",,"number_2dp",,,"y"\n'
+        '"pain_vas","exam","slider","Pain Score","0, No pain | 100, Worst pain","number",,,\n'
+        '"visit_dmy","exam","text","Visit Date",,"date_dmy",,,\n'
+        '"instructions","exam","descriptive","Read carefully",,,,,"y"\n'
+        '"symptoms","exam","checkbox","Symptoms","0, None | 1, Headache | 2, Fever",,,,"y"\n'
+        '"DateOfBirth","exam","checkbox","PHI Year Cohort","1980, 1980s | 1990, 1990s",,,\n'
+    )
+    dd = load_from_redcap(redcap_csv, study_key="REDCAP_VAL")
+
+    # Valid payload: 72.45 on number_2dp, 75 on slider, 25-05-2026 on date_dmy,
+    # omitted descriptive item (even though Required Field? was 'y'), and symptoms___1 indicator
+    validate_record_data(
+        dd,
+        "exam",
+        {
+            "weight_kg": 72.45,
+            "pain_vas": 75,
+            "visit_dmy": "25-05-2026",
+            "symptoms___1": 1,
+            "symptoms___0": 0,
+        },
+    )
+
+    # Boundary slider values (0 and 100) and string/boolean checkbox indicators pass
+    validate_record_data(
+        dd,
+        "exam",
+        {
+            "weight_kg": 70.0,
+            "pain_vas": 0,
+            "symptoms___0": "1",
+            "symptoms___2": False,
+        },
+    )
+    validate_record_data(
+        dd,
+        "exam",
+        {
+            "weight_kg": 70,
+            "pain_vas": 100,
+            "symptoms___2": True,
+        },
+    )
+
+    # Slider values outside 0..100 are rejected
+    for out_of_bounds_slider in (-1, -0.1, 100.5, 150):
+        with pytest.raises(ValidationError):
+            validate_record_data(
+                dd,
+                "exam",
+                {"weight_kg": 72.45, "pain_vas": out_of_bounds_slider, "symptoms___1": 1},
+            )
+
+    # Invalid calendar dates are rejected on date_dmy, whereas 25-05-2026 is accepted only via Date DMY
+    for bad_dmy in ("31-02-2026", "29-02-2025", "15-13-2026", "not-a-date"):
+        with pytest.raises(ValidationError):
+            validate_record_data(
+                dd,
+                "exam",
+                {"weight_kg": 72.45, "visit_dmy": bad_dmy, "symptoms___1": 1},
+            )
+
+    # Absent var___<code> choice suffixes are rejected
+    for bad_ind_key in ("symptoms___99", "symptoms___"):
+        with pytest.raises(ValidationError, match="Invalid choice"):
+            validate_record_data(
+                dd,
+                "exam",
+                {"weight_kg": 72.45, bad_ind_key: 1, "symptoms___1": 1},
+            )
+
+    # Non-binary checkbox indicator values are rejected
+    for bad_ind_val in (2, -1, "2", "checked"):
+        with pytest.raises(ValidationError, match="Checkbox indicator"):
+            validate_record_data(
+                dd,
+                "exam",
+                {"weight_kg": 72.45, "symptoms___1": bad_ind_val},
+            )
+
+    # Required checkbox fails when all indicators are unchecked (0 / False) and parent is omitted
+    with pytest.raises(ValidationError, match="Required variable 'symptoms'"):
+        validate_record_data(
+            dd,
+            "exam",
+            {"weight_kg": 72.45, "symptoms___1": 0, "symptoms___2": False},
+        )
+
+    # Unknown parent prefix still fails as unknown variable
+    with pytest.raises(ValidationError, match="Unknown variables"):
+        validate_record_data(
+            dd,
+            "exam",
+            {"weight_kg": 72.45, "symptoms___1": 1, "nonexistent___1": 1},
+        )
+
+    # PHI masking on sensitive Multi Select indicator variable
+    secret_code = "1985_SECRET"
+    with pytest.raises(ValidationError) as exc_phi:
+        validate_record_data(
+            dd,
+            "exam",
+            {"weight_kg": 72.45, "symptoms___1": 1, f"DateOfBirth___{secret_code}": 1},
+        )
+    assert MASKED_SENTINEL in str(exc_phi.value)
+    assert secret_code not in str(exc_phi.value)
