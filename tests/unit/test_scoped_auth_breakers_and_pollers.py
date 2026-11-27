@@ -1087,7 +1087,7 @@ async def test_origin_scoped_external_breakers_spare_other_hosts_and_lru_evict(
         assert "x-api-key" not in {
             k.lower() for k in seen_headers["bad-origin.example.com/export.json"]
         }
-        assert "bad-origin.example.com" in resolved_hosts
+        assert any(host == "bad-origin.example.com" for host in resolved_hosts)
 
         # Same-origin JobsEndpoint.fetch_result 302 -> 503 reopens primary EDC HALF_OPEN breaker
         client._circuit_breaker.failure_threshold = 1
