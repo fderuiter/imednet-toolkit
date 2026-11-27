@@ -201,16 +201,18 @@ def _attach_sdtm_document_id(doc: dict[str, Any], record: Any, study_key: str) -
     if rid is None:
         rid = doc.get("RECORD_ID")
     resolved_study = str(doc.get("STUDYID") or study_key)
-    if rid is not None:
+    domain = str(doc.get("DOMAIN") or "DM").strip().upper()
+    raw_usubjid = doc.get("USUBJID")
+    usubjid = str(raw_usubjid).strip() if raw_usubjid is not None else ""
+    if domain == "DM" and usubjid:
+        doc["_id"] = f"{resolved_study}/DM/{usubjid}"
+    elif rid is not None:
         doc["_id"] = _make_document_id(resolved_study, rid)
+    elif domain == "DM":
+        doc["_id"] = f"{resolved_study}/DM/"
     else:
-        domain = str(doc.get("DOMAIN") or "DM").strip().upper()
-        usubjid = str(doc.get("USUBJID") or "")
-        if domain == "DM":
-            doc["_id"] = f"{resolved_study}/DM/{usubjid}"
-        else:
-            seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
-            doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
+        seq_val = next((doc[k] for k in doc if k.endswith("SEQ")), 1)
+        doc["_id"] = f"{resolved_study}/{domain}/{usubjid}/{seq_val}"
     normalized: dict[str, Any] = normalize_sink_value(doc)
     return _encode_bson_scalars(normalized)  # type: ignore[no-any-return]
 
@@ -245,6 +247,13 @@ def _dedupe_sdtm_mongo_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     index_by_key: dict[tuple[Any, ...], int] = {}
     ordered: list[dict[str, Any] | None] = []
     for doc in docs:
+        comp = extract_sdtm_composite_key(doc)
+        if comp is not None and comp[1] == "DM":
+            if comp in index_by_key:
+                ordered[index_by_key[comp]] = None
+            index_by_key[comp] = len(ordered)
+            ordered.append(doc)
+            continue
         if "_id" in doc and "RECORD_ID" in doc and doc.get("RECORD_ID") is not None:
             comp_id: tuple[Any, ...] = ("_id", doc["_id"])
             if comp_id in index_by_key:
@@ -252,7 +261,6 @@ def _dedupe_sdtm_mongo_docs(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             index_by_key[comp_id] = len(ordered)
             ordered.append(doc)
             continue
-        comp = extract_sdtm_composite_key(doc)
         if comp is None or (comp[1] != "DM" and comp[4] is None):
             ordered.append(doc)
             continue
@@ -286,13 +294,13 @@ def _record_to_document(
 def _build_sdtm_superseded_prune_query(
     mapped_docs: Sequence[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Build an optional delete filter for superseded SDTM documents without ``RECORD_ID``."""
+    """Build an optional delete filter for superseded SDTM documents."""
     superseded_clauses: list[dict[str, Any]] = []
     for doc in mapped_docs:
-        if "RECORD_ID" in doc:
-            continue
         comp = extract_sdtm_composite_key(doc)
-        if comp is not None and (comp[1] == "DM" or comp[4] is not None):
+        if "RECORD_ID" in doc and (comp is None or comp[1] != "DM"):
+            continue
+        if comp is not None and "_id" in doc and (comp[1] == "DM" or comp[4] is not None):
             flt: dict[str, Any] = {
                 "STUDYID": comp[0],
                 "DOMAIN": comp[1],
@@ -446,16 +454,21 @@ class _MongoDbSinkCoreMixin:
     ) -> tuple[dict[str, Any] | None, int, bool]:
         """Build ``(delete_query, expected_count, is_sdtm)`` for voided MongoDB documents."""
         if self.config.as_sdtm:
-            doc_ids = [
-                _make_document_id(self._study_key, rid)
-                for r in records
-                if (rid := extract_record_id(r)) is not None
-            ]
-            unmatched_records = [r for r in records if extract_record_id(r) is None]
+            rids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+            preserve_rid = should_preserve_sdtm_record_id(self.config)
+            doc_ids = [_make_document_id(self._study_key, rid) for rid in rids]
+            seen_doc_ids = set(doc_ids)
+            may_include_dm = self.config.sdtm_domain in (None, "DM")
+            records_for_lineage = (
+                list(records)
+                if (not preserve_rid or may_include_dm)
+                else [r for r in records if extract_record_id(r) is None]
+            )
             comp_filters: list[dict[str, Any]] = []
-            if unmatched_records:
+            unkeyed_matched = 0
+            if records_for_lineage:
                 sdtm_entries = resolve_voided_sdtm_keys(
-                    unmatched_records,
+                    records_for_lineage,
                     self,
                     study_key=getattr(self, "_active_study_key", None) or self._study_key,
                     stream_name=getattr(self, "_active_stream_name", None)
@@ -463,18 +476,44 @@ class _MongoDbSinkCoreMixin:
                     sdtm_domain=self.config.sdtm_domain,
                     form_domain_map=getattr(self, "_active_form_domain_map", None),
                 )
-                comp_filters = [
-                    flt
-                    for e in sdtm_entries
-                    if (flt := _sdtm_composite_mongo_filter(e)) is not None
-                ]
+                for entry in sdtm_entries:
+                    dom_upper = (
+                        str(entry.get("domain") or entry.get("DOMAIN") or "").strip().upper()
+                    )
+                    study_id = str(
+                        entry.get("study_id") or entry.get("STUDYID") or self._study_key
+                    ).strip()
+                    usubjid = str(entry.get("usubjid") or entry.get("USUBJID") or "").strip()
+                    has_rid = entry.get("record_id") is not None
+                    if dom_upper == "DM" and study_id and usubjid:
+                        dm_id = f"{study_id}/DM/{usubjid}"
+                        if dm_id not in seen_doc_ids:
+                            seen_doc_ids.add(dm_id)
+                            doc_ids.append(dm_id)
+                        if preserve_rid and has_rid:
+                            continue
+                    if preserve_rid and has_rid:
+                        continue
+                    flt = _sdtm_composite_mongo_filter(entry)
+                    if flt is not None:
+                        comp_filters.append(flt)
+                        if not has_rid:
+                            unkeyed_matched += 1
+            if self.config.sdtm_domain == "DM" and preserve_rid and doc_ids and rids:
+                # Filter out raw STUDY/rid IDs when DM IDs resolved cleanly so doc_ids stays minimal
+                dm_only_ids = [did for did in doc_ids if "/DM/" in did]
+                if len(dm_only_ids) >= len(rids):
+                    doc_ids = dm_only_ids
             or_clauses: list[dict[str, Any]] = list(comp_filters)
             if doc_ids:
                 or_clauses.append({"_id": {"$in": doc_ids}})
             if not or_clauses:
                 return None, 0, True
             delete_query = or_clauses[0] if len(or_clauses) == 1 else {"$or": or_clauses}
-            return delete_query, len(doc_ids) + len(comp_filters), True
+            expected_count = (
+                len(rids) + unkeyed_matched if preserve_rid else max(len(rids), len(comp_filters))
+            )
+            return delete_query, expected_count, True
 
         doc_ids = [
             _make_document_id(self._study_key, rid)
