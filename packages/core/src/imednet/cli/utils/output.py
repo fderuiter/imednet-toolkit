@@ -767,7 +767,9 @@ def display_list(
         data_list = [_project_item_to_row(item, field_keys, explicit_fields=True) for item in items]
     else:
         first = items[0]
-        if hasattr(first, "model_dump"):
+        if isinstance(first, BaseModel):
+            data_list = [item.model_dump(warnings=False) for item in items]
+        elif hasattr(first, "model_dump"):
             data_list = [item.model_dump() for item in items]
         elif isinstance(first, dict):
             data_list = list(items)
@@ -870,7 +872,7 @@ def print_error(
 def _json_default(value: Any) -> Any:
     """Serialize model/date/enum values without lossy string fallbacks."""
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json", by_alias=True)
+        return value.model_dump(mode="json", by_alias=True, warnings=False)
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     if isinstance(value, Enum):
