@@ -3,7 +3,7 @@ Retry Policy and Error Handling
 
 :class:`~imednet.core.RetryPolicy` decouples retry decisions from the underlying tenacity logic
 configured via :class:`~imednet.core.RetryConfig`.
-The :class:`~imednet.core.DefaultRetryPolicy` implementation retries idempotent network and 5xx errors and HTTP 429 rate limits.
+The :class:`~imednet.core.DefaultRetryPolicy` implementation retries idempotent network, HTTP 408, and 5xx errors and HTTP 429 rate limits.
 You can implement your own strategy by inspecting :class:`imednet.core.retry.RetryState`.
 
 Handling exceptions
@@ -103,22 +103,25 @@ Circuit breakers, probe leases, and rate-limit classification
 -------------------------------------------------------------
 
 Every :class:`~imednet.sdk.ImednetSDK` and :class:`~imednet.sdk.AsyncImednetSDK` client owns an
-isolated ``CircuitBreaker`` instance (configured on ``HTTPClientBase`` with
+isolated primary ``CircuitBreaker`` instance (configured on ``HTTPClientBase`` with
 ``failure_threshold=5``, ``recovery_timeout=10.0`` seconds, and
-``half_open_max_probes=1``) so consecutive upstream faults on one ``Study`` client never
-trip an independent client instance:
+``half_open_max_probes=1``) plus an LRU-bounded per-origin ``CircuitBreaker`` map for external
+terminal redirect hops so consecutive upstream faults on one ``Study`` client or external host
+never trip an independent client or origin:
 
-* **State transitions (``CircuitState``):** The breaker starts in ``CircuitState.CLOSED``.
-  After ``failure_threshold`` consecutive network transport errors or HTTP ``5xx`` responses
-  (``record_failure``), it transitions to ``CircuitState.OPEN`` and blocks new calls
+* **State transitions (``CircuitState``):** Each attempt acquires its own ``ProbeLease``. The
+  breaker starts in ``CircuitState.CLOSED``. After ``failure_threshold`` consecutive network
+  transport errors, HTTP ``408`` timeouts, or HTTP ``5xx`` responses (``record_failure``), it
+  transitions to ``CircuitState.OPEN``, aborts remaining retries, and blocks new calls
   immediately for ``recovery_timeout`` seconds.
 * **Bounded recovery probes (``ProbeLease``):** Once ``recovery_timeout`` elapses, the next
-  caller transitions the breaker to ``CircuitState.HALF_OPEN`` and receives a ``ProbeLease``
-  (blocking concurrent callers beyond ``half_open_max_probes``). A ``2xx`` response calls
-  ``record_success`` and closes the circuit; a transport or ``5xx`` failure re-opens it. If
-  a probe exits early (for example via task cancellation or a client ``4xx`` response),
-  ``ProbeLease.release_if_unsettled`` releases the in-flight probe slot automatically so
-  recovery never deadlocks.
+  attempt transitions the breaker to ``CircuitState.HALF_OPEN`` and receives a ``ProbeLease``
+  (blocking concurrent callers beyond ``half_open_max_probes``). Only an HTTP ``2xx`` response
+  calls ``record_success`` to close the circuit and increment its epoch; a transport, ``408``, or
+  ``5xx`` failure re-opens it. If a probe exits without a terminal health signal (for example via
+  task cancellation, a ``3xx`` redirect hop, or a non-``408``/non-``429`` ``4xx`` client error),
+  ``ProbeLease.release`` releases the in-flight probe slot automatically without closing
+  ``HALF_OPEN`` so recovery neither deadlocks nor masks upstream faults.
 * **HTTP ``429`` ``record_rate_limit`` vs ``5xx`` ``record_failure``:** While the breaker is
   ``CircuitState.CLOSED``, HTTP ``429`` responses invoke ``record_rate_limit()`` rather than
   ``record_failure()``, allowing ``Retry-After`` backoff to pace ``Subject``, ``Site``,
