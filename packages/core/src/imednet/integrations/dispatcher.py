@@ -76,12 +76,18 @@ class ExportRegistry:
     def get_tabular(self, target_type: str) -> Callable[..., Any] | None:
         """Retrieve a registered tabular function, or None if not found."""
         with self._lock:
-            return self._tabular_targets.get(target_type)
+            found = self._tabular_targets.get(target_type)
+            if found is not None or "-" not in target_type:
+                return found
+            return self._tabular_targets.get(target_type.replace("-", "_"))
 
     def get_async_tabular(self, target_type: str) -> Callable[..., Any] | None:
         """Retrieve a registered async tabular function, or None if not found."""
         with self._lock:
-            return self._async_tabular_targets.get(target_type)
+            found = self._async_tabular_targets.get(target_type)
+            if found is not None or "-" not in target_type:
+                return found
+            return self._async_tabular_targets.get(target_type.replace("-", "_"))
 
     def get_sink(self, target_type: str) -> type[ExportSink] | None:
         """Retrieve a registered synchronous sink class, or None if not found."""
@@ -198,14 +204,35 @@ class _PrefetchedSyncFacade:
         forms: list[Any],
         variables: list[Any],
         records: list[Any],
+        intervals: list[Any] | None = None,
+        sites: list[Any] | None = None,
+        users: list[Any] | None = None,
+        subjects: list[Any] | None = None,
+        visits: list[Any] | None = None,
+        record_revisions: list[Any] | None = None,
+        queries: list[Any] | None = None,
     ) -> None:
         self._async_sdk = async_sdk
         self._forms = forms
         self._variables = variables
         self._records = records
+        self._intervals = list(intervals or ())
+        self._sites = list(sites or ())
+        self._users = list(users or ())
+        self._subjects = list(subjects or ())
+        self._visits = list(visits or ())
+        self._record_revisions = list(record_revisions or ())
+        self._queries = list(queries or ())
         self.forms = _PrefetchedListEndpoint(forms)
         self.variables = _PrefetchedListEndpoint(variables)
         self.records = _PrefetchedListEndpoint(records)
+        self.intervals = _PrefetchedListEndpoint(self._intervals)
+        self.sites = _PrefetchedListEndpoint(self._sites)
+        self.users = _PrefetchedListEndpoint(self._users)
+        self.subjects = _PrefetchedListEndpoint(self._subjects)
+        self.visits = _PrefetchedListEndpoint(self._visits)
+        self.record_revisions = _PrefetchedListEndpoint(self._record_revisions)
+        self.queries = _PrefetchedListEndpoint(self._queries)
 
     @property
     def config(self) -> Any:
@@ -236,6 +263,64 @@ class _PrefetchedSyncFacade:
         if _filters.get("deleted") is False:
             return [r for r in self._records if not is_record_deleted(r)]
         return list(self._records)
+
+    def get_intervals(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._intervals)
+
+    def get_sites(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._sites)
+
+    def get_users(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._users)
+
+    def get_subjects(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._subjects)
+
+    def get_visits(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._visits)
+
+    def get_record_revisions(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._record_revisions)
+
+    def get_queries(self, study_key: str | None = None, **_filters: Any) -> list[Any]:
+        _ = study_key
+        return list(self._queries)
+
+
+async def _try_prefetch_endpoint_items(
+    sdk: Any, study_key: str, ep_attr: str, method_name: str
+) -> list[Any]:
+    """Best-effort async fetch for secondary study metadata endpoints."""
+    with contextlib.suppress(Exception):
+        if isinstance(sdk, NonCallableMock):
+            children = getattr(sdk, "_mock_children", {})
+            ov = vars(sdk)
+            has_ep = ep_attr in children or ep_attr in ov
+            has_m = (
+                method_name in children
+                or method_name in ov
+                or f"async_{method_name}" in children
+                or f"async_{method_name}" in ov
+            )
+            if not has_ep and not has_m:
+                return []
+            if has_ep and not has_m:
+                ep_res = getattr(sdk, ep_attr).list(study_key=study_key)
+                if inspect.isawaitable(ep_res):
+                    ep_res = await ep_res
+                if hasattr(ep_res, "__aiter__"):
+                    return [item async for item in ep_res]
+                return [] if isinstance(ep_res, NonCallableMock) else list(ep_res)
+        raw = await call_async_facade_method(sdk, method_name, study_key=study_key)
+        if not isinstance(raw, NonCallableMock):
+            return list(raw)
+    return []
 
 
 async def _run_tabular_via_async_prefetch(
@@ -291,11 +376,37 @@ async def _run_tabular_via_async_prefetch(
             exclude_deleted_upstream=not (include_deleted or is_inc),
         )
     ]
+    extra_prefetched: dict[str, list[Any]] = {}
+    func_name = getattr(tabular_func, "__name__", "")
+    if func_name in ("export_to_odm", "export_to_dataset_json"):
+        extra_prefetched["visits"] = await _try_prefetch_endpoint_items(
+            sdk, study_key, "visits", "get_visits"
+        )
+    if func_name == "export_to_odm":
+        for ep_attr, method_name in (
+            ("intervals", "get_intervals"),
+            ("sites", "get_sites"),
+            ("users", "get_users"),
+            ("subjects", "get_subjects"),
+        ):
+            extra_prefetched[ep_attr] = await _try_prefetch_endpoint_items(
+                sdk, study_key, ep_attr, method_name
+            )
+        if kwargs.get("include_audit_trail", True):
+            extra_prefetched["record_revisions"] = await _try_prefetch_endpoint_items(
+                sdk, study_key, "record_revisions", "get_record_revisions"
+            )
+        if kwargs.get("include_annotations", True):
+            extra_prefetched["queries"] = await _try_prefetch_endpoint_items(
+                sdk, study_key, "queries", "get_queries"
+            )
+
     prefetched_sdk = _PrefetchedSyncFacade(
         sdk,
         forms=forms,
         variables=variables,
         records=records,
+        **extra_prefetched,
     )
 
     def _invoke() -> Any:

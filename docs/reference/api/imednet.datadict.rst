@@ -17,6 +17,14 @@ Subpackages
 Submodules
 ----------
 
+imednet.datadict.cdisc\_builders module
+---------------------------------------
+
+.. automodule:: imednet.datadict.cdisc_builders
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
 imednet.datadict.diff module
 ----------------------------
 
@@ -29,6 +37,14 @@ imednet.datadict.emit module
 ----------------------------
 
 .. automodule:: imednet.datadict.emit
+   :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
+   :members:
+   :show-inheritance:
+
+imednet.datadict.exchange module
+--------------------------------
+
+.. automodule:: imednet.datadict.exchange
    :inherited-members: BaseModel, ImednetBaseModel, RootModel, Enum, str, int, Exception, BaseException, object
    :members:
    :show-inheritance:

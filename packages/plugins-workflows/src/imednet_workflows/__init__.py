@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         AsyncRecordMapper,
         RecordMapper,
         format_iso8601_dtc,
+        transform_records_to_dataset_json,
         transform_records_to_sdtm,
     )
     from .record_update import AsyncRecordUpdateWorkflow, RecordUpdateWorkflow
@@ -154,6 +155,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "format_iso8601_dtc": ("imednet_workflows.record_mapper", "format_iso8601_dtc"),
     "get_study_structure": ("imednet_workflows.study_structure", "get_study_structure"),
     "iter_chunks": ("imednet_workflows.chunked_pipeline", "iter_chunks"),
+    "transform_records_to_dataset_json": (
+        "imednet_workflows.record_mapper",
+        "transform_records_to_dataset_json",
+    ),
     "transform_records_to_sdtm": (
         "imednet_workflows.record_mapper",
         "transform_records_to_sdtm",
@@ -241,5 +246,6 @@ __all__ = [
     "format_iso8601_dtc",
     "get_study_structure",
     "iter_chunks",
+    "transform_records_to_dataset_json",
     "transform_records_to_sdtm",
 ]

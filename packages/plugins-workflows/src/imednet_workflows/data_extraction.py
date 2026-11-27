@@ -1,8 +1,9 @@
 """Provides workflows for extracting specific datasets from iMednet studies."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any
 
+from imednet.spi.cdisc import OdmAuditRecord, map_revisions_to_audit_records
 from imednet.spi.models import Record, RecordRevision
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
@@ -12,6 +13,7 @@ from imednet.spi.utils import (
     matches_revision_date_bound,
     matches_revision_date_bounds,
     parse_revision_timestamp_utc,
+    resolve_enrichment_pipeline,
     run_sync_over_async,
     split_revision_date_bounds,
 )
@@ -144,6 +146,39 @@ class AsyncDataExtractionWorkflow:
             ]
         return revisions
 
+    async def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        default_location_oid: str | None = None,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Asynchronously extract study RecordRevision audit history mapped to ODM 1.3.2 ``<AuditRecord>`` models."""
+        revisions = await self.extract_audit_trail(
+            study_key=study_key,
+            start_date=start_date,
+            end_date=end_date,
+            user_filter=user_filter,
+            **filters,
+        )
+        resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+        if mask_phi:
+            pipeline = resolve_enrichment_pipeline(study_key)
+            if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                resolved_phi.update(pipeline.phi_keys)
+        _by_rec, all_ordered = map_revisions_to_audit_records(
+            revisions,
+            default_location_oid=default_location_oid,
+            mask_phi=mask_phi,
+            custom_phi_keys=resolved_phi or None,
+        )
+        return all_ordered
+
 
 class DataExtractionWorkflow:
     """Provides methods for complex data extraction tasks involving multiple iMednet endpoints.
@@ -212,6 +247,58 @@ class DataExtractionWorkflow:
                 start_date=start_date,
                 end_date=end_date,
                 user_filter=user_filter,
+                **filters,
+            )
+        )
+
+    def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        default_location_oid: str | None = None,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Extract study RecordRevision audit history mapped to ODM 1.3.2 ``<AuditRecord>`` models."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "DataExtractionWorkflow",
+            "extract_odm_audit_records",
+            "extract_odm_audit_records",
+        )
+        if "extract_audit_trail" in vars(self):
+            revisions = self.extract_audit_trail(
+                study_key=study_key,
+                start_date=start_date,
+                end_date=end_date,
+                user_filter=user_filter,
+                **filters,
+            )
+            resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+            if mask_phi:
+                pipeline = resolve_enrichment_pipeline(study_key)
+                if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                    resolved_phi.update(pipeline.phi_keys)
+            _by_rec, all_ordered = map_revisions_to_audit_records(
+                revisions,
+                default_location_oid=default_location_oid,
+                mask_phi=mask_phi,
+                custom_phi_keys=resolved_phi or None,
+            )
+            return all_ordered
+        return run_sync_over_async(
+            lambda: self._async_core.extract_odm_audit_records(
+                study_key,
+                start_date=start_date,
+                end_date=end_date,
+                user_filter=user_filter,
+                default_location_oid=default_location_oid,
+                mask_phi=mask_phi,
+                phi_keys=phi_keys,
                 **filters,
             )
         )

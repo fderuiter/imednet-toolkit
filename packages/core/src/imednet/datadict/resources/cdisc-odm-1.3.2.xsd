@@ -1,0 +1,690 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           xmlns:odm="http://www.cdisc.org/ns/odm/v1.3"
+           targetNamespace="http://www.cdisc.org/ns/odm/v1.3"
+           elementFormDefault="qualified"
+           attributeFormDefault="unqualified">
+
+  <xs:import namespace="http://www.w3.org/XML/1998/namespace" schemaLocation="xml.xsd"/>
+
+  <xs:simpleType name="oidType">
+    <xs:restriction base="xs:string">
+      <xs:minLength value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="yesOrNo">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Yes"/>
+      <xs:enumeration value="No"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="fileType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Snapshot"/>
+      <xs:enumeration value="Transactional"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="odmVersionType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="1.2"/>
+      <xs:enumeration value="1.3"/>
+      <xs:enumeration value="1.3.1"/>
+      <xs:enumeration value="1.3.2"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="transactionType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Insert"/>
+      <xs:enumeration value="Update"/>
+      <xs:enumeration value="Remove"/>
+      <xs:enumeration value="Upsert"/>
+      <xs:enumeration value="Context"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="dataType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="integer"/>
+      <xs:enumeration value="float"/>
+      <xs:enumeration value="date"/>
+      <xs:enumeration value="datetime"/>
+      <xs:enumeration value="time"/>
+      <xs:enumeration value="text"/>
+      <xs:enumeration value="string"/>
+      <xs:enumeration value="double"/>
+      <xs:enumeration value="URI"/>
+      <xs:enumeration value="boolean"/>
+      <xs:enumeration value="hexBinary"/>
+      <xs:enumeration value="base64Binary"/>
+      <xs:enumeration value="hexFloat"/>
+      <xs:enumeration value="base64Float"/>
+      <xs:enumeration value="partialDate"/>
+      <xs:enumeration value="partialTime"/>
+      <xs:enumeration value="partialDatetime"/>
+      <xs:enumeration value="durationDatetime"/>
+      <xs:enumeration value="intervalDatetime"/>
+      <xs:enumeration value="incompleteDatetime"/>
+      <xs:enumeration value="incompleteDate"/>
+      <xs:enumeration value="incompleteTime"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:complexType name="translatedTextContainer">
+    <xs:sequence>
+      <xs:element name="TranslatedText" minOccurs="1" maxOccurs="unbounded">
+        <xs:complexType>
+          <xs:simpleContent>
+            <xs:extension base="xs:string">
+              <xs:attribute ref="xml:lang" use="optional"/>
+            </xs:extension>
+          </xs:simpleContent>
+        </xs:complexType>
+      </xs:element>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="auditRecordType">
+    <xs:sequence>
+      <xs:element name="UserRef">
+        <xs:complexType>
+          <xs:attribute name="UserOID" type="odm:oidType" use="required"/>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="LocationRef">
+        <xs:complexType>
+          <xs:attribute name="LocationOID" type="odm:oidType" use="required"/>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="DateTimeStamp" type="xs:string"/>
+      <xs:element name="ReasonForChange" type="xs:string" minOccurs="0"/>
+      <xs:element name="SourceID" type="xs:string" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attribute name="EditPoint" type="xs:string" use="optional"/>
+    <xs:attribute name="UsedImputationMethod" type="odm:yesOrNo" use="optional"/>
+    <xs:attribute name="ID" type="xs:ID" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="annotationType">
+    <xs:sequence>
+      <xs:element name="Comment" minOccurs="0">
+        <xs:complexType>
+          <xs:simpleContent>
+            <xs:extension base="xs:string">
+              <xs:attribute name="SponsorOrSite" type="xs:string" use="optional"/>
+            </xs:extension>
+          </xs:simpleContent>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="Flag" minOccurs="0" maxOccurs="unbounded">
+        <xs:complexType>
+          <xs:sequence>
+            <xs:element name="FlagValue">
+              <xs:complexType>
+                <xs:simpleContent>
+                  <xs:extension base="xs:string">
+                    <xs:attribute name="CodeListOID" type="odm:oidType" use="required"/>
+                  </xs:extension>
+                </xs:simpleContent>
+              </xs:complexType>
+            </xs:element>
+            <xs:element name="FlagType" minOccurs="0">
+              <xs:complexType>
+                <xs:simpleContent>
+                  <xs:extension base="xs:string">
+                    <xs:attribute name="CodeListOID" type="odm:oidType" use="required"/>
+                  </xs:extension>
+                </xs:simpleContent>
+              </xs:complexType>
+            </xs:element>
+          </xs:sequence>
+        </xs:complexType>
+      </xs:element>
+    </xs:sequence>
+    <xs:attribute name="SeqNum" type="xs:integer" use="required"/>
+    <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+    <xs:attribute name="ID" type="xs:ID" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="itemDataType">
+    <xs:sequence>
+      <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0"/>
+      <xs:element name="MeasurementUnitRef" minOccurs="0">
+        <xs:complexType>
+          <xs:attribute name="MeasurementUnitOID" type="odm:oidType" use="required"/>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="ItemOID" type="odm:oidType" use="required"/>
+    <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+    <xs:attribute name="Value" type="xs:string" use="optional"/>
+    <xs:attribute name="IsNull" type="odm:yesOrNo" use="optional"/>
+    <xs:attribute name="AuditRecordID" type="xs:IDREF" use="optional"/>
+    <xs:attribute name="AnnotationID" type="xs:IDREF" use="optional"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <xs:complexType name="itemGroupDataType">
+    <xs:sequence>
+      <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0"/>
+      <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="ItemData" type="odm:itemDataType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="ItemGroupOID" type="odm:oidType" use="required"/>
+    <xs:attribute name="ItemGroupRepeatKey" type="xs:string" use="optional"/>
+    <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <xs:complexType name="formDataType">
+    <xs:sequence>
+      <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0"/>
+      <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="ItemGroupData" type="odm:itemGroupDataType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="FormOID" type="odm:oidType" use="required"/>
+    <xs:attribute name="FormRepeatKey" type="xs:string" use="optional"/>
+    <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <xs:complexType name="studyEventDataType">
+    <xs:sequence>
+      <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0"/>
+      <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="FormData" type="odm:formDataType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="StudyEventOID" type="odm:oidType" use="required"/>
+    <xs:attribute name="StudyEventRepeatKey" type="xs:string" use="optional"/>
+    <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <xs:complexType name="subjectDataType">
+    <xs:sequence>
+      <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0"/>
+      <xs:element name="InvestigatorRef" minOccurs="0">
+        <xs:complexType>
+          <xs:attribute name="UserOID" type="odm:oidType" use="required"/>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="SiteRef" minOccurs="0">
+        <xs:complexType>
+          <xs:attribute name="LocationOID" type="odm:oidType" use="required"/>
+        </xs:complexType>
+      </xs:element>
+      <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="StudyEventData" type="odm:studyEventDataType" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="FormData" type="odm:formDataType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="SubjectKey" type="xs:string" use="required"/>
+    <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>
+    <xs:anyAttribute namespace="##other" processContents="lax"/>
+  </xs:complexType>
+
+  <xs:element name="ODM">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="Study" minOccurs="0" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="GlobalVariables">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="StudyName" type="xs:string"/>
+                    <xs:element name="StudyDescription" type="xs:string" minOccurs="0"/>
+                    <xs:element name="ProtocolName" type="xs:string" minOccurs="0"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="BasicDefinitions" minOccurs="0">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="MeasurementUnit" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Symbol" type="odm:translatedTextContainer"/>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="MetaDataVersion" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="Include" minOccurs="0">
+                      <xs:complexType>
+                        <xs:attribute name="StudyOID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="MetaDataVersionOID" type="odm:oidType" use="required"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="Protocol" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:element name="StudyEventRef" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="StudyEventOID" type="odm:oidType" use="required"/>
+                              <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+                              <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+                              <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidType" use="optional"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="StudyEventDef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:element name="FormRef" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="FormOID" type="odm:oidType" use="required"/>
+                              <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+                              <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+                              <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidType" use="optional"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:attribute name="Repeating" type="odm:yesOrNo" use="required"/>
+                        <xs:attribute name="Type" type="xs:string" use="required"/>
+                        <xs:attribute name="Category" type="xs:string" use="optional"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="FormDef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:element name="ItemGroupRef" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="ItemGroupOID" type="odm:oidType" use="required"/>
+                              <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+                              <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+                              <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidType" use="optional"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:attribute name="Repeating" type="odm:yesOrNo" use="required"/>
+                        <xs:attribute name="FormType" type="xs:string" use="optional"/>
+                        <xs:attribute name="Comment" type="xs:string" use="optional"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="ItemGroupDef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:element name="ItemRef" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="ItemOID" type="odm:oidType" use="required"/>
+                              <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+                              <xs:attribute name="Mandatory" type="odm:yesOrNo" use="required"/>
+                              <xs:attribute name="KeySequence" type="xs:integer" use="optional"/>
+                              <xs:attribute name="MethodOID" type="odm:oidType" use="optional"/>
+                              <xs:attribute name="Role" type="xs:string" use="optional"/>
+                              <xs:attribute name="RoleCodeListOID" type="odm:oidType" use="optional"/>
+                              <xs:attribute name="CollectionExceptionConditionOID" type="odm:oidType" use="optional"/>
+                              <xs:attribute name="ControlType" type="xs:string" use="optional"/>
+                              <xs:anyAttribute namespace="##other" processContents="lax"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:attribute name="Repeating" type="odm:yesOrNo" use="required"/>
+                        <xs:attribute name="IsReferenceData" type="odm:yesOrNo" use="optional"/>
+                        <xs:attribute name="SASDatasetName" type="xs:string" use="optional"/>
+                        <xs:attribute name="Domain" type="xs:string" use="optional"/>
+                        <xs:attribute name="Origin" type="xs:string" use="optional"/>
+                        <xs:attribute name="Purpose" type="xs:string" use="optional"/>
+                        <xs:attribute name="Comment" type="xs:string" use="optional"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="ItemDef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:element name="Question" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:element name="ExternalQuestion" minOccurs="0">
+                            <xs:complexType>
+                              <xs:attribute name="Dictionary" type="xs:string" use="optional"/>
+                              <xs:attribute name="Version" type="xs:string" use="optional"/>
+                              <xs:attribute name="Code" type="xs:string" use="optional"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="MeasurementUnitRef" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="MeasurementUnitOID" type="odm:oidType" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="RangeCheck" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:sequence>
+                                <xs:element name="CheckValue" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+                                <xs:element name="FormalExpression" minOccurs="0" maxOccurs="unbounded">
+                                  <xs:complexType>
+                                    <xs:simpleContent>
+                                      <xs:extension base="xs:string">
+                                        <xs:attribute name="Context" type="xs:string" use="optional"/>
+                                      </xs:extension>
+                                    </xs:simpleContent>
+                                  </xs:complexType>
+                                </xs:element>
+                                <xs:element name="MeasurementUnitRef" minOccurs="0">
+                                  <xs:complexType>
+                                    <xs:attribute name="MeasurementUnitOID" type="odm:oidType" use="required"/>
+                                  </xs:complexType>
+                                </xs:element>
+                                <xs:element name="ErrorMessage" type="odm:translatedTextContainer" minOccurs="0"/>
+                              </xs:sequence>
+                              <xs:attribute name="Comparator" type="xs:string" use="optional"/>
+                              <xs:attribute name="SoftHard" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="CodeListRef" minOccurs="0">
+                            <xs:complexType>
+                              <xs:attribute name="CodeListOID" type="odm:oidType" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Origin" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType mixed="true">
+                              <xs:sequence>
+                                <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                              </xs:sequence>
+                              <xs:attribute name="Type" type="xs:string" use="optional"/>
+                              <xs:attribute name="Source" type="xs:string" use="optional"/>
+                              <xs:anyAttribute namespace="##other" processContents="lax"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:attribute name="DataType" type="odm:dataType" use="required"/>
+                        <xs:attribute name="Length" type="xs:integer" use="optional"/>
+                        <xs:attribute name="SignificantDigits" type="xs:integer" use="optional"/>
+                        <xs:attribute name="SASFieldName" type="xs:string" use="optional"/>
+                        <xs:attribute name="SDSVarName" type="xs:string" use="optional"/>
+                        <xs:attribute name="Origin" type="xs:string" use="optional"/>
+                        <xs:attribute name="Comment" type="xs:string" use="optional"/>
+                        <xs:attribute name="ControlType" type="xs:string" use="optional"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="CodeList" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer" minOccurs="0"/>
+                          <xs:choice minOccurs="0" maxOccurs="unbounded">
+                            <xs:element name="CodeListItem">
+                              <xs:complexType>
+                                <xs:sequence>
+                                  <xs:element name="Decode" type="odm:translatedTextContainer"/>
+                                  <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                                    <xs:complexType>
+                                      <xs:attribute name="Context" type="xs:string" use="required"/>
+                                      <xs:attribute name="Name" type="xs:string" use="required"/>
+                                    </xs:complexType>
+                                  </xs:element>
+                                </xs:sequence>
+                                <xs:attribute name="CodedValue" type="xs:string" use="required"/>
+                                <xs:attribute name="Rank" type="xs:decimal" use="optional"/>
+                                <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+                              </xs:complexType>
+                            </xs:element>
+                            <xs:element name="EnumeratedItem">
+                              <xs:complexType>
+                                <xs:sequence>
+                                  <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                                    <xs:complexType>
+                                      <xs:attribute name="Context" type="xs:string" use="required"/>
+                                      <xs:attribute name="Name" type="xs:string" use="required"/>
+                                    </xs:complexType>
+                                  </xs:element>
+                                </xs:sequence>
+                                <xs:attribute name="CodedValue" type="xs:string" use="required"/>
+                                <xs:attribute name="Rank" type="xs:decimal" use="optional"/>
+                                <xs:attribute name="OrderNumber" type="xs:integer" use="optional"/>
+                              </xs:complexType>
+                            </xs:element>
+                          </xs:choice>
+                          <xs:element name="ExternalCodeList" minOccurs="0">
+                            <xs:complexType>
+                              <xs:attribute name="Dictionary" type="xs:string" use="optional"/>
+                              <xs:attribute name="Version" type="xs:string" use="optional"/>
+                              <xs:attribute name="ref" type="xs:string" use="optional"/>
+                              <xs:attribute name="href" type="xs:string" use="optional"/>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:attribute name="DataType" type="odm:dataType" use="required"/>
+                        <xs:attribute name="SASFormatName" type="xs:string" use="optional"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="ConditionDef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer"/>
+                          <xs:element name="FormalExpression" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:simpleContent>
+                                <xs:extension base="xs:string">
+                                  <xs:attribute name="Context" type="xs:string" use="required"/>
+                                </xs:extension>
+                              </xs:simpleContent>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="MethodDef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="Description" type="odm:translatedTextContainer"/>
+                          <xs:element name="FormalExpression" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:simpleContent>
+                                <xs:extension base="xs:string">
+                                  <xs:attribute name="Context" type="xs:string" use="required"/>
+                                </xs:extension>
+                              </xs:simpleContent>
+                            </xs:complexType>
+                          </xs:element>
+                          <xs:element name="Alias" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="Context" type="xs:string" use="required"/>
+                              <xs:attribute name="Name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                        <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="Name" type="xs:string" use="required"/>
+                        <xs:attribute name="Type" type="xs:string" use="optional"/>
+                        <xs:anyAttribute namespace="##other" processContents="lax"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+                  </xs:sequence>
+                  <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                  <xs:attribute name="Name" type="xs:string" use="required"/>
+                  <xs:attribute name="Description" type="xs:string" use="optional"/>
+                  <xs:anyAttribute namespace="##other" processContents="lax"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+            <xs:attribute name="OID" type="odm:oidType" use="required"/>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="AdminData" minOccurs="0" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="User" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="LoginName" type="xs:string" minOccurs="0"/>
+                    <xs:element name="DisplayName" type="xs:string" minOccurs="0"/>
+                    <xs:element name="FullName" type="xs:string" minOccurs="0"/>
+                    <xs:element name="FirstName" type="xs:string" minOccurs="0"/>
+                    <xs:element name="LastName" type="xs:string" minOccurs="0"/>
+                    <xs:element name="Organization" type="xs:string" minOccurs="0"/>
+                    <xs:element name="Email" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+                    <xs:element name="Phone" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+                    <xs:element name="LocationRef" minOccurs="0" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:attribute name="LocationOID" type="odm:oidType" use="required"/>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                  <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                  <xs:attribute name="UserType" type="xs:string" use="optional"/>
+                  <xs:anyAttribute namespace="##other" processContents="lax"/>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="Location" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="MetaDataVersionRef" minOccurs="1" maxOccurs="unbounded">
+                      <xs:complexType>
+                        <xs:attribute name="StudyOID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="MetaDataVersionOID" type="odm:oidType" use="required"/>
+                        <xs:attribute name="EffectiveDate" type="xs:string" use="required"/>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                  <xs:attribute name="OID" type="odm:oidType" use="required"/>
+                  <xs:attribute name="Name" type="xs:string" use="required"/>
+                  <xs:attribute name="LocationType" type="xs:string" use="optional"/>
+                  <xs:anyAttribute namespace="##other" processContents="lax"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+            <xs:attribute name="StudyOID" type="odm:oidType" use="optional"/>
+            <xs:anyAttribute namespace="##other" processContents="lax"/>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="ReferenceData" minOccurs="0" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="ItemGroupData" type="odm:itemGroupDataType" minOccurs="0" maxOccurs="unbounded"/>
+              <xs:element name="AuditRecords" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0" maxOccurs="unbounded"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="Annotations" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+            <xs:attribute name="StudyOID" type="odm:oidType" use="required"/>
+            <xs:attribute name="MetaDataVersionOID" type="odm:oidType" use="required"/>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="ClinicalData" minOccurs="0" maxOccurs="unbounded">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="SubjectData" type="odm:subjectDataType" minOccurs="0" maxOccurs="unbounded"/>
+              <xs:element name="AuditRecords" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="AuditRecord" type="odm:auditRecordType" minOccurs="0" maxOccurs="unbounded"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+              <xs:element name="Annotations" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
+                  </xs:sequence>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+            <xs:attribute name="StudyOID" type="odm:oidType" use="required"/>
+            <xs:attribute name="MetaDataVersionOID" type="odm:oidType" use="required"/>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="Description" type="xs:string" use="optional"/>
+      <xs:attribute name="FileType" type="odm:fileType" use="required"/>
+      <xs:attribute name="Granularity" type="xs:string" use="optional"/>
+      <xs:attribute name="Archival" type="odm:yesOrNo" use="optional"/>
+      <xs:attribute name="FileOID" type="odm:oidType" use="required"/>
+      <xs:attribute name="CreationDateTime" type="xs:string" use="required"/>
+      <xs:attribute name="PriorFileOID" type="odm:oidType" use="optional"/>
+      <xs:attribute name="AsOfDateTime" type="xs:string" use="optional"/>
+      <xs:attribute name="ODMVersion" type="odm:odmVersionType" use="optional"/>
+      <xs:attribute name="Originator" type="xs:string" use="optional"/>
+      <xs:attribute name="SourceSystem" type="xs:string" use="optional"/>
+      <xs:attribute name="SourceSystemVersion" type="xs:string" use="optional"/>
+      <xs:attribute name="ID" type="xs:ID" use="optional"/>
+      <xs:anyAttribute namespace="##other" processContents="lax"/>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

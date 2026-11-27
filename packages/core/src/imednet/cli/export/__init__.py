@@ -456,6 +456,177 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
 
     json_parser.set_defaults(func=_dispatch_json)
 
+    # odm
+    odm_parser = sub.add_parser(
+        "odm",
+        help="Export study metadata, clinical data, audit records, and annotations to CDISC ODM 1.3.2 XML.",
+    )
+    _add_export_study_args(odm_parser)
+    odm_parser.add_argument("path", type=Path, help="Destination ODM 1.3.2 XML file.")
+    odm_parser.add_argument(
+        "--vars", dest="vars_", help="Comma-separated list of variable names to include."
+    )
+    odm_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    odm_parser.add_argument(
+        "--no-audit-trail",
+        dest="include_audit_trail",
+        action="store_false",
+        default=True,
+        help="Omit RecordRevision <AuditRecord> elements from the ODM snapshot.",
+    )
+    odm_parser.add_argument(
+        "--no-annotations",
+        dest="include_annotations",
+        action="store_false",
+        default=True,
+        help="Omit Query <Annotation> elements from the ODM snapshot.",
+    )
+    odm_parser.add_argument(
+        "--file-oid",
+        dest="file_oid",
+        default=None,
+        help="Optional deterministic ODM FileOID header value.",
+    )
+    odm_parser.add_argument(
+        "--creation-datetime",
+        dest="creation_datetime",
+        default=None,
+        help="Optional deterministic ISO-8601 CreationDateTime header value.",
+    )
+    _add_streaming_export_args(odm_parser)
+
+    @with_sdk
+    def export_odm_cmd(
+        sdk: ImednetSDK,
+        /,
+        study_key: str,
+        path: Path,
+        vars_: str | None = None,
+        forms: str | None = None,
+        include_audit_trail: bool = True,
+        include_annotations: bool = True,
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        **stream_kwargs: Any,
+    ) -> None:
+        from .. import export_to_odm
+
+        var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
+        form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
+        if file_oid is not None:
+            stream_kwargs["file_oid"] = file_oid
+        if creation_datetime is not None:
+            stream_kwargs["creation_datetime"] = creation_datetime
+        with fetching_status("records for CDISC ODM 1.3.2 export", study_key):
+            export_to_odm(
+                sdk,
+                study_key,
+                str(path),
+                variable_whitelist=var_list,
+                form_whitelist=form_list,
+                include_audit_trail=include_audit_trail,
+                include_annotations=include_annotations,
+                **stream_kwargs,
+            )
+
+    def _dispatch_odm(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(odm_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_odm_cmd(
+                study_key=study_key,
+                path=args.path,
+                vars_=args.vars_,
+                forms=args.forms,
+                include_audit_trail=args.include_audit_trail,
+                include_annotations=args.include_annotations,
+                file_oid=args.file_oid,
+                creation_datetime=args.creation_datetime,
+                **stream_kwargs,
+            )
+
+    odm_parser.set_defaults(func=_dispatch_odm)
+
+    # dataset-json
+    dsj_parser = sub.add_parser(
+        "dataset-json",
+        aliases=["dataset_json"],
+        help="Export study clinical datasets to CDISC Dataset-JSON v1.1.",
+    )
+    _add_export_study_args(dsj_parser)
+    dsj_parser.add_argument("path", type=Path, help="Destination Dataset-JSON v1.1 file.")
+    dsj_parser.add_argument(
+        "--use-labels",
+        action="store_true",
+        help="Use variable labels instead of names as item names.",
+    )
+    dsj_parser.add_argument(
+        "--vars", dest="vars_", help="Comma-separated list of variable names to include."
+    )
+    dsj_parser.add_argument("--forms", help="Comma-separated list of form IDs to include.")
+    dsj_parser.add_argument(
+        "--file-oid",
+        dest="file_oid",
+        default=None,
+        help="Optional deterministic Dataset-JSON fileOID header value.",
+    )
+    dsj_parser.add_argument(
+        "--creation-datetime",
+        dest="creation_datetime",
+        default=None,
+        help="Optional deterministic ISO-8601 creationDateTime header value.",
+    )
+    _add_streaming_export_args(dsj_parser)
+
+    @with_sdk
+    def export_dataset_json_cmd(
+        sdk: ImednetSDK,
+        /,
+        study_key: str,
+        path: Path,
+        use_labels: bool = False,
+        vars_: str | None = None,
+        forms: str | None = None,
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        **stream_kwargs: Any,
+    ) -> None:
+        from .. import export_to_dataset_json
+
+        var_list = [v.strip() for v in vars_.split(",")] if vars_ else None
+        form_list = [int(f.strip()) for f in forms.split(",")] if forms else None
+        if file_oid is not None:
+            stream_kwargs["file_oid"] = file_oid
+        if creation_datetime is not None:
+            stream_kwargs["creation_datetime"] = creation_datetime
+        with fetching_status("records for CDISC Dataset-JSON v1.1 export", study_key):
+            export_to_dataset_json(
+                sdk,
+                study_key,
+                str(path),
+                use_labels_as_columns=use_labels,
+                variable_whitelist=var_list,
+                form_whitelist=form_list,
+                **stream_kwargs,
+            )
+
+    def _dispatch_dataset_json(args: argparse.Namespace) -> None:
+        study_key = _resolve_export_study(dsj_parser, args)
+        stream_kwargs = _extract_streaming_kwargs(args)
+        with simulation_mode_context(bool(getattr(args, "simulation", False))):
+            export_dataset_json_cmd(
+                study_key=study_key,
+                path=args.path,
+                use_labels=args.use_labels,
+                vars_=args.vars_,
+                forms=args.forms,
+                file_oid=args.file_oid,
+                creation_datetime=args.creation_datetime,
+                **stream_kwargs,
+            )
+
+    dsj_parser.set_defaults(func=_dispatch_dataset_json)
+
     # duckdb
     ddb_parser = sub.add_parser("duckdb", help="Export study records to a DuckDB table.")
     _add_export_study_args(ddb_parser)

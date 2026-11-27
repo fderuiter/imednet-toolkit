@@ -48,6 +48,7 @@ from collections.abc import (
     AsyncIterable,
     AsyncIterator,
     Callable,
+    Collection,
     Iterable,
     Iterator,
     Mapping,
@@ -63,7 +64,7 @@ from typing_extensions import deprecated
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .datadict import DataDictionary
+    from .datadict import DataDictionary, DatasetJsonEnvelope, OdmAnnotation, OdmAuditRecord
     from .integrations.sink_base import AsyncExportSink, ExportSink
     from .models.forms import Form
     from .models.intervals import Interval
@@ -187,6 +188,21 @@ class DataExtractionWorkflowProtocol(Protocol):
         """Extract record revisions bounded by optional UTC dates and filters."""
         ...
 
+    def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any] | None = None,
+        *,
+        default_location_oid: str | None = None,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Extract record revisions mapped to CDISC ODM 1.3.2 AuditRecord models."""
+        ...
+
 
 class AsyncDataExtractionWorkflowProtocol(Protocol):
     """Structural contract for ``sdk.workflows.data_extraction``."""
@@ -214,6 +230,21 @@ class AsyncDataExtractionWorkflowProtocol(Protocol):
         **filters: Any,
     ) -> list[RecordRevision]:
         """Extract record revisions bounded by optional UTC dates and filters."""
+        ...
+
+    async def extract_odm_audit_records(
+        self,
+        study_key: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_filter: dict[str, Any] | None = None,
+        *,
+        default_location_oid: str | None = None,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **filters: Any,
+    ) -> list[OdmAuditRecord]:
+        """Asynchronously extract record revisions mapped to CDISC ODM 1.3.2 AuditRecord models."""
         ...
 
 
@@ -383,6 +414,20 @@ class QueryManagementWorkflowProtocol(Protocol):
         """Synchronize clinical queries for a study into a local triage queue."""
         ...
 
+    def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Extract study queries mapped to CDISC ODM 1.3.2 Annotation models."""
+        ...
+
 
 class AsyncQueryManagementWorkflowProtocol(Protocol):
     """Asynchronous contract for ``sdk.workflows.query_management`` on ``AsyncImednetSDK``."""
@@ -441,6 +486,20 @@ class AsyncQueryManagementWorkflowProtocol(Protocol):
         **kwargs: Any,
     ) -> list[TriageItem]:
         """Asynchronously synchronize clinical queries into a local triage queue."""
+        ...
+
+    async def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Asynchronously extract study queries mapped to CDISC ODM 1.3.2 Annotation models."""
         ...
 
 
@@ -537,6 +596,46 @@ class RecordMapperProtocol(Protocol):
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
         ...
 
+    def to_dataset_json(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        ...
+
+    def sdtm_dataset_json(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Emit a CDISC Dataset-JSON v1.1 envelope for a specific SDTM domain."""
+        ...
+
 
 class AsyncRecordMapperProtocol(Protocol):
     """Structural contract for ``sdk.workflows.record_mapper``."""
@@ -629,6 +728,46 @@ class AsyncRecordMapperProtocol(Protocol):
         include_deleted: bool | None = None,
     ) -> AsyncIterator[pd.DataFrame]:
         """Yield chunked DataFrames mapped to a CDISC SDTM domain."""
+        ...
+
+    async def to_dataset_json(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | AsyncIterable[Any] | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        ...
+
+    async def sdtm_dataset_json(
+        self,
+        study_key: str,
+        domain: str,
+        visit_key: str | None = None,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+    ) -> DatasetJsonEnvelope:
+        """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for a specific SDTM domain."""
         ...
 
 

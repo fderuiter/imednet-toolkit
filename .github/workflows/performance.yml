@@ -44,9 +44,9 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            uv-venv-${{ runner.os }}-3.11-
+            uv-venv-${{ runner.os }}-py3.11-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
@@ -65,7 +65,7 @@ jobs:
           path: |
             ~/.cache/uv
             .venv
-          key: uv-venv-${{ runner.os }}-3.11-${{ hashFiles('uv.lock') }}
+          key: uv-venv-${{ runner.os }}-py3.11-${{ hashFiles('uv.lock') }}
 
       - name: Run Performance Suite
         env:

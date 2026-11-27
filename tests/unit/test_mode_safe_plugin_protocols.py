@@ -639,3 +639,48 @@ def test_sink_config_factories_expose_max_buffered_records() -> None:
         assert sf_cfg.max_buffered_records == 2500
     finally:
         sync_sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_async_workflows_and_async_export_support_cdisc_odm_and_dataset_json(
+    tmp_path: Path,
+) -> None:
+    from imednet.datadict import load_dataset_json, load_odm_archive
+    from imednet.integrations import async_export
+    from imednet_workflows import QueryManagementWorkflow
+
+    async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
+        sync_de = DataExtractionWorkflow(async_sdk)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="extract_odm_audit_records"):
+            sync_de.extract_odm_audit_records("STUDY")
+
+        sync_qm = QueryManagementWorkflow(async_sdk)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="extract_odm_annotations"):
+            sync_qm.extract_odm_annotations("STUDY")
+
+        audit_records = await async_sdk.workflows.data_extraction.extract_odm_audit_records("STUDY")
+        assert isinstance(audit_records, list)
+
+        annotations = await async_sdk.workflows.query_management.extract_odm_annotations("STUDY")
+        open_annotations = await async_sdk.workflows.query_management.extract_odm_annotations(
+            "STUDY", open_only=True
+        )
+        assert isinstance(annotations, list)
+        assert isinstance(open_annotations, list)
+
+        cdash_env = await async_sdk.workflows.record_mapper.to_dataset_json("STUDY")
+        assert cdash_env.dataset_json_version == "1.1.0"
+        assert cdash_env.clinical_data is not None
+
+        sdtm_env = await async_sdk.workflows.record_mapper.sdtm_dataset_json("STUDY", "DM")
+        assert sdtm_env.dataset_json_version == "1.1.0"
+
+        odm_path = tmp_path / "study.odm.xml"
+        dsj_path = tmp_path / "study.dataset.json"
+        await async_export("odm", async_sdk, "STUDY", path=odm_path)
+        await async_export("dataset-json", async_sdk, "STUDY", path=dsj_path)
+
+        archive = load_odm_archive(odm_path)
+        assert archive.data_dictionary.metadata.studyKey == "STUDY"
+        loaded_dsj = load_dataset_json(dsj_path)
+        assert loaded_dsj.dataset_json_version == "1.1.0"

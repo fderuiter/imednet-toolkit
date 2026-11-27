@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from imednet.spi.cdisc import OdmAnnotation, map_queries_to_annotations
 from imednet.spi.models import (
     Query,
     QueryStatus,
@@ -23,6 +24,7 @@ from imednet.spi.utils import (
     maybe_to_thread,
     normalize_iso_date,
     parse_iso_datetime,
+    resolve_enrichment_pipeline,
     run_sync_over_async,
 )
 
@@ -252,6 +254,37 @@ class _QueryManagementBase:
             target_store.upsert_item(triage_item)
         return target_store.get_queue(study_key)
 
+    @staticmethod
+    def _queries_to_odm_annotations(
+        study_key: str,
+        queries: Iterable[Query],
+        *,
+        mask_phi: bool,
+        phi_keys: Collection[str] | None,
+    ) -> list[OdmAnnotation]:
+        """Map fetched study Query records to deterministically ordered ODM 1.3.2 annotations."""
+        resolved_phi: set[str] = set(phi_keys) if phi_keys is not None else set()
+        if mask_phi:
+            pipeline = resolve_enrichment_pipeline(study_key)
+            if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                resolved_phi.update(pipeline.phi_keys)
+
+        by_rec_var, by_rec, by_subj, unattached = map_queries_to_annotations(
+            queries,
+            mask_phi=mask_phi,
+            custom_phi_keys=resolved_phi or None,
+        )
+        ordered: list[OdmAnnotation] = []
+        for _key, anns in sorted(by_rec_var.items()):
+            ordered.extend(anns)
+        for _rid, anns in sorted(by_rec.items()):
+            ordered.extend(anns)
+        for _sk, anns in sorted(by_subj.items()):
+            ordered.extend(anns)
+        ordered.extend(unattached)
+        ordered.sort(key=lambda ann: ann.seq_num)
+        return ordered
+
 
 class AsyncQueryManagementWorkflow(_QueryManagementBase):
     """Canonical asynchronous workflow for clinical discrepancy management."""
@@ -376,6 +409,39 @@ class AsyncQueryManagementWorkflow(_QueryManagementBase):
             queries,
             store,
             default_severity=default_severity,
+        )
+
+    async def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Asynchronously extract study Query histories mapped to ODM 1.3.2 ``<Annotation>`` models."""
+        if open_only:
+            queries = await self.get_open_queries(
+                study_key,
+                additional_filter=additional_filter,
+                include_answered=include_answered,
+                **kwargs,
+            )
+        else:
+            filters = dict(additional_filter) if additional_filter else {}
+            queries = list(
+                await call_async_facade_method(
+                    self._sdk, "get_queries", study_key, **filters, **kwargs
+                )
+            )
+        return self._queries_to_odm_annotations(
+            study_key,
+            queries,
+            mask_phi=mask_phi,
+            phi_keys=phi_keys,
         )
 
 
@@ -528,6 +594,49 @@ class QueryManagementWorkflow(_QueryManagementBase):
                 additional_filter=additional_filter,
                 unresolved_only=unresolved_only,
                 default_severity=default_severity,
+                **kwargs,
+            )
+        )
+
+    def extract_odm_annotations(
+        self,
+        study_key: str,
+        additional_filter: dict[str, Any | tuple[str, Any] | list[Any]] | None = None,
+        *,
+        open_only: bool = False,
+        include_answered: bool = False,
+        mask_phi: bool = True,
+        phi_keys: Collection[str] | None = None,
+        **kwargs: Any,
+    ) -> list[OdmAnnotation]:
+        """Extract study Query and QueryComment histories mapped to ODM 1.3.2 ``<Annotation>`` models."""
+        ensure_sync_workflow_mode(
+            is_async_facade(self._sdk),
+            "QueryManagementWorkflow",
+            "extract_odm_annotations",
+            "extract_odm_annotations",
+        )
+        if open_only and "get_open_queries" in vars(self):
+            queries = self.get_open_queries(
+                study_key,
+                additional_filter=additional_filter,
+                include_answered=include_answered,
+                **kwargs,
+            )
+            return self._queries_to_odm_annotations(
+                study_key,
+                queries,
+                mask_phi=mask_phi,
+                phi_keys=phi_keys,
+            )
+        return run_sync_over_async(
+            lambda: self._async_core.extract_odm_annotations(
+                study_key,
+                additional_filter=additional_filter,
+                open_only=open_only,
+                include_answered=include_answered,
+                mask_phi=mask_phi,
+                phi_keys=phi_keys,
                 **kwargs,
             )
         )

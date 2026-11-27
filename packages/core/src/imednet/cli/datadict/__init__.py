@@ -8,12 +8,14 @@ import sys
 from pathlib import Path
 
 from ...datadict import (
+    OdmArchive,
     diff,
     get_schema,
     load_from_api,
     load_from_cdisc_odm,
     load_from_csv,
     load_from_redcap,
+    load_odm_archive,
     to_file,
     to_json,
     to_odm_file,
@@ -41,17 +43,22 @@ def _handle_to_odm(args: argparse.Namespace) -> None:
     """Handle `imednet datadict to-odm` command."""
     try:
         input_text = Path(args.file).read_text(encoding="utf-8")
-        dd = DataDictionary.model_validate_json(input_text)
+        raw_payload = json.loads(input_text)
+        source_obj: DataDictionary | OdmArchive
+        if isinstance(raw_payload, dict) and "dataDictionary" in raw_payload:
+            source_obj = OdmArchive.model_validate(raw_payload)
+        else:
+            source_obj = DataDictionary.model_validate(raw_payload)
     except Exception as exc:
         print_error(redact_cli_secrets(f"Error reading data dictionary from '{args.file}': {exc}"))
         sys.exit(1)
 
     try:
         if args.output:
-            to_odm_file(dd, args.output, file_oid=getattr(args, "file_oid", None))
+            to_odm_file(source_obj, args.output, file_oid=getattr(args, "file_oid", None))
             print(f"Successfully wrote CDISC ODM XML to '{args.output}'", file=sys.stderr)
         else:
-            print(to_odm_xml(dd, file_oid=getattr(args, "file_oid", None)), end="")
+            print(to_odm_xml(source_obj, file_oid=getattr(args, "file_oid", None)), end="")
     except OSError as exc:
         print_error(redact_cli_secrets(f"Error writing CDISC ODM XML to '{args.output}': {exc}"))
         sys.exit(1)
@@ -87,6 +94,41 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
 
 def _handle_from_odm(args: argparse.Namespace) -> None:
     """Handle `imednet datadict from-odm` command."""
+    if getattr(args, "archive", False):
+        try:
+            archive = load_odm_archive(
+                args.path,
+                study_key=getattr(args, "study_key", None),
+                strict=args.strict,
+                no_raw_xml=args.no_raw_xml,
+            )
+        except Exception as exc:
+            print_error(redact_cli_secrets(f"Error loading from CDISC ODM: {exc}"))
+            sys.exit(1)
+
+        archive_json = (
+            json.dumps(
+                archive.model_dump(mode="json", by_alias=True, exclude_none=True),
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        if args.output:
+            try:
+                out_path = Path(args.output)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(archive_json, encoding="utf-8")
+                print(f"Successfully wrote ODM archive JSON to '{args.output}'", file=sys.stderr)
+            except OSError as exc:
+                print_error(
+                    redact_cli_secrets(f"Error writing ODM archive to '{args.output}': {exc}")
+                )
+                sys.exit(1)
+        else:
+            print(archive_json, end="")
+        return
+
     try:
         dd = load_from_cdisc_odm(
             args.path,
@@ -325,6 +367,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--no-raw-xml",
         action="store_true",
         help="Omit verbatim XML strings from business logic rules.",
+    )
+    odm_parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="Parse full ODM 1.3.2 archive including AdminData, ReferenceData, and ClinicalData.",
     )
     odm_parser.set_defaults(func=_handle_from_odm)
 

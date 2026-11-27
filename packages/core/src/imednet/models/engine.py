@@ -872,7 +872,7 @@ def get_contract() -> APIContract:
                 with importlib.resources.as_file(resource) as bundled_path:
                     builder.ingest_postman(str(bundled_path))
             else:
-                # Local dev checkout fallback
+                # Local dev checkout fallback (editable src/ layout and workspace .venv wheel layout)
                 local_dev_candidates = _iter_local_postman_candidates(__file__)
                 local_dev_path = next(
                     (candidate for candidate in local_dev_candidates if os.path.exists(candidate)),

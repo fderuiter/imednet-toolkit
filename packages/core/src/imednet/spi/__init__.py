@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from imednet.integrations import async_export, export
 
     from . import (
+        cdisc,
         cli,
         constants,
         endpoints,
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     )
 
 _LAZY_SUBMODULES: dict[str, str] = {
+    "cdisc": "imednet.spi.cdisc",
     "cli": "imednet.spi.cli",
     "constants": "imednet.spi.constants",
     "endpoints": "imednet.spi.endpoints",
@@ -70,6 +72,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "async_export",
+    "cdisc",
     "cli",
     "constants",
     "endpoints",

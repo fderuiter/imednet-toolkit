@@ -33,10 +33,10 @@ def test_workspace_rejects_python_without_patched_selector_support() -> None:
 @pytest.mark.parametrize(
     ("name", "affected", "patched", "later_patch"),
     [
-        ("apache-airflow-providers-smtp", ("3.0.1",), "3.2.2", "3.2.3"),
         ("soupsieve", ("2.9.2", "2.10", "3.0.4", "4.0.1", "4.1"), "4.1.1", "4.1.2"),
         ("mako", ("1.3.12", "1.4.1"), "1.4.2", "1.4.3"),
         ("opentelemetry-api", ("1.37.0", "1.43.0", "1.45.1"), "1.45.2", "1.45.3"),
+        ("apache-airflow-providers-smtp", ("2.0.0", "3.0.1", "3.2.1"), "3.2.2", "3.2.3"),
     ],
 )
 def test_workspace_resolution_excludes_reported_vulnerabilities(

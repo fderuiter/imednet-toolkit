@@ -362,6 +362,27 @@ def _validate_semantics(dd: DataDictionary) -> list[str]:
     return errors
 
 
+def _parse_json_validation_source(source: str | Path) -> tuple[Any, str | None]:
+    """Load JSON from a file path or JSON string, returning ``(data, error_message)``."""
+    path_obj = Path(source)
+    if _is_file_target(source):
+        if not _safe_is_file(path_obj):
+            return None, f"FileNotFoundError: Target file '{source}' does not exist"
+        try:
+            return json.loads(path_obj.read_text(encoding="utf-8")), None
+        except Exception as exc:
+            return None, f"Failed to read JSON file '{source}': {exc}"
+    if _safe_is_file(path_obj):
+        try:
+            return json.loads(path_obj.read_text(encoding="utf-8")), None
+        except Exception as exc:
+            return None, f"Failed to read JSON file '{source}': {exc}"
+    try:
+        return json.loads(str(source)), None
+    except Exception as exc:
+        return None, f"Failed to parse JSON string: {exc}"
+
+
 def validate(
     target: dict[str, Any] | str | Path | DataDictionary,
     schema: dict[str, Any] | None = None,
@@ -382,24 +403,9 @@ def validate(
     if isinstance(target, DataDictionary):
         data = target.model_dump(mode="json")
     elif isinstance(target, str | Path):
-        p = Path(target)
-        if _is_file_target(target):
-            if not _safe_is_file(p):
-                return [f"FileNotFoundError: Target file '{target}' does not exist"]
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except Exception as exc:
-                return [f"Failed to read JSON file '{target}': {exc}"]
-        elif _safe_is_file(p):
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except Exception as exc:
-                return [f"Failed to read JSON file '{target}': {exc}"]
-        else:
-            try:
-                data = json.loads(str(target))
-            except Exception as exc:
-                return [f"Failed to parse JSON string: {exc}"]
+        data, load_err = _parse_json_validation_source(target)
+        if load_err is not None:
+            return [load_err]
     elif isinstance(target, dict):
         data = target
     else:

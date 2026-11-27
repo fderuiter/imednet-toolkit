@@ -20,6 +20,7 @@ env:
 
 jobs:
   release-please:
+    name: Release Please
     runs-on: ubuntu-latest
     # Keep default GITHUB_TOKEN read-only; all write operations use the
     # short-lived GitHub App installation token minted below so Release PR

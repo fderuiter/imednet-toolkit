@@ -55,7 +55,7 @@ Environment Variables
      - Enable the opt-in local CDASH/SDTM naming-prefix heuristic on ``MappingRule`` and ``StudyConfiguration``.
      - ``false``
    * - IMEDNET_CONFIG_ENCRYPTION_KEY
-     - Primary Fernet key or passphrase override used by ``ConfigVersionStore`` to encrypt and decrypt ``StudyConfiguration`` payloads at rest (checked before ``IMEDNET_ENCRYPTION_KEY`` and ``IMEDNET_SECURITY_KEY``).
+     - Optional dedicated Fernet key or passphrase used by ``ConfigVersionStore`` to encrypt and decrypt ``StudyConfiguration`` payloads at rest (takes precedence over ``IMEDNET_ENCRYPTION_KEY`` and ``IMEDNET_SECURITY_KEY``).
      - None
    * - IMEDNET_ENCRYPTION_KEY
      - Fernet key or passphrase used by ``ConfigVersionStore`` to encrypt and decrypt ``StudyConfiguration`` payloads at rest (falls back to ``IMEDNET_SECURITY_KEY``).

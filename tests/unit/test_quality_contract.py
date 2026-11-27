@@ -761,42 +761,104 @@ def test_verification_docs_and_skills_specify_workspace_quality_all() -> None:
         )
 
 
-def test_all_github_workflows_enforce_sha_pins_permissions_concurrency_and_safe_shell() -> None:
+def test_all_workflows_enforce_sha_pinning_least_privilege_concurrency_and_safe_caching() -> None:
     sha_action_re = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}$")
-    workflows_dir = ROOT / ".github" / "workflows"
-    workflow_files = sorted([*workflows_dir.glob("*.yml"), *workflows_dir.glob("*.yaml")])
-    assert len(workflow_files) >= 7
+    workflow_paths = sorted((ROOT / ".github/workflows").glob("*.yml"))
+    assert len(workflow_paths) >= 7
 
-    for wf_path in workflow_files:
-        raw_text = wf_path.read_text(encoding="utf-8")
-        wf = yaml.safe_load(raw_text)
-        assert "concurrency" in wf, f"{wf_path.name} missing top-level concurrency control"
-        assert "permissions" in wf, f"{wf_path.name} missing top-level permissions block"
-        if wf_path.name != "live-tests.yml":
-            assert wf["permissions"] == {}, f"{wf_path.name} top-level permissions should be {{}}"
+    for wf_path in workflow_paths:
+        wf_name = wf_path.name
+        wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
+
+        assert "concurrency" in wf, f"{wf_name} missing workflow concurrency"
+        assert "group" in wf["concurrency"], f"{wf_name} missing concurrency.group"
+        cancel_cfg = wf["concurrency"].get("cancel-in-progress")
+        assert isinstance(cancel_cfg, bool) or (
+            cancel_cfg == "${{ github.event_name == 'pull_request' }}"
+        ), f"{wf_name} invalid concurrency.cancel-in-progress: {cancel_cfg!r}"
+
+        assert "permissions" in wf, f"{wf_name} missing top-level permissions"
+        expected_top_perms = {"contents": "read"} if wf_name == "live-tests.yml" else {}
+        assert wf["permissions"] == expected_top_perms, (
+            f"{wf_name} unexpected top-level permissions: {wf['permissions']}"
+        )
+
+        triggers = wf.get("on") or wf.get(True) or {}
 
         for job_id, job in wf["jobs"].items():
-            assert "permissions" in job, f"{wf_path.name}:{job_id} missing job permissions"
-            if wf_path.name == "main.yml" and job_id == "scorecard":
+            ctx = f"{wf_name}:{job_id}"
+            assert isinstance(job.get("name"), str) and job["name"].strip(), (
+                f"{ctx} missing explicit job name"
+            )
+            assert isinstance(job.get("permissions"), dict), f"{ctx} missing job permissions"
+            if wf_name == "main.yml" and job_id == "scorecard":
                 assert job.get("if") == "github.event_name != 'pull_request'"
 
-            for step in job.get("steps", []):
-                uses = step.get("uses")
-                if uses is not None:
-                    assert sha_action_re.match(str(uses)), (
-                        f"{wf_path.name}:{job_id} unpinned action: {uses}"
+            steps = job.get("steps", [])
+            for step in steps:
+                step_label = f"{ctx}:{step.get('name', step.get('uses', 'unnamed'))}"
+                if "uses" in step:
+                    uses = str(step["uses"])
+                    assert sha_action_re.match(uses), f"{step_label} not SHA-pinned: {uses}"
+                    assert not uses.startswith("actions/cache@"), (
+                        f"{step_label} uses combined actions/cache instead of explicit restore/save"
                     )
-                    assert not str(uses).startswith("actions/cache@"), (
-                        f"{wf_path.name}:{job_id} must use actions/cache/restore + main-gated save"
+                    if uses.startswith("actions/checkout@"):
+                        assert step.get("with", {}).get("persist-credentials") is False, (
+                            f"{step_label} must set persist-credentials: false"
+                        )
+                    if uses.startswith("actions/cache/restore@") and ".venv" in str(
+                        step.get("with", {}).get("path", "")
+                    ):
+                        key = str(step["with"]["key"])
+                        assert '"' not in key, f"{step_label} cache key contains quotes: {key}"
+                        assert key.startswith("uv-venv-${{ runner.os }}-py"), (
+                            f"{step_label} unexpected venv cache key prefix: {key}"
+                        )
+                        assert key.endswith("-${{ hashFiles('uv.lock') }}"), (
+                            f"{step_label} unexpected venv cache key suffix: {key}"
+                        )
+                    if uses.startswith("actions/cache/save@"):
+                        cond = str(step.get("if", ""))
+                        if wf_name == "fuzzing-deep.yml":
+                            assert "pull_request" not in triggers, (
+                                f"{step_label} workflow must not run on pull_request"
+                            )
+                        else:
+                            assert (
+                                "github.event_name == 'push'" in cond
+                                and "github.ref == 'refs/heads/main'" in cond
+                            ), f"{step_label} must restrict cache saves to push on refs/heads/main"
+
+                if "run" in step:
+                    script = str(step["run"])
+                    assert "${{" not in script, (
+                        f"{step_label} contains unsafe template interpolation in run script"
                     )
-                run_script = step.get("run")
-                if run_script is not None:
-                    assert "${{" not in str(run_script), (
-                        f"{wf_path.name}:{job_id} has direct expression interpolation in run block"
+                    assert not re.search(r"(?<!uv )pip install", script), (
+                        f"{step_label} uses unpinned pip install instead of uv/uvx"
                     )
-                    assert "pip install " not in str(run_script) or "uv pip install" in str(
-                        run_script
-                    ), f"{wf_path.name}:{job_id} uses unpinned pip install in run block"
-                    assert ">> $GITHUB_PATH" not in str(run_script), (
-                        f"{wf_path.name}:{job_id} has unquoted $GITHUB_PATH redirection"
-                    )
+                    if "GITHUB_PATH" in script:
+                        assert '"$GITHUB_PATH"' in script, f"{step_label} must quote $GITHUB_PATH"
+
+    main_wf = yaml.safe_load((ROOT / ".github/workflows/main.yml").read_text(encoding="utf-8"))
+    test_step_names = [s.get("name", "") for s in main_wf["jobs"]["test"]["steps"]]
+    assert test_step_names.index("Save Python 3.13 Workspace Dependencies") < test_step_names.index(
+        "Install Built Wheels"
+    )
+
+    docs_runs = "\n".join(s.get("run", "") for s in main_wf["jobs"]["docs"]["steps"] if "run" in s)
+    assert docs_runs.count('"playwright==') >= 2
+    assert "--with playwright " not in docs_runs
+
+    quality_runs = "\n".join(
+        s.get("run", "") for s in main_wf["jobs"]["quality"]["steps"] if "run" in s
+    )
+    for pinned_tool in (
+        '"pip-audit==',
+        '"detect-secrets==',
+        '"semgrep==',
+        '"vulture==',
+        '"pylint==',
+    ):
+        assert pinned_tool in quality_runs, f"Missing pinned {pinned_tool} in quality job"
