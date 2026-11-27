@@ -121,9 +121,19 @@ class Client(HTTPClientBase[httpx.Client, SyncRequestExecutor]):
                 infos = socket.getaddrinfo(host_to_resolve, port, type=socket.SOCK_STREAM)
                 _validate_addrinfo_results(infos, host_to_resolve)
             req_kwargs = self._prepare_external_kwargs(validated_url, kwargs)
-            response = self._external_executor("GET", validated_url, **req_kwargs)
+            origin, breaker, existed = self._acquire_external_origin_breaker(validated_url)
+            try:
+                response = self._external_executor.execute_with_breaker(
+                    breaker, "GET", validated_url, **req_kwargs
+                )
+            except Exception:
+                if not existed:
+                    self._store_external_origin_breaker(origin, breaker)
+                raise
             next_url = self._resolve_external_redirect(validated_url, response, hop)
             if next_url is None:
+                if not existed:
+                    self._store_external_origin_breaker(origin, breaker)
                 return response
             current_url = next_url
         raise ExternalUrlError("Maximum redirects exceeded for external URL")

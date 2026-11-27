@@ -6,7 +6,9 @@ import ipaddress
 import logging
 import re
 import socket
+import threading
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Generator, Mapping, Sequence
 from typing import Any, Generic, TypeVar, cast
 from urllib.parse import urlsplit
@@ -24,7 +26,7 @@ from imednet.constants import (
     HEADER_SECURITY_KEY,
 )
 from imednet.core.http.executor import BaseRequestExecutor
-from imednet.core.operations.circuit_breaker import CircuitBreaker
+from imednet.core.operations.circuit_breaker import CircuitBreaker, CircuitState
 from imednet.errors.client import ClientError
 
 from .base_client import BaseClient, Tracer  # type: ignore[attr-defined]
@@ -53,6 +55,7 @@ _BLOCKED_EXTERNAL_HOSTS: frozenset[str] = frozenset(
 )
 _OBFUSCATED_IP_LABEL_RE = re.compile(r"^(?:0x[0-9a-f]+|\d+)$", re.IGNORECASE)
 _MAX_EXTERNAL_REDIRECTS = 5
+_MAX_EXTERNAL_CIRCUIT_BREAKERS = 128
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 
 
@@ -177,7 +180,9 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
     _executor: ExecutorT
     _circuit_breaker: CircuitBreaker
     _external_executor: ExecutorT
-    _external_circuit_breaker: CircuitBreaker
+    _external_breakers_lock: threading.RLock
+    _max_external_circuit_breakers: int
+    _external_circuit_breakers: OrderedDict[tuple[str, str, int | None], CircuitBreaker]
 
     @abstractmethod
     def _get_client_class(self) -> type[ClientT]:
@@ -227,9 +232,63 @@ class HTTPClientBase(BaseClient, ABC, Generic[ClientT, ExecutorT]):
         self._executor = self._create_executor(self._client, self.retry_config)
         self._executor.circuit_breaker = self._circuit_breaker
 
-        self._external_circuit_breaker = CircuitBreaker()
+        self._external_breakers_lock = threading.RLock()
+        self._max_external_circuit_breakers = _MAX_EXTERNAL_CIRCUIT_BREAKERS
+        self._external_circuit_breakers = OrderedDict()
         self._external_executor = self._create_executor(self._client, self.retry_config)
-        self._external_executor.circuit_breaker = self._external_circuit_breaker
+
+    def _evict_excess_external_breakers(self) -> None:
+        """Bound external origin circuit breakers using LRU eviction under lock."""
+        max_entries = max(1, self._max_external_circuit_breakers)
+        while len(self._external_circuit_breakers) > max_entries:
+            self._external_circuit_breakers.popitem(last=False)
+
+    def _acquire_external_origin_breaker(
+        self, url: httpx.URL | str
+    ) -> tuple[tuple[str, str, int | None], CircuitBreaker, bool]:
+        """Return ``(origin, breaker, existed)`` without caching untrusted redirect hops yet."""
+        origin = _url_origin(url)
+        with self._external_breakers_lock:
+            existing = self._external_circuit_breakers.get(origin)
+            if existing is not None:
+                self._external_circuit_breakers.move_to_end(origin)
+                return origin, existing, True
+        return origin, CircuitBreaker(), False
+
+    def _store_external_origin_breaker(
+        self,
+        origin: tuple[str, str, int | None],
+        breaker: CircuitBreaker,
+    ) -> CircuitBreaker:
+        """Persist a terminal hop's origin circuit breaker in the LRU-bounded map."""
+        with self._external_breakers_lock:
+            existing = self._external_circuit_breakers.get(origin)
+            if existing is not None:
+                self._external_circuit_breakers.move_to_end(origin)
+                if existing is not breaker:
+                    if breaker.state == CircuitState.OPEN:
+                        while existing.state == CircuitState.CLOSED:
+                            existing.record_failure()
+                    elif breaker.consecutive_failures > 0:
+                        for _ in range(breaker.consecutive_failures):
+                            existing.record_failure()
+                return existing
+            self._external_circuit_breakers[origin] = breaker
+            self._evict_excess_external_breakers()
+            return breaker
+
+    def _get_external_circuit_breaker(self, url: httpx.URL | str) -> CircuitBreaker:
+        """Return or create the LRU-tracked ``CircuitBreaker`` scoped to *url*'s origin."""
+        origin = _url_origin(url)
+        with self._external_breakers_lock:
+            existing = self._external_circuit_breakers.get(origin)
+            if existing is not None:
+                self._external_circuit_breakers.move_to_end(origin)
+                return existing
+            breaker = CircuitBreaker()
+            self._external_circuit_breakers[origin] = breaker
+            self._evict_excess_external_breakers()
+            return breaker
 
     def _create_client(self, auth: AuthStrategy) -> ClientT:
         """Create the underlying httpx client with origin-scoped authentication."""

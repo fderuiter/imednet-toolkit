@@ -30,9 +30,9 @@ Retry policy
 * Idempotent methods (``GET``, ``PUT``, ``DELETE``, ``HEAD``, ``OPTIONS``) retry on:
 
   * ``httpx.RequestError`` network failures
-  * HTTP ``5xx`` responses
+  * HTTP ``408`` and ``5xx`` responses
 * All methods (including ``POST``/``PATCH``) retry on HTTP ``429`` rate limits.
-* Non-idempotent methods do not retry on network errors or ``5xx`` responses.
+* Non-idempotent methods do not retry on network errors, ``408``, or ``5xx`` responses.
 * Maximum attempts and backoff are configured via ``retry_config``
   (:class:`~imednet.core.retry.RetryConfig`) on
   :class:`~imednet.core.client.Client` and
@@ -62,19 +62,22 @@ Circuit breaker and probe leases
 * ``HTTPClientBase`` initializes a dedicated ``CircuitBreaker`` per client instance
   (``failure_threshold=5``, ``recovery_timeout=10.0`` seconds,
   ``half_open_max_probes=1``), isolating ``CircuitState`` across independent
-  ``Study`` clients.
-* ``CircuitState`` progresses through ``CLOSED``, ``OPEN``, and ``HALF_OPEN``:
-  five consecutive ``httpx.RequestError`` or HTTP ``5xx`` outcomes via
-  ``record_failure()`` open the breaker, causing new requests to fail immediately with
-  :class:`imednet.errors.CircuitBreakerError` (subclassing
-  :class:`imednet.errors.ImednetError` directly with ``attempt_count=0`` on
-  :class:`imednet.errors.DiagnosticContext`).
-* After ``recovery_timeout`` elapses, the next request transitions the breaker to
+  ``Study`` clients, alongside an LRU-bounded origin-keyed ``CircuitBreaker`` map
+  for terminal external redirect hops.
+* Each execution attempt acquires its own ``ProbeLease``. ``CircuitState`` progresses
+  through ``CLOSED``, ``OPEN``, and ``HALF_OPEN``: five consecutive
+  ``httpx.RequestError``, HTTP ``408``, or HTTP ``5xx`` outcomes via
+  ``record_failure()`` open the breaker, aborting pending retries and causing new
+  requests to fail immediately with :class:`imednet.errors.CircuitBreakerError`
+  (subclassing :class:`imednet.errors.ImednetError` directly with ``attempt_count=0``
+  on :class:`imednet.errors.DiagnosticContext`).
+* After ``recovery_timeout`` elapses, the next attempt transitions the breaker to
   ``HALF_OPEN`` and acquires a ``ProbeLease`` (enforcing ``half_open_max_probes=1``).
-  A ``2xx`` response calls ``record_success()`` and returns the breaker to ``CLOSED``;
-  a ``5xx`` or network error re-opens it; and early exits (task cancellation or
-  non-429 ``4xx`` responses) invoke ``ProbeLease.release_if_unsettled()`` so in-flight
-  probe capacity is never leaked.
+  Only an HTTP ``2xx`` response calls ``record_success()`` (returning the breaker to
+  ``CLOSED`` and advancing its monotonic epoch); HTTP ``408``, ``5xx``, or network
+  errors re-open it; and early exits (task cancellation, ``3xx`` redirects, or other
+  non-429 ``4xx`` responses) leave the lease unsettled for ``ProbeLease.release()`` so
+  in-flight probe capacity is never leaked and ``HALF_OPEN`` is not prematurely closed.
 * HTTP ``429`` responses invoke ``record_rate_limit()`` rather than
   ``record_failure()``: in ``CLOSED`` state they leave the consecutive failure counter
   untouched so rate-limited ``Subject``, ``Site``, ``Form``, ``Record``, ``Visit``,

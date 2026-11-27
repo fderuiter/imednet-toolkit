@@ -52,9 +52,9 @@ versioned JSON envelopes, or PHI-masked CSV/JSON file exports using
    # Filter server-side by Record ID and dual dateCreated bounds
    imednet record-revisions list STUDY -f "recordId==601" -f "dateCreated>=2026-01-01" -f "dateCreated<=2026-01-31" --sort "recordRevision,asc"
 
-   # Extract a verified audit slice or ingest revisions into DuckDB via workflows CLI
+   # Extract a verified audit slice or ingest revisions into ./audit_lakehouse.duckdb via workflows CLI
    imednet workflows extract-audit-trail STUDY --start-date 2026-01-01 --end-date 2026-01-31 --validate-chain -o ./audit_trail.json
-   imednet workflows ingest-revisions STUDY --db-path ./audit_lakehouse.duckdb --mode replace --validate-chain
+   imednet workflows ingest-revisions STUDY --mode replace --validate-chain
 
 ``RecordRevisionsEndpoint.FILTER_ATTRIBUTES`` supports server-side filtering on
 all 18 revision-level attributes (``recordRevisionId``, ``recordId``,
@@ -230,7 +230,16 @@ across the toolkit:
    temporal view exposing ``valid_from``, ``valid_to``, ``is_current``, and
    ``LAG()`` transition diff columns ``prev_record_status``,
    ``prev_data_revision``, ``prev_deleted``, ``data_changed``, and
-   ``change_type``) via ``DuckDBIngestionWorkflow.build_silver_view``.
+   ``change_type``—emitting ``'created'`` for initial ``record_revision == 1``
+   or unnumbered revisions and ``'window_baseline'`` with
+   ``data_changed IS NULL`` when a date-bounded slice starts at
+   ``record_revision > 1``) via ``DuckDBIngestionWorkflow.build_silver_view``.
+   On the CLI, ``imednet workflows ingest-revisions`` persists to
+   ``./audit_lakehouse.duckdb`` by default, rejects ``--db-path :memory:``
+   without ``-o``/``--output``, validates merged ``bronze_revisions`` chains in
+   a single fetch when ``--validate-chain`` is passed, and omits voided
+   ``deleted=True`` rows from ``-o`` file exports unless ``--include-deleted``
+   is specified.
 2. **PHI Masking & Redaction** (:doc:`export_destinations`): All sink plugins,
    CLI revision exports, and ``DuckDBIngestionWorkflow`` default to
    ``mask_phi=True`` and honor global ``SensitivityRegistry`` rules plus

@@ -7,7 +7,7 @@ import re
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, model_validator
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.engine import ModelEngine
@@ -196,18 +196,21 @@ QueryComment = ModelEngine.get_model('QueryComment', QueryComment)
 class Query(ImednetBaseModel):
     """Represents a data query (discrepancy) raised on a record."""
 
-    query_comments: list[QueryComment] = Field(default_factory=list, alias="queryComments")
+    query_comments: list[QueryComment] | None = Field(
+        default_factory=list[QueryComment], alias="queryComments"
+    )
     status: QueryStatus = Field(default=QueryStatus.OPEN, alias="status")
 
     @model_validator(mode="before")
     @classmethod
-    def _resolve_legacy_status(cls, data: Any) -> Any:
+    def _resolve_legacy_status(cls, data: Any, info: ValidationInfo) -> Any:
         """Resolve query status using explicit value or fallback legacy calculation."""
         if isinstance(data, dict):
             resolved = dict(data)
             status_val = resolved.get("status")
             if status_val is None:
-                comments = resolved.get("query_comments")
+                is_wire = isinstance(info.context, dict) and bool(info.context.get("wire"))
+                comments = None if is_wire else resolved.get("query_comments")
                 if comments is None:
                     comments = resolved.get("queryComments")
                 resolved["status"] = calculate_legacy_status(comments)

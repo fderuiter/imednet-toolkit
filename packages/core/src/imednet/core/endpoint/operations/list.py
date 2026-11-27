@@ -24,8 +24,17 @@ class _PaginatedIterator(Iterator[T]):
         self._iterator: Iterator[Any] | None = None
 
     @property
+    def cursor(self) -> int | None:
+        """Return the active iterator cursor, or ``None`` before start and after exhaustion."""
+        if self._iterator is not None and hasattr(self._iterator, "cursor"):
+            return self._iterator.cursor  # type: ignore[no-any-return]
+        return getattr(self._paginator, "cursor", None)
+
+    @property
     def has_more(self) -> bool:
-        """Return True if more items remain in the underlying paginator."""
+        """Return True if more items remain in the active iterator or underlying paginator."""
+        if self._iterator is not None and hasattr(self._iterator, "has_more"):
+            return bool(self._iterator.has_more)
         return bool(getattr(self._paginator, "has_more", False))
 
     def __iter__(self) -> _PaginatedIterator[T]:
@@ -46,8 +55,17 @@ class _AsyncPaginatedIterator(AsyncIterator[T]):
         self._iterator: AsyncIterator[Any] | None = None
 
     @property
+    def cursor(self) -> int | None:
+        """Return the active async iterator cursor, or ``None`` before start and after exhaustion."""
+        if self._iterator is not None and hasattr(self._iterator, "cursor"):
+            return self._iterator.cursor  # type: ignore[no-any-return]
+        return getattr(self._paginator, "cursor", None)
+
+    @property
     def has_more(self) -> bool:
-        """Return True if more items remain in the underlying async paginator."""
+        """Return True if more items remain in the active async iterator or underlying paginator."""
+        if self._iterator is not None and hasattr(self._iterator, "has_more"):
+            return bool(self._iterator.has_more)
         return bool(getattr(self._paginator, "has_more", False))
 
     def __aiter__(self) -> _AsyncPaginatedIterator[T]:
