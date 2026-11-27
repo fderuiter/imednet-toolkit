@@ -477,12 +477,12 @@ The ``imednet datadict`` command group exposes eight subcommands for Study metad
 .. code-block:: bash
 
    # 1. Compile canonical JSON from a 4-file CSV directory or ZIP archive
-   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-csv ./datadict_export.zip --study-key STUDY -o study_dd.json --strict --no-raw-xml
 
    # 2. Import CDISC ODM 1.3 XML into canonical Data Dictionary JSON
    imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
 
-   # 3. Export canonical Data Dictionary JSON to CDISC ODM 1.3 XML
+   # 3. Export a Data Dictionary (.json, .xml, REDCap .csv, .zip, or CSV directory) to CDISC ODM 1.3 XML
    imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
 
    # 4. Convert a REDCap CSV Data Dictionary into canonical JSON
@@ -494,9 +494,9 @@ The ``imednet datadict`` command group exposes eight subcommands for Study metad
    # 6. Export the canonical Draft 2020-12 JSON Schema
    imednet datadict schema -o data-dictionary.schema.json
 
-   # 7. Validate a Data Dictionary JSON file against model and JSON Schema rules
+   # 7. Validate a Data Dictionary (.json, .xml, REDCap .csv, .zip, or CSV directory) against model and JSON Schema rules
    imednet datadict validate study_dd.json --schema data-dictionary.schema.json
-   imednet datadict validate study_dd.json --format json
+   imednet datadict validate ./datadict_export.zip --format json
 
-   # 8. Compare two Study Data Dictionary revisions in text, Markdown, or JSON format
+   # 8. Compare two Study Data Dictionary revisions (.json, .xml, REDCap .csv, .zip, or CSV directory) in text, Markdown, or JSON format
    imednet datadict diff baseline_dd.json study_dd.json --format md
