@@ -67,10 +67,12 @@ from .logic import (
     ExtractedRuleMetadata,
     LogicEvaluationReport,
     LogicTreeEvaluator,
+    RangeCheckConstraint,
     RuleEvaluationResult,
     VariableConstraints,
     extract_variable_constraints,
     parse_logic_xml,
+    validate_regex_pattern,
 )
 from .models import (
     BusinessLogicRule,
@@ -124,6 +126,7 @@ __all__ = [
     "OdmStudyEventData",
     "OdmSubjectData",
     "OdmUser",
+    "RangeCheckConstraint",
     "RuleEvaluationResult",
     "Variable",
     "VariableConstraints",
@@ -163,6 +166,7 @@ __all__ = [
     "validate",
     "validate_dataset_json",
     "validate_odm_xml",
+    "validate_regex_pattern",
     "validate_timestamp",
     "write_odm_xml_stream",
 ]

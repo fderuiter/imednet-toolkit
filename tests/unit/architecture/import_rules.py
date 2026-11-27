@@ -32,6 +32,7 @@ PUBLIC_SYMBOLS = {
     "SyncWorkflowsNamespaceProtocol",
     "WorkflowsNamespaceProtocol",
     "BaseClient",
+    "DataFrameLike",
     "DefaultRetryPolicy",
     "FilterScalar",
     "FilterValue",

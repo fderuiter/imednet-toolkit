@@ -7,14 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import (
-    Field,
-    RootModel,
-    SerializerFunctionWrapHandler,
-    ValidatorFunctionWrapHandler,
-    field_validator,
-    model_serializer,
-)
+from pydantic import Field, RootModel, ValidatorFunctionWrapHandler, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -179,94 +172,237 @@ class RecordData(RootModel[dict[str, Any]]):
     """Arbitrary record data as a dictionary."""
 
 class BaseRecordRequest(ImednetBaseModel):
-    """Base class for record creation/update requests."""
+    """Base class for record creation and update requests.
 
-    form_key: str = Field("", alias="formKey")
-    data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
-
-    def __init__(
-        self, *, form_key: str = "", formKey: str = "", data: RecordData | dict[str, Any] = ...
-    ) -> None: ...
-
-class RegisterSubjectRequest(BaseRecordRequest):
-    """Payload for registering (enrolling) a new subject.
-
-    Requires ``formKey`` and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey`` and ``subjectOid`` attributes are omitted when
-    ``None`` so server-assigned subject keys continue working by default; when
-    explicitly supplied, they are preserved for enrollment and deduplication.
+    Declares all 14 optional iMednet REST API ``POST /records`` write attributes
+    with ``None`` defaults, forbids undeclared keys (``extra="forbid"``), and
+    serializes to camelCase keys omitting ``None`` and blank identifiers by default.
     """
 
-    site_name: str = Field(
-        "", alias="siteName", description="Name of the site where the subject is enrolled"
-    )
-    site_id: int | None = Field(
-        default=None,
-        alias="siteId",
-        description="Numeric ID of the site where the subject is enrolled",
-    )
-    subject_key: str | None = Field(
-        default=None, alias="subjectKey", description="Optional client-assigned subject key"
-    )
-    subject_oid: str | None = Field(
-        default=None, alias="subjectOid", description="Optional subject OID"
-    )
+    form_key: str | None = Field(default=None, alias="formKey")
+    form_id: int | None = Field(default=None, alias="formId")
+    site_name: str | None = Field(default=None, alias="siteName")
+    site_id: int | None = Field(default=None, alias="siteId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    interval_name: str | None = Field(default=None, alias="intervalName")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    visit_id: int | None = Field(default=None, alias="visitId")
+    record_id: int | None = Field(default=None, alias="recordId")
+    record_oid: str | None = Field(default=None, alias="recordOid")
+    record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
+    reason_for_change: str | None = Field(default=None, alias="reasonForChange")
+    data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
 
     def __init__(
         self,
         *,
-        form_key: str = "",
-        formKey: str = "",
-        data: RecordData | dict[str, Any] = ...,
-        site_name: str = "",
-        siteName: str = "",
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
         site_id: int | None = None,
         siteId: int | None = None,
         subject_key: str | None = None,
         subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
         subject_oid: str | None = None,
         subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
     ) -> None: ...
-    @field_validator("subject_key", "subject_oid", mode="before")
+    @field_validator("record_status", mode="wrap")
     @classmethod
-    def _normalize_optional_subject_identifier(cls, value: Any) -> str | None: ...
-    @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_enrollment_fields(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]: ...
+    def _validate_request_record_status(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> RecordStatus | str | None: ...
     def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
 
-class UpdateScheduledRecordRequest(BaseRecordRequest):
-    """Payload for updating an existing scheduled record."""
+class RegisterSubjectRequest(BaseRecordRequest):
+    """Payload for registering (enrolling) a new subject.
 
-    subject_key: str = Field("", alias="subjectKey")
-    interval_name: str = Field("", alias="intervalName")
+    Typically supplies ``formKey`` (or ``formId``) and a site identifier
+    (``siteName`` or ``siteId``). Optional ``subjectKey`` and ``subjectOid``
+    attributes are omitted when ``None`` or blank so server-assigned subject
+    keys continue working by default; when explicitly supplied, they are
+    preserved for enrollment and deduplication.
+    """
 
     def __init__(
         self,
         *,
-        form_key: str = "",
-        formKey: str = "",
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
         data: RecordData | dict[str, Any] = ...,
-        subject_key: str = "",
-        subjectKey: str = "",
-        interval_name: str = "",
-        intervalName: str = "",
+    ) -> None: ...
+
+class UpdateScheduledRecordRequest(BaseRecordRequest):
+    """Payload for updating an existing scheduled record.
+
+    Targets a scheduled form instance via ``formKey``/``formId``,
+    ``subjectKey``/``subjectId``/``subjectOid``, and ``intervalName``/``intervalId``
+    (or ``visitId``), with optional ``recordStatus`` and ``reasonForChange``.
+    """
+
+    def __init__(
+        self,
+        *,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
     ) -> None: ...
 
 class CreateNewRecordRequest(BaseRecordRequest):
-    """Payload for creating a new unscheduled record."""
+    """Payload for creating a new unscheduled record.
 
-    subject_key: str = Field("", alias="subjectKey")
+    Targets a form and subject via ``formKey``/``formId`` and
+    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, status,
+    and audit reason attributes.
+    """
 
     def __init__(
         self,
         *,
-        form_key: str = "",
-        formKey: str = "",
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
         data: RecordData | dict[str, Any] = ...,
-        subject_key: str = "",
-        subjectKey: str = "",
+    ) -> None: ...
+
+class UpdateRecordRequest(BaseRecordRequest):
+    """Payload for directly updating an existing record by identifier.
+
+    Targets an existing record via ``recordId``, ``recordOid``, or ``visitId``,
+    with optional ``formKey``/``formId``, ``recordStatus``, ``reasonForChange``,
+    and clinical ``data`` updates.
+    """
+
+    def __init__(
+        self,
+        *,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
     ) -> None: ...
 
 __all__ = [
@@ -279,6 +415,7 @@ __all__ = [
     "RecordJobResponse",
     "RecordStatus",
     "RegisterSubjectRequest",
+    "UpdateRecordRequest",
     "UpdateScheduledRecordRequest",
     "is_valid_record_transition",
     "normalize_record_status",
