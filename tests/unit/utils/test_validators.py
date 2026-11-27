@@ -16,9 +16,8 @@ from imednet.utils.validators import (
 
 def test_parse_datetime_handles_empty_values():
     """Test that parse datetime handles empty values."""
-    sentinel = datetime(1969, 4, 20, 16, 20)
-    assert parse_datetime("") == sentinel
-    assert parse_datetime(None) == sentinel
+    assert parse_datetime("") is None
+    assert parse_datetime(None) is None
 
 
 def test_parse_datetime_handles_numeric_timestamps():

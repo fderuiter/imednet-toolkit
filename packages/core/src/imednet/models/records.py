@@ -124,8 +124,8 @@ class Keyword(ImednetBaseModel):
 
     keyword_name: str = Field("", alias="keywordName")
     keyword_key: str = Field("", alias="keywordKey")
-    keyword_id: int = Field(0, alias="keywordId")
-    date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
+    keyword_id: int | None = Field(default=None, alias="keywordId")
+    date_added: datetime | None = Field(default=None, alias="dateAdded")
 
 
 Keyword = ModelEngine.get_model('Keyword', Keyword)
@@ -134,8 +134,8 @@ Keyword = ModelEngine.get_model('Keyword', Keyword)
 class Record(ImednetBaseModel):
     """A data record for a subject, form, and visit."""
 
-    keywords: list[Keyword] = Field(default_factory=list, alias="keywords")
-    record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
+    keywords: list[Keyword] | None = Field(default_factory=list[Keyword], alias="keywords")
+    record_data: dict[str, Any] | None = Field(default_factory=dict[str, Any], alias="recordData")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
 

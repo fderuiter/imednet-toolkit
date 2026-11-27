@@ -7,7 +7,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Generic, Self, TypeVar
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 _NORMALIZERS: dict[type, dict[str, Callable[[Any], Any]]]
 _logger: logging.Logger
@@ -26,8 +26,10 @@ def _get_normalizer(cls: type[BaseModel], field_name: str) -> Callable[[Any], An
 
 _drift_reported: set[str]
 _FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]]
+_WIRE_FIELD_METADATA_CACHE: dict[type, tuple[set[str], list[tuple[str, str | None]]]]
 
 def _get_field_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]: ...
+def _get_wire_metadata(cls: type[BaseModel]) -> tuple[set[str], list[tuple[str, str | None]]]: ...
 
 class ImednetBaseModel(BaseModel):
     """Core base model for all iMedNet API responses.
@@ -45,7 +47,7 @@ class ImednetBaseModel(BaseModel):
     def from_json(cls, data: Any) -> Self: ...
     @model_validator(mode="before")
     @classmethod
-    def _detect_drift(cls, data: Any) -> Any: ...
+    def _detect_drift(cls, data: Any, info: ValidationInfo) -> Any: ...
     @field_validator("*", check_fields=False, mode="before")
     def _normalise(cls, v: Any, info: Any) -> Any: ...
 
