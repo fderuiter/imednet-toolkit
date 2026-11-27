@@ -147,7 +147,7 @@ When reading environment variables or other untyped values, use helpers from
        parse_dict_or_default,
    )
    print(parse_bool("yes"))
-   print(parse_datetime("2020-01-01T00:00:00Z").year)
+   print(parse_datetime("2020-01-01T00:00:00Z", strict=True).year)
    print(parse_int_or_default("bad", default=5))
    print(repr(parse_str_or_default(1.23)))
    print(parse_list_or_default("x"))

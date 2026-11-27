@@ -134,11 +134,12 @@ def users_to_dataframe(users: list[User]) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.users.User` to a DataFrame.
 
     Each user model is serialized using :meth:`pydantic.BaseModel.model_dump` with
-    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    ``by_alias=False`` (plus the ``name`` convenience property) and returned as a
+    :class:`pandas.DataFrame`.
     """
     check_pandas("users_to_dataframe")
 
-    user_dicts = [u.model_dump(by_alias=False) for u in users]
+    user_dicts = [{**u.model_dump(by_alias=False), "name": u.name} for u in users]
     return pd.DataFrame(user_dicts)
 
 
@@ -211,7 +212,10 @@ def records_to_dataframe(
 
     if flatten:
         base_df = df.drop(columns=["record_data"])
-        record_df = pd.json_normalize(df["record_data"].tolist(), sep="_")
+        record_df = pd.json_normalize(
+            [d if isinstance(d, dict) else {} for d in df["record_data"].tolist()],
+            sep="_",
+        )
         clean_label_map = (
             {str(k): str(v) for k, v in label_map.items() if k and v and str(v).strip()}
             if label_map

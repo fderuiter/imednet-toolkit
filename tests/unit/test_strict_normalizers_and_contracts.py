@@ -185,6 +185,7 @@ def test_permissive_mode_rejects_bool_on_int_fields_while_preserving_other_fallb
     )
     assert permissive_rec.record_id == 42
     assert permissive_rec.record_data == {"AGE": 50}
+    assert permissive_rec.keywords is not None
     assert len(permissive_rec.keywords) == 1
     assert permissive_rec.keywords[0].keyword_id == 3
 
@@ -208,7 +209,8 @@ def test_role_seven_int_timestamps_user_name_property_and_request_dict_data():
     assert isinstance(User.name, property)
     assert user.name == "Ada Lovelace"
     dumped = user.model_dump()
-    assert dumped["name"] == "Ada Lovelace"
+    assert "name" not in dumped
+    assert "name" not in user.model_dump(by_alias=True)
 
     req = RegisterSubjectRequest(form_key="DM", siteName="SITE-01", data={"SUBJID": "001"})
     assert isinstance(req.data, RecordData)

@@ -6,7 +6,7 @@ import logging
 import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, overload
 
 from imednet.utils.dates import parse_iso_datetime  # Centralized date parsing
 
@@ -19,9 +19,6 @@ _FALSE_LOWER = {"false", "0", "no", "n", "f"}
 _TRUE_VARIANTS = _TRUE_LOWER | {"True", "TRUE"}
 _FALSE_VARIANTS = _FALSE_LOWER | {"False", "FALSE"}
 
-
-# Sentinel value for empty timestamps to avoid allocation overhead
-_SENTINEL_DATETIME = datetime(1969, 4, 20, 16, 20)
 
 _drift_reported: set[str] = set()
 _logger: logging.Logger = logging.getLogger(__name__)
@@ -62,18 +59,35 @@ def is_boolean_token(value: str) -> bool:
     return normalized in _TRUE_LOWER or normalized in _FALSE_LOWER
 
 
+@overload
+def parse_datetime(v: datetime, *, strict: bool | None = None) -> datetime: ...
+
+
+@overload
+def parse_datetime(v: Any, *, strict: Literal[True]) -> datetime: ...
+
+
+@overload
 def parse_datetime(
-    v: str | int | float | datetime,
+    v: str | int | float | datetime | None,
     *,
     strict: bool | None = None,
-) -> datetime:
-    """Parse an ISO datetime string, numeric timestamp, or return a sentinel value.
+) -> datetime | None: ...
 
-    In permissive mode, returns ``datetime(1969, 4, 20, 16, 20)`` when a timestamp
-    field is empty. In strict mode, raises ``ValueError`` on empty or invalid values.
+
+def parse_datetime(
+    v: str | int | float | datetime | None,
+    *,
+    strict: bool | None = None,
+) -> datetime | None:
+    """Parse an ISO datetime string or numeric timestamp, returning ``None`` when blank.
+
+    In permissive mode, returns ``None`` when a timestamp field is empty, missing,
+    boolean, non-finite, or out of range. In strict mode, raises ``ValueError`` on
+    empty or invalid values.
 
     Args:
-        v: Date string, numeric timestamp (seconds since epoch), or datetime object.
+        v: Date string, numeric timestamp (seconds since epoch), datetime object, or None.
            Numeric values are assumed to be UTC timestamps.
         strict: Optional explicit strict-mode override.
     """
@@ -83,24 +97,24 @@ def parse_datetime(
         if not v or v.isspace():
             if _effective_strict(strict):
                 raise ValueError(f"Expected non-empty timestamp, got {type(v).__name__}")
-            return _SENTINEL_DATETIME
+            return None
         return parse_iso_datetime(v.strip())
     use_strict = _effective_strict(strict)
     if isinstance(v, bool):
         if use_strict:
             raise ValueError("Expected datetime, got bool")
         _report_drift("Expected datetime, got bool")
-        return _SENTINEL_DATETIME
+        return None
     if is_missing_value(v):
         if use_strict:
             raise ValueError(f"Expected non-empty timestamp, got {type(v).__name__}")
-        return _SENTINEL_DATETIME
+        return None
     if isinstance(v, (int, float)):
         if isinstance(v, float) and not math.isfinite(v):
             if use_strict:
                 raise ValueError("Expected finite timestamp, got non-finite float")
             _report_drift("Expected datetime, got non-finite float")
-            return _SENTINEL_DATETIME
+            return None
         try:
             return datetime.fromtimestamp(v, tz=UTC)
         except (OSError, OverflowError, ValueError):
@@ -109,7 +123,7 @@ def parse_datetime(
             except (OverflowError, ValueError) as exc:
                 if use_strict:
                     raise ValueError("Timestamp out of range") from exc
-                return _SENTINEL_DATETIME
+                return None
     if use_strict:
         raise ValueError(f"Expected datetime, got {type(v).__name__}")
     return v
