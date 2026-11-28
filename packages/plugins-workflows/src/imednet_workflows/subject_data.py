@@ -3,9 +3,9 @@
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, Field
 
-from imednet.spi.models import Query, Record, Subject, Visit
+from imednet.spi.models import ImednetBaseModel, Query, Record, Subject, Visit
 from imednet.spi.sink_base import is_record_deleted
 from imednet.spi.utils import (
     SyncToAsyncFacadeAdapter,
@@ -20,17 +20,43 @@ if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
 
 
-class SubjectComprehensiveData(BaseModel):
+class SubjectComprehensiveData(ImednetBaseModel):
     """Structure to hold aggregated data for a subject."""
 
-    subject_details: Subject | None = Field(None, description="Core details of the subject.")
-    visits: list[Visit] = Field(default_factory=list, description="List of visits for the subject.")
+    model_config = ConfigDict(
+        extra="ignore",
+        populate_by_name=True,
+        str_strip_whitespace=True,
+    )
+
+    subject_details: Subject | None = Field(
+        default=None, alias="subjectDetails", description="Core details of the subject."
+    )
+    visits: list[Visit] = Field(
+        default_factory=list, alias="visits", description="List of visits for the subject."
+    )
     records: list[Record] = Field(
-        default_factory=list, description="List of records for the subject."
+        default_factory=list, alias="records", description="List of records for the subject."
     )
     queries: list[Query] = Field(
-        default_factory=list, description="List of queries related to the subject."
+        default_factory=list,
+        alias="queries",
+        description="List of queries related to the subject.",
     )
+
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            *,
+            subject_details: Subject | None = None,
+            subjectDetails: Subject | None = None,  # noqa: N803
+            visits: list[Visit] = ...,
+            records: list[Record] = ...,
+            queries: list[Query] = ...,
+            **extra: Any,
+        ) -> None:
+            """Initialize aggregated subject data using field names or camelCase aliases."""
 
 
 class AsyncSubjectDataWorkflow:

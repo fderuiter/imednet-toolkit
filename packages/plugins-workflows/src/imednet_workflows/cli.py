@@ -21,6 +21,8 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+import imednet.spi.cli as _spi_cli
+import imednet.spi.utils as _spi_utils
 from imednet.spi.cli import (
     NON_INTERACTIVE_ENV,
     OUTPUT_FORMAT_ENV,
@@ -31,6 +33,7 @@ from imednet.spi.cli import (
     add_study_key_args,
     clear_line,
     cli_execution_guard,
+    collect_list_items_with_remainder,
     console,
     display_list,
     emit_json,
@@ -40,7 +43,9 @@ from imednet.spi.cli import (
     load_offline_schema,
     parse_email_notify,
     parse_filter_args,
+    parse_record_data_filter,
     positive_int,
+    prepare_list_query,
     print_error,
     redact_cli_secrets,
     resolve_cli_schema,
@@ -54,16 +59,11 @@ from imednet.spi.cli import (
 )
 from imednet.spi.models import PROFILE_REGISTRY, StudyConfiguration
 from imednet.spi.utils import (
-    EnrichmentPipeline,
     PathTraversalValidationError,
-    SensitivityRegistry,
     build_study_sensitivity_registry,
     global_sensitivity_registry,
     mask_clinical_phi,
-    mask_custom_phi_recursive,
     redact_sensitive_text,
-    resolve_cli_phi_fields,
-    resolve_study_configuration,
     sanitize_diagnostic_text,
     sdk_governance_context,
     validate_path_segment,
@@ -75,12 +75,42 @@ from ._audit_cli import setup_audit_parsers
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
 
-_ORIG_RESOLVE_STUDY_CONFIG = resolve_study_configuration
-
 DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
     str(Path.home() / ".imednet" / "pipeline_ledger.json"),
 )
+
+
+def _resolve_workflow_phi_fields(
+    study_key: str | None,
+    *,
+    sdk: Any = None,
+) -> set[str]:
+    """Resolve normalized study PHI keys via SPI under *sdk* governance."""
+    sk = (study_key or "").strip()
+    if not sk:
+        return set()
+    patched = globals().get("resolve_study_configuration")
+    if callable(patched) and patched is not _spi_utils.resolve_study_configuration:
+        with sdk_governance_context(sdk):
+            cfg = patched(sk)
+        raw_fields = getattr(cfg, "phi_fields", None) if cfg is not None else None
+        if not raw_fields:
+            return set()
+        non_exempt = [
+            str(k)
+            for k in raw_fields
+            if str(k).strip() and not global_sensitivity_registry.is_exempt(str(k))
+        ]
+        if not non_exempt:
+            return set()
+        return set(
+            _spi_utils.EnrichmentPipeline(
+                StudyConfiguration(study_key="PHI", phi_fields=non_exempt)
+            ).phi_keys
+        )
+    return set(_spi_cli.resolve_cli_phi_fields(sk, sdk=sdk))
+
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "DataExtractionWorkflow": ("imednet_workflows.data_extraction", "DataExtractionWorkflow"),
@@ -90,6 +120,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "SyncWorkerConfig": ("imednet_workflows.sync_worker", "SyncWorkerConfig"),
     "SyncWorkerState": ("imednet_workflows.sync_worker", "SyncWorkerState"),
     "get_state_provider": ("imednet_workflows.state_ledger", "get_state_provider"),
+    "resolve_study_configuration": ("imednet.spi.utils", "resolve_study_configuration"),
 }
 
 
@@ -151,7 +182,7 @@ def _exit_uat_validation_error(
         with contextlib.suppress(Exception):
             validate_path_segment(study_key.strip(), name="study_key")
             safe_phi_study = study_key.strip()
-    custom_phi = _resolve_custom_phi_fields(safe_phi_study, sdk=sdk)
+    custom_phi = _resolve_workflow_phi_fields(safe_phi_study, sdk=sdk)
     sanitized = _sanitize_uat_error_text(str(exc), custom_phi_fields=custom_phi)
     prefix = "" if sanitized.startswith("Validation Error:") else "Validation Error: "
     print_error(f"{prefix}{sanitized}")
@@ -199,7 +230,7 @@ def _sanitize_phi_issue_message(
         if inferred:
             variable_name = inferred.group(1)
 
-    if isinstance(variable_name, str) and _is_key_phi_sensitive(variable_name, custom_phi_fields):
+    if isinstance(variable_name, str) and active_registry.is_sensitive(variable_name):
 
         def _mask_quote(match: re.Match[str]) -> str:
             inner = match.group(1)
@@ -274,7 +305,7 @@ def _emit_uat_json_failure(
         with contextlib.suppress(Exception):
             validate_path_segment(resolved_study, name="study_key")
             safe_phi_study = resolved_study
-    custom_phi = _resolve_custom_phi_fields(safe_phi_study, sdk=sdk)
+    custom_phi = _resolve_workflow_phi_fields(safe_phi_study, sdk=sdk)
     now = datetime.now(UTC)
     failed_result = UATRunResult.model_construct(
         study_key=resolved_study,
@@ -300,6 +331,7 @@ def _emit_uat_json_failure(
         study_key=resolved_study,
         dry_run=dry_run,
         custom_phi_fields=custom_phi,
+        sdk=sdk,
     )
     emit_json([item], "uat_run", status="failed")
     sys.exit(1)
@@ -311,6 +343,7 @@ def _serialize_uat_run_result(
     study_key: str,
     dry_run: bool,
     custom_phi_fields: set[str],
+    sdk: Any = None,
 ) -> dict[str, Any]:
     """Serialize a UATRunResult into a PHI-masked camelCase dictionary for emit_json."""
     state_raw = getattr(result, "state", None)
@@ -394,193 +427,14 @@ def _serialize_uat_run_result(
         "validationReport": val_rep_dict,
         "phaseDurations": phase_durations,
     }
-    masked = _mask_workflow_value(item, custom_phi_fields=custom_phi_fields)
+    masked = _spi_cli.mask_cli_models(
+        [item],
+        study_key=study_key,
+        mask_phi=True,
+        sdk=sdk,
+        custom_phi_fields=custom_phi_fields,
+    )[0]
     return masked if isinstance(masked, dict) else item
-
-
-def _resolve_custom_phi_fields(study_key: str | None, *, sdk: Any = None) -> set[str]:
-    """Return normalized study-configured custom PHI field keys within active SDK origin."""
-    sk = (study_key or "").strip()
-    if not sk:
-        return set()
-    if resolve_study_configuration is _ORIG_RESOLVE_STUDY_CONFIG:
-        return set(resolve_cli_phi_fields(sk, sdk=sdk))
-    with sdk_governance_context(sdk):
-        cfg = resolve_study_configuration(sk)
-    if cfg is None:
-        return set()
-    raw_fields = getattr(cfg, "phi_fields", None)
-    if not raw_fields:
-        return set()
-    non_exempt = [
-        str(k)
-        for k in raw_fields
-        if str(k).strip() and not global_sensitivity_registry.is_exempt(str(k))
-    ]
-    if not non_exempt:
-        return set()
-    return set(
-        EnrichmentPipeline(StudyConfiguration(study_key="PHI", phi_fields=non_exempt)).phi_keys
-    )
-
-
-def _is_key_phi_sensitive(
-    key: str,
-    custom_phi_fields: set[str],
-    *,
-    registry: SensitivityRegistry | None = None,
-) -> bool:
-    """Return True if *key* matches global or study-configured PHI sensitivity rules."""
-    active_registry = (
-        registry if registry is not None else build_study_sensitivity_registry(custom_phi_fields)
-    )
-    if active_registry.is_exempt(key):
-        return False
-    return active_registry.is_sensitive(key)
-
-
-def _mask_workflow_value(
-    value: Any,
-    *,
-    custom_phi_fields: set[str],
-    registry: SensitivityRegistry | None = None,
-) -> Any:
-    """Recursively mask clinical PHI across Pydantic models, mappings, and sequences.
-
-    Preserves object identity when no field values require masking so downstream
-    interactive views and SDK model serializers receive unmodified model instances.
-    """
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-
-    active_registry = (
-        registry if registry is not None else build_study_sensitivity_registry(custom_phi_fields)
-    )
-
-    if isinstance(value, Mapping):
-        changed = False
-        rebuilt: dict[Any, Any] = {}
-        for k, v in value.items():
-            key_str = str(k)
-            if _is_key_phi_sensitive(key_str, custom_phi_fields, registry=active_registry):
-                rebuilt[k] = "***MASKED***"
-                if v != "***MASKED***":
-                    changed = True
-            elif isinstance(v, str) and key_str in {"reason_for_change", "reasonForChange"}:
-                scrubbed = sanitize_diagnostic_text(v, registry=active_registry)
-                rebuilt[k] = scrubbed
-                if scrubbed != v:
-                    changed = True
-            else:
-                masked_v = _mask_workflow_value(
-                    v,
-                    custom_phi_fields=custom_phi_fields,
-                    registry=active_registry,
-                )
-                rebuilt[k] = masked_v
-                if masked_v is not v and masked_v != v:
-                    changed = True
-        if not changed and isinstance(value, dict):
-            return value
-        return rebuilt
-
-    if isinstance(value, list):
-        masked_list = [
-            _mask_workflow_value(
-                item,
-                custom_phi_fields=custom_phi_fields,
-                registry=active_registry,
-            )
-            for item in value
-        ]
-        if all(
-            new_item is old_item for new_item, old_item in zip(masked_list, value, strict=False)
-        ):
-            return value
-        return masked_list
-
-    if isinstance(value, tuple):
-        masked_tuple = tuple(
-            _mask_workflow_value(
-                item,
-                custom_phi_fields=custom_phi_fields,
-                registry=active_registry,
-            )
-            for item in value
-        )
-        if all(
-            new_item is old_item for new_item, old_item in zip(masked_tuple, value, strict=False)
-        ):
-            return value
-        return masked_tuple
-
-    model_fields = getattr(type(value), "model_fields", None)
-    model_copy = getattr(value, "model_copy", None)
-    if isinstance(model_fields, Mapping) and callable(model_copy):
-        updates: dict[str, Any] = {}
-        for fname, finfo in model_fields.items():
-            raw_val = getattr(value, fname, None)
-            if raw_val is None:
-                continue
-            alias = getattr(finfo, "alias", None)
-            if _is_key_phi_sensitive(fname, custom_phi_fields, registry=active_registry) or (
-                isinstance(alias, str)
-                and _is_key_phi_sensitive(alias, custom_phi_fields, registry=active_registry)
-            ):
-                if raw_val != "***MASKED***":
-                    updates[fname] = "***MASKED***"
-                continue
-            if isinstance(raw_val, str) and fname == "reason_for_change":
-                scrubbed = sanitize_diagnostic_text(raw_val, registry=active_registry)
-                if scrubbed != raw_val:
-                    updates[fname] = scrubbed
-                continue
-            masked_val = _mask_workflow_value(
-                raw_val,
-                custom_phi_fields=custom_phi_fields,
-                registry=active_registry,
-            )
-            if masked_val is not raw_val and masked_val != raw_val:
-                updates[fname] = masked_val
-
-        extra = getattr(value, "__pydantic_extra__", None)
-        masked_extra: dict[str, Any] | None = None
-        if isinstance(extra, dict) and extra:
-            candidate_extra = _mask_workflow_value(
-                extra,
-                custom_phi_fields=custom_phi_fields,
-                registry=active_registry,
-            )
-            if candidate_extra is not extra and candidate_extra != extra:
-                masked_extra = dict(candidate_extra)
-
-        if not updates and masked_extra is None:
-            return value
-
-        copied = model_copy(update=updates)
-        if masked_extra is not None:
-            copied_extra = getattr(copied, "__pydantic_extra__", None)
-            if isinstance(copied_extra, dict):
-                copied_extra = dict(copied_extra)
-                copied_extra.update(masked_extra)
-                object.__setattr__(copied, "__pydantic_extra__", copied_extra)
-        return copied
-
-    return value
-
-
-def _mask_workflow_item(
-    payload: Any,
-    *,
-    study_key: str | None = None,
-    mask_phi: bool = True,
-    sdk: Any = None,
-) -> Any:
-    """Apply default and study-configured PHI masking to *payload* when enabled."""
-    if not mask_phi:
-        return payload
-    custom_phi_fields = _resolve_custom_phi_fields(study_key, sdk=sdk)
-    return _mask_workflow_value(payload, custom_phi_fields=custom_phi_fields)
 
 
 def _to_serializable(value: Any) -> Any:
@@ -612,24 +466,6 @@ def _to_serializable(value: Any) -> Any:
         ):
             return _to_serializable(dumped)
     return str(value)
-
-
-def _sanitize_workflow_payload(
-    payload: Any,
-    *,
-    study_key: str | None = None,
-    mask_phi: bool = True,
-    sdk: Any = None,
-) -> Any:
-    """Serialize *payload* and apply default + study-configured PHI masking when enabled."""
-    serialized = _to_serializable(payload)
-    if not mask_phi:
-        return serialized
-    masked = mask_clinical_phi(serialized)
-    custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk)
-    if custom_phi:
-        masked = mask_custom_phi_recursive(masked, custom_phi)
-    return masked
 
 
 def _execute_set_state(
@@ -1100,6 +936,15 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         help="Record filter criteria (e.g., 'form_key=DEMO'). Repeat for multiple filters.",
     )
     extract_parser.add_argument(
+        "--record-data-filter",
+        dest="record_data_filter",
+        action="append",
+        help=(
+            "Filter by form variable values (e.g., 'AGE>25', 'RACE==White'). "
+            "Repeatable; combined with AND."
+        ),
+    )
+    extract_parser.add_argument(
         "--subject-filter",
         action="append",
         help="Subject filter criteria (e.g., 'subject_status=Screened'). Repeat for multiple filters.",
@@ -1108,6 +953,19 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         "--visit-filter",
         action="append",
         help="Visit filter criteria (e.g., 'interval_name=Screening'). Repeat for multiple filters.",
+    )
+    extract_parser.add_argument(
+        "--limit",
+        type=positive_int,
+        default=None,
+        help="Maximum number of items to return (default: 100 in table mode; unlimited for --format json).",
+    )
+    extract_parser.add_argument(
+        "--all",
+        dest="fetch_all",
+        action="store_true",
+        default=False,
+        help="Fetch all matching pages without the default 100-item table cap.",
     )
     extract_parser.add_argument(
         "--interactive",
@@ -1124,20 +982,51 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     add_output_format(extract_parser)
     add_simulation_arg(extract_parser)
 
+    def _extract_record_view_row(rec_obj: Any) -> dict[str, Any]:
+        if isinstance(rec_obj, Mapping):
+            return {
+                "ID": rec_obj.get("record_id"),
+                "Subject": rec_obj.get("subject_key"),
+                "Form": rec_obj.get("form_key"),
+                "Status": rec_obj.get("record_status"),
+                "Created": rec_obj.get("date_created"),
+            }
+        return {
+            "ID": getattr(rec_obj, "record_id", None),
+            "Subject": getattr(rec_obj, "subject_key", None),
+            "Form": getattr(rec_obj, "form_key", None),
+            "Status": getattr(rec_obj, "record_status", None),
+            "Created": getattr(rec_obj, "date_created", None),
+        }
+
+    def _coalesce_record_data_filter(raw: str | list[str] | None) -> str | None:
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            stripped = raw.strip()
+            return stripped or None
+        joined = ";".join(part.strip() for part in raw if part and part.strip())
+        return joined or None
+
     @with_sdk
     def extract_records(
         sdk: ImednetSDK,
         study_key: str | None,
         record_filter: list[str] | None = None,
+        record_data_filter: str | list[str] | None = None,
         subject_filter: list[str] | None = None,
         visit_filter: list[str] | None = None,
+        limit: int | None = None,
+        fetch_all: bool = False,
         interactive: bool = False,
         no_interactive: bool = False,
         output_format: str | None = None,
         mask_phi: bool = True,
+        _prepared_query: tuple[dict[str, Any], int | None] | None = None,
     ) -> None:
         from imednet.spi.models import Record, Subject, Visit
 
+        from .data_extraction import DataExtractionWorkflow as _RealDataExtractionWorkflow
         from .wizard import print_progress
 
         _reject_interactive_json_mode(interactive, output_format)
@@ -1167,75 +1056,117 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 existing_filters=visit_filter,
                 model=Visit,
             )
+            _prepared_query = None
         elif not study_key:
             extract_parser.error("the following arguments are required: study_key")
 
         assert study_key is not None
         validate_path_segment(study_key, name="study_key")
         workflow = _resolve_attr("DataExtractionWorkflow")(sdk)
-        parsed_record_filter = parse_filter_args(record_filter, model=Record)
+        coalesced_rdf = _coalesce_record_data_filter(record_data_filter)
+        req_kwargs, effective_limit = (
+            (dict(_prepared_query[0]), _prepared_query[1])
+            if _prepared_query is not None
+            else prepare_list_query(
+                filter_args=record_filter,
+                record_data_filter=coalesced_rdf,
+                limit=limit,
+                fetch_all=fetch_all,
+                output_format=resolved_format,
+                no_interactive=no_interactive,
+                model=Record,
+                disallow_study_key=False,
+            )
+        )
+        combined_rdf: str | None = req_kwargs.pop("record_data_filter", None)
+        page_size: int | None = req_kwargs.pop("size", None)
+        parsed_record_filter: dict[str, Any] | None = req_kwargs or None
         parsed_subject_filter = parse_filter_args(subject_filter, model=Subject)
         parsed_visit_filter = parse_filter_args(visit_filter, model=Visit)
 
+        progress_cb = (
+            (lambda msg: print_progress(f"[Progress] {msg}"))
+            if interactive and not json_mode
+            else None
+        )
         if not json_mode:
             print_progress(f"Extracting records for study '{study_key}'...")
-        if interactive and not json_mode:
-            records = workflow.extract_records_by_criteria(
+
+        if isinstance(workflow, _RealDataExtractionWorkflow):
+            iter_extra: dict[str, Any] = {}
+            if page_size is not None:
+                iter_extra["size"] = page_size
+            stream = workflow.iter_records_by_criteria(
                 study_key=study_key,
                 record_filter=parsed_record_filter,
                 subject_filter=parsed_subject_filter,
                 visit_filter=parsed_visit_filter,
-                on_progress=lambda msg: print_progress(f"[Progress] {msg}"),
+                on_progress=progress_cb,
+                record_data_filter=combined_rdf,
+                **iter_extra,
+            )
+            records, truncated, load_remaining = collect_list_items_with_remainder(
+                stream,
+                effective_limit,
             )
         else:
-            records = workflow.extract_records_by_criteria(
-                study_key=study_key,
-                record_filter=parsed_record_filter,
-                subject_filter=parsed_subject_filter,
-                visit_filter=parsed_visit_filter,
+            criteria_kwargs: dict[str, Any] = {
+                "study_key": study_key,
+                "record_filter": parsed_record_filter,
+                "subject_filter": parsed_subject_filter,
+                "visit_filter": parsed_visit_filter,
+            }
+            if combined_rdf is not None:
+                criteria_kwargs["record_data_filter"] = combined_rdf
+            if progress_cb is not None:
+                criteria_kwargs["on_progress"] = progress_cb
+            raw_records = workflow.extract_records_by_criteria(**criteria_kwargs)
+            records, truncated, load_remaining = collect_list_items_with_remainder(
+                raw_records,
+                effective_limit,
             )
 
-        masked_records = _mask_workflow_item(
-            records, study_key=study_key, mask_phi=mask_phi, sdk=sdk
+        custom_phi_fields = (
+            _resolve_workflow_phi_fields(study_key, sdk=sdk)
+            if mask_phi and (records or load_remaining is not None)
+            else None
+        )
+        masked_records = _spi_cli.mask_cli_records(
+            records,
+            study_key=study_key,
+            mask_phi=mask_phi,
+            sdk=sdk,
+            custom_phi_fields=custom_phi_fields,
         )
 
         if resolved_format == "json":
             display_list(masked_records, "records", output_format="json")
             return
 
-        view_models = [
-            {
-                "ID": r.get("record_id")
-                if isinstance(r, Mapping)
-                else getattr(r, "record_id", None),
-                "Subject": (
-                    r.get("subject_key")
-                    if isinstance(r, Mapping)
-                    else getattr(r, "subject_key", None)
-                ),
-                "Form": r.get("form_key")
-                if isinstance(r, Mapping)
-                else getattr(r, "form_key", None),
-                "Status": (
-                    r.get("record_status")
-                    if isinstance(r, Mapping)
-                    else getattr(r, "record_status", None)
-                ),
-                "Created": (
-                    r.get("date_created")
-                    if isinstance(r, Mapping)
-                    else getattr(r, "date_created", None)
-                ),
-            }
-            for r in masked_records
-        ]
+        view_models = [_extract_record_view_row(r) for r in masked_records]
+
+        def _load_more_extracted_records() -> tuple[list[dict[str, Any]], list[Any]]:
+            more = load_remaining() if load_remaining is not None else []
+            masked_more = _spi_cli.mask_cli_records(
+                more,
+                study_key=study_key,
+                mask_phi=mask_phi,
+                sdk=sdk,
+                custom_phi_fields=custom_phi_fields,
+            )
+            return [_extract_record_view_row(r) for r in masked_more], masked_more
+
         display_list(
             view_models,
             "matching records",
             "No records found matching the criteria.",
             details=masked_records,
+            truncated=truncated,
             interactive=False if no_interactive else None,
             output_format=resolved_format,
+            on_load_all=_load_more_extracted_records if load_remaining is not None else None,
+            entity_kind="records",
+            drain_on_fallback=limit is None,
         )
 
     def _handle_extract_records(args: argparse.Namespace) -> None:
@@ -1244,28 +1175,47 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         _reject_interactive_json_mode(args.interactive, raw_format)
         output_format = resolve_output_format(raw_format)
         study_key = resolve_study_key(extract_parser, args, required=not args.interactive)
+        prepared_query: tuple[dict[str, Any], int | None] | None = None
+        coalesced_rdf = _coalesce_record_data_filter(getattr(args, "record_data_filter", None))
         if args.interactive:
             from .wizard import ensure_interactive_stdin
 
+            if getattr(args, "limit", None) is not None and getattr(args, "fetch_all", False):
+                print_error("Error: Cannot combine --limit with --all.")
+                sys.exit(1)
+            parse_record_data_filter(coalesced_rdf)
             ensure_interactive_stdin(force_non_interactive=no_interactive)
         else:
             assert study_key is not None
             validate_cli_path_segment(study_key, name="study_key")
             from imednet.spi.models import Record, Subject, Visit
 
-            parse_filter_args(args.record_filter, model=Record)
+            prepared_query = prepare_list_query(
+                filter_args=args.record_filter,
+                record_data_filter=coalesced_rdf,
+                limit=getattr(args, "limit", None),
+                fetch_all=bool(getattr(args, "fetch_all", False)),
+                output_format=output_format,
+                no_interactive=no_interactive,
+                model=Record,
+                disallow_study_key=False,
+            )
             parse_filter_args(args.subject_filter, model=Subject)
             parse_filter_args(args.visit_filter, model=Visit)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
             extract_records(
                 study_key=study_key,
                 record_filter=args.record_filter,
+                record_data_filter=getattr(args, "record_data_filter", None),
                 subject_filter=args.subject_filter,
                 visit_filter=args.visit_filter,
+                limit=getattr(args, "limit", None),
+                fetch_all=bool(getattr(args, "fetch_all", False)),
                 interactive=args.interactive,
                 no_interactive=no_interactive,
                 output_format=output_format,
                 mask_phi=getattr(args, "mask_phi", True),
+                _prepared_query=prepared_query,
             )
 
     extract_parser.set_defaults(func=_handle_extract_records)
@@ -1747,12 +1697,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             if json_mode:
                 last_res = getattr(workflow, "last_result", None)
                 if last_res is not None and isinstance(getattr(last_res, "run_id", None), str):
-                    custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk)
+                    custom_phi = _resolve_workflow_phi_fields(study_key, sdk=sdk)
                     item = _serialize_uat_run_result(
                         last_res,
                         study_key=study_key,
                         dry_run=dry_run,
                         custom_phi_fields=custom_phi,
+                        sdk=sdk,
                     )
                     emit_json([item], "uat_run", status="failed")
                     sys.exit(1)
@@ -1771,12 +1722,13 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         is_success = bool(result.overall_success) and result_state != UATWorkflowState.FAILED
 
         if json_mode:
-            custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk)
+            custom_phi = _resolve_workflow_phi_fields(study_key, sdk=sdk)
             item = _serialize_uat_run_result(
                 result,
                 study_key=study_key,
                 dry_run=dry_run,
                 custom_phi_fields=custom_phi,
+                sdk=sdk,
             )
             emit_json([item], "uat_run", status="complete" if is_success else "failed")
             if not is_success:
@@ -2028,7 +1980,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             resolve_sdtm_domain(sdtm_domain, fallback="") if sdtm_domain else ""
         ) or None
         with sdk_governance_context(sdk):
-            study_cfg = resolve_study_configuration(study_key)
+            study_cfg = _resolve_attr("resolve_study_configuration")(study_key)
 
         def _fetch_inputs() -> tuple[list[Any], list[Any], list[Any]]:
             forms = list(sdk.forms.list(study_key=study_key))
@@ -2204,7 +2156,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             form_domain_map=cli_form_map if (cli_form_map or raw_forms) else None,
         )
 
-        custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk) if mask_phi else []
+        custom_phi = list(_resolve_workflow_phi_fields(study_key, sdk=sdk)) if mask_phi else []
         if mask_phi and study_cfg is not None:
             cfg_phi = getattr(study_cfg, "phi_fields", None) or []
             if cfg_phi:
@@ -2319,12 +2271,14 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             "violations": serialized_violations,
         }
         if json_mode:
-            sanitized_payload = _sanitize_workflow_payload(
-                payload,
+            serialized_payload = _to_serializable(payload)
+            sanitized_payload = _spi_cli.mask_cli_models(
+                [serialized_payload],
                 study_key=study_key,
                 mask_phi=mask_phi,
                 sdk=sdk,
-            )
+                custom_phi_fields=custom_phi if mask_phi else None,
+            )[0]
             emit_json([sanitized_payload], "standards_readiness")
         else:
             _emit_line(
@@ -2375,8 +2329,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
     setup_audit_parsers(
         sub,
         resolve_attr=_resolve_attr,
-        resolve_custom_phi_fields=_resolve_custom_phi_fields,
-        mask_workflow_item=_mask_workflow_item,
+        resolve_phi_fields=_resolve_workflow_phi_fields,
         emit_line=_emit_line,
     )
 
@@ -2438,14 +2391,21 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             print_error(f"Error: Subject '{subject_key}' not found in study '{study_key}'.")
             sys.exit(1)
 
-        masked_data = _mask_workflow_item(data, study_key=study_key, mask_phi=mask_phi, sdk=sdk)
+        custom_phi = _resolve_workflow_phi_fields(study_key, sdk=sdk) if mask_phi else None
+        masked_data = _spi_cli.mask_cli_models(
+            [data],
+            study_key=study_key,
+            mask_phi=mask_phi,
+            sdk=sdk,
+            custom_phi_fields=custom_phi,
+        )[0]
 
         if resolved_format == "json":
             emit_json([masked_data], "subject_data")
             return
 
         if isinstance(masked_data, Mapping):
-            subj_dict = masked_data.get("subject_details")
+            subj_dict = masked_data.get("subject_details", masked_data.get("subjectDetails"))
             subj_map = subj_dict if isinstance(subj_dict, Mapping) else masked_data
             raw_keywords = subj_map.get("keywords") or []
             keywords_str = ", ".join(

@@ -53,7 +53,14 @@ from imednet.cli.utils import (
 
 if TYPE_CHECKING:
     from imednet.cli.utils import is_interactive_terminal
-    from imednet.cli.utils.export import export_list_to_file, resolve_records_export_target
+    from imednet.cli.utils.args import collect_list_items_with_remainder, prepare_list_query
+    from imednet.cli.utils.export import (
+        export_list_to_file,
+        mask_cli_models,
+        mask_cli_records,
+        resolve_cli_phi_fields,
+        resolve_records_export_target,
+    )
 
 __all__ = [
     "NON_INTERACTIVE_ENV",
@@ -70,6 +77,7 @@ __all__ = [
     "add_study_key_args",
     "clear_line",
     "cli_execution_guard",
+    "collect_list_items_with_remainder",
     "console",
     "display_list",
     "emit_json",
@@ -83,12 +91,16 @@ __all__ = [
     "is_non_interactive",
     "is_tty",
     "load_offline_schema",
+    "mask_cli_models",
+    "mask_cli_records",
     "parse_email_notify",
     "parse_filter_args",
     "parse_record_data_filter",
     "positive_int",
+    "prepare_list_query",
     "print_error",
     "redact_cli_secrets",
+    "resolve_cli_phi_fields",
     "resolve_cli_schema",
     "resolve_endpoint_filter_attributes",
     "resolve_hybrid_study_and_key",
@@ -105,17 +117,37 @@ __all__ = [
     "write_stdout",
 ]
 
+_LAZY_EXPORT_NAMES = frozenset(
+    {
+        "export_list_to_file",
+        "mask_cli_models",
+        "mask_cli_records",
+        "resolve_cli_phi_fields",
+        "resolve_records_export_target",
+    }
+)
+_LAZY_ARGS_NAMES = frozenset(
+    {
+        "collect_list_items_with_remainder",
+        "prepare_list_query",
+    }
+)
+
 
 def __getattr__(name: str) -> Any:
-    """Lazily resolve interactive terminal and file export helpers from ``imednet.cli.utils``."""
+    """Lazily resolve interactive terminal, pagination, and PHI helpers from ``imednet.cli.utils``."""
     if name == "is_interactive_terminal":
         from imednet.cli.utils import is_interactive_terminal
 
         return is_interactive_terminal
-    if name in {"export_list_to_file", "resolve_records_export_target"}:
+    if name in _LAZY_EXPORT_NAMES:
         from imednet.cli.utils import export as _cli_export
 
         return getattr(_cli_export, name)
+    if name in _LAZY_ARGS_NAMES:
+        from imednet.cli.utils import args as _cli_args
+
+        return getattr(_cli_args, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

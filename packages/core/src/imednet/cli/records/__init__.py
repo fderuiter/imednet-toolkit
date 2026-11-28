@@ -167,6 +167,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 output,
                 study_key=study_key,
                 mask_phi=mask_phi,
+                sdk=sdk,
             )
             return
 
