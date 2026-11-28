@@ -92,14 +92,13 @@ def test_parse_datetime_wrapper():
     iso = "2024-01-01T00:00:00Z"
     parsed = validators.parse_datetime(iso)
     assert isinstance(parsed, datetime.datetime)
-    assert validators.parse_datetime("") == datetime.datetime(1969, 4, 20, 16, 20)
+    assert validators.parse_datetime("") is None
 
 
 def test_parse_datetime_default_date() -> None:
-    """Return a sentinel date when given an empty or ``None`` value."""
-    sentinel = datetime.datetime(1969, 4, 20, 16, 20)
-    assert validators.parse_datetime("") == sentinel
-    assert validators.parse_datetime(None) == sentinel  # type: ignore[arg-type]
+    """Return ``None`` when given an empty or ``None`` value in permissive mode."""
+    assert validators.parse_datetime("") is None
+    assert validators.parse_datetime(None) is None
 
 
 def test_parse_datetime_parses_strings() -> None:
@@ -412,7 +411,7 @@ def test_optional_and_primitive_normalizer_edge_branches(monkeypatch):
     assert _optional_dict("") is None
     assert _optional_dict("not-a-dict") == {}
 
-    assert validators.parse_datetime(True) == datetime.datetime(1969, 4, 20, 16, 20)
+    assert validators.parse_datetime(True) is None
     with pytest.raises(ValueError, match="Expected datetime, got bool"):
         validators.parse_datetime(True, strict=True)
     assert validators.parse_int_or_default("nan", default=3) == 3
@@ -502,10 +501,13 @@ def test_record_batch_validation_call_counts_and_subclass_validator_order(monkey
         )
         assert canonical_rec.record_status is RecordStatus.RECORD_COMPLETE
         job = JobStatus.from_json(
-            {"batchId": "B-1", "progress": "80", "total_records": 10, "successful_records": 8}
+            {"batchId": "B-1", "progress": "80", "totalRecords": 10, "successfulRecords": 8}
         )
         assert job.progress == 80
         assert job.total_records == 10
+        py_job = JobStatus(batchId="B-1", progress="80", total_records=10, successful_records=8)
+        assert py_job.total_records == 10
+        assert py_job.successful_records == 8
 
     report = StandardsReadinessReport.model_validate(
         {

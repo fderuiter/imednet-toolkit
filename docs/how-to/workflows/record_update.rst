@@ -11,15 +11,35 @@ Chunked Batch Writes (``create_or_update_records_batch``)
 ---------------------------------------------------------
 
 Use :meth:`~imednet_workflows.record_update.RecordUpdateWorkflow.create_or_update_records_batch`
-(or ``async_create_or_update_records_batch`` on ``AsyncImednetSDK``) to validate a
-list of ``Record`` dictionaries once against the cached ``Study`` schema, split
+(or :meth:`~imednet_workflows.record_update.AsyncRecordUpdateWorkflow.create_or_update_records_batch`
+on ``AsyncImednetSDK``) to validate a sequence of typed
+:class:`~imednet.models.records.BaseRecordRequest` models (such as
+:class:`~imednet.models.records.RegisterSubjectRequest`,
+:class:`~imednet.models.records.CreateNewRecordRequest`,
+:class:`~imednet.models.records.UpdateScheduledRecordRequest`, and
+:class:`~imednet.models.records.UpdateRecordRequest`), ``Record`` dictionaries,
+a ``DataFrame``, or a CSV path once against the cached ``Study`` schema, split
 them into bounded chunks via :class:`~imednet.utils.batch_coordinator.BatchCoordinator`,
-and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
+and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`.
+
+Every :class:`~imednet.models.records.BaseRecordRequest` subclass accepts both
+``snake_case`` and ``camelCase`` keyword arguments for all 14 iMednet
+``POST /records`` write attributes (``formKey``, ``formId``, ``siteName``,
+``siteId``, ``subjectKey``, ``subjectId``, ``subjectOid``, ``intervalName``,
+``intervalId``, ``visitId``, ``recordId``, ``recordOid``, ``recordStatus``, and
+``reasonForChange``) plus ``data``, rejects unknown keys (``extra="forbid"``),
+and omits ``None`` defaults when serialized:
 
 .. testcode::
 
    import asyncio
    from imednet import AsyncImednetSDK, ImednetSDK
+   from imednet.models.records import (
+       CreateNewRecordRequest,
+       RecordStatus,
+       UpdateRecordRequest,
+       UpdateScheduledRecordRequest,
+   )
    from imednet.simulation import reset_default_simulation_state
 
    sdk = ImednetSDK(simulation_mode=True)
@@ -28,20 +48,21 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
    summary = workflow.create_or_update_records_batch(
        study_key="STUDY",
        records_data=[
-           {
-               "formKey": "F_VS",
-               "siteName": "SITE",
-               "subjectKey": "SUB1",
-               "intervalName": "Baseline",
-               "data": {"V_WEIGHT": 71.5},
-           },
-           {
-               "formKey": "F_VS",
-               "siteName": "SITE",
-               "subjectKey": "SUB1",
-               "intervalName": "Baseline",
-               "data": {"V_WEIGHT": 72.0},
-           },
+           UpdateScheduledRecordRequest(
+               form_key="F_VS",
+               site_name="SITE",
+               subject_key="SUB1",
+               interval_name="Baseline",
+               data={"V_WEIGHT": 71.5},
+           ),
+           UpdateRecordRequest(
+               record_id=602,
+               visit_id=401,
+               form_id=302,
+               record_status=RecordStatus.COMPLETE,
+               reason_for_change="Confirmed vital signs",
+               data={"V_WEIGHT": 72.0},
+           ),
        ],
        wait_for_completion=True,
        poll_interval=1,
@@ -52,17 +73,15 @@ and return a :class:`~imednet.utils.batch_coordinator.BatchSubmissionSummary`:
 
    async def run_async_batch() -> None:
        async with AsyncImednetSDK(simulation_mode=True) as async_sdk:
-           async_summary = await async_sdk.workflows.record_update.async_create_or_update_records_batch(
+           async_summary = await async_sdk.workflows.record_update.create_or_update_records_batch(
                "STUDY",
-               [
-                   {
-                       "formKey": "F_VS",
-                       "siteName": "SITE",
-                       "subjectKey": "SUB1",
-                       "intervalName": "Baseline",
-                       "data": {"V_WEIGHT": 73.0},
-                   }
-               ],
+               (
+                   CreateNewRecordRequest(
+                       formKey="F_VS",
+                       subjectKey="SUB1",
+                       data={"V_WEIGHT": 73.0},
+                   ),
+               ),
                wait_for_completion=True,
                poll_interval=1,
            )

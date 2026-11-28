@@ -29,11 +29,14 @@ from ..utils import (
     UniqueStoreAction,
     add_simulation_arg,
     add_study_key_args,
+    flush_stdout,
     get_sdk,
+    load_offline_schema,
     print_error,
     resolve_output_format,
     resolve_study_key,
     simulation_mode_context,
+    write_stdout,
 )
 
 __all__ = ["get_sdk", "setup_parser"]
@@ -42,29 +45,41 @@ __all__ = ["get_sdk", "setup_parser"]
 def _handle_to_odm(args: argparse.Namespace) -> None:
     """Handle `imednet datadict to-odm` command."""
     try:
-        input_text = Path(args.file).read_text(encoding="utf-8")
-        raw_payload = json.loads(input_text)
+        file_path = Path(args.file)
         source_obj: DataDictionary | OdmArchive
-        if isinstance(raw_payload, dict) and "dataDictionary" in raw_payload:
-            source_obj = OdmArchive.model_validate(raw_payload)
+        if file_path.is_file() and file_path.suffix.lower() == ".json":
+            input_text = file_path.read_text(encoding="utf-8")
+            raw_payload = json.loads(input_text)
+            if isinstance(raw_payload, dict) and "dataDictionary" in raw_payload:
+                source_obj = OdmArchive.model_validate(raw_payload)
+            else:
+                source_obj = load_offline_schema(args.file)
         else:
-            source_obj = DataDictionary.model_validate(raw_payload)
+            source_obj = load_offline_schema(args.file)
     except Exception as exc:
         print_error(redact_cli_secrets(f"Error reading data dictionary from '{args.file}': {exc}"))
         sys.exit(1)
 
-    try:
-        if args.output:
+    if args.output:
+        try:
             to_odm_file(source_obj, args.output, file_oid=getattr(args, "file_oid", None))
             print(f"Successfully wrote CDISC ODM XML to '{args.output}'", file=sys.stderr)
-        else:
-            print(to_odm_xml(source_obj, file_oid=getattr(args, "file_oid", None)), end="")
-    except OSError as exc:
-        print_error(redact_cli_secrets(f"Error writing CDISC ODM XML to '{args.output}': {exc}"))
-        sys.exit(1)
-    except Exception as exc:
-        print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
-        sys.exit(1)
+        except OSError as exc:
+            print_error(
+                redact_cli_secrets(f"Error writing CDISC ODM XML to '{args.output}': {exc}")
+            )
+            sys.exit(1)
+        except Exception as exc:
+            print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
+            sys.exit(1)
+    else:
+        try:
+            odm_xml = to_odm_xml(source_obj, file_oid=getattr(args, "file_oid", None))
+        except Exception as exc:
+            print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
+            sys.exit(1)
+        if write_stdout(odm_xml, end=""):
+            flush_stdout()
 
 
 def _handle_from_csv(args: argparse.Namespace) -> None:
@@ -72,6 +87,7 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
     try:
         dd = load_from_csv(
             args.path,
+            study_key=getattr(args, "study_key", None),
             strict=args.strict,
             no_raw_xml=args.no_raw_xml,
         )
@@ -88,8 +104,8 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
                 redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
             )
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 def _handle_from_odm(args: argparse.Namespace) -> None:
@@ -125,8 +141,8 @@ def _handle_from_odm(args: argparse.Namespace) -> None:
                     redact_cli_secrets(f"Error writing ODM archive to '{args.output}': {exc}")
                 )
                 sys.exit(1)
-        else:
-            print(archive_json, end="")
+        elif write_stdout(archive_json, end=""):
+            flush_stdout()
         return
 
     try:
@@ -149,8 +165,8 @@ def _handle_from_odm(args: argparse.Namespace) -> None:
                 redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
             )
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 def _handle_from_redcap(args: argparse.Namespace) -> None:
@@ -175,8 +191,8 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
                 redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
             )
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 @with_sdk
@@ -195,8 +211,8 @@ def _from_api(
         except OSError as exc:
             print_error(redact_cli_secrets(f"Error writing data dictionary to '{output}': {exc}"))
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 def _handle_from_api(args: argparse.Namespace) -> None:
@@ -225,7 +241,8 @@ def _emit_validate_json(file_path: str, errors: list[str]) -> None:
         "error_count": len(errors),
         "errors": [redact_cli_secrets(err) for err in errors],
     }
-    print(json.dumps(payload, indent=2) + "\n", end="")
+    if write_stdout(json.dumps(payload, indent=2) + "\n", end=""):
+        flush_stdout()
 
 
 def _handle_validate(args: argparse.Namespace) -> None:
@@ -244,7 +261,16 @@ def _handle_validate(args: argparse.Namespace) -> None:
                 print_error(redact_cli_secrets(err_msg))
             sys.exit(1)
 
-    errors = validate(args.file, schema=schema_dict)
+    file_path = Path(args.file)
+    if not file_path.is_dir() and file_path.suffix.lower() == ".json":
+        errors = validate(args.file, schema=schema_dict)
+    else:
+        try:
+            dd = load_offline_schema(args.file)
+        except Exception as exc:
+            errors = [str(exc)]
+        else:
+            errors = validate(dd, schema=schema_dict)
     if output_format == "json":
         _emit_validate_json(args.file, errors)
         if errors:
@@ -256,15 +282,16 @@ def _handle_validate(args: argparse.Namespace) -> None:
         for err in errors:
             print_error(redact_cli_secrets(f"  - {err}"))
         sys.exit(1)
-    else:
-        print(f"Validation passed: '{args.file}' conforms to the data dictionary specification.")
+    elif write_stdout(
+        f"Validation passed: '{args.file}' conforms to the data dictionary specification."
+    ):
+        flush_stdout()
 
 
 def _handle_diff(args: argparse.Namespace) -> None:
     """Handle `imednet datadict diff` command."""
     try:
-        old_text = Path(args.old).read_text(encoding="utf-8")
-        old_dd = DataDictionary.model_validate_json(old_text)
+        old_dd = load_offline_schema(args.old)
     except Exception as exc:
         print_error(
             redact_cli_secrets(f"Error reading baseline data dictionary '{args.old}': {exc}")
@@ -272,8 +299,7 @@ def _handle_diff(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     try:
-        new_text = Path(args.new).read_text(encoding="utf-8")
-        new_dd = DataDictionary.model_validate_json(new_text)
+        new_dd = load_offline_schema(args.new)
     except Exception as exc:
         print_error(redact_cli_secrets(f"Error reading target data dictionary '{args.new}': {exc}"))
         sys.exit(1)
@@ -282,11 +308,13 @@ def _handle_diff(args: argparse.Namespace) -> None:
     output_format = resolve_output_format(args.format, default="text")
 
     if output_format == "json":
-        print(report.to_json(), end="")
+        rendered_diff = report.to_json()
     elif output_format == "md":
-        print(report.to_markdown(), end="")
+        rendered_diff = report.to_markdown()
     else:
-        print(report.to_text(), end="")
+        rendered_diff = report.to_text()
+    if write_stdout(rendered_diff, end=""):
+        flush_stdout()
 
 
 def _handle_schema(args: argparse.Namespace) -> None:
@@ -301,8 +329,8 @@ def _handle_schema(args: argparse.Namespace) -> None:
         except Exception as exc:
             print_error(redact_cli_secrets(f"Error writing schema to '{args.output}': {exc}"))
             sys.exit(1)
-    else:
-        print(json_text, end="")
+    elif write_stdout(json_text, end=""):
+        flush_stdout()
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -326,6 +354,11 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "-o",
         "--output",
         help="Destination JSON file path (default: stdout).",
+    )
+    csv_parser.add_argument(
+        "--study-key",
+        action=UniqueStoreAction,
+        help="Optional study key identifier override.",
     )
     csv_parser.add_argument(
         "--strict",
@@ -382,7 +415,10 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     )
     to_odm_parser.add_argument(
         "file",
-        help="Path to data dictionary JSON file to export.",
+        help=(
+            "Path to data dictionary source (.json, .xml, .csv REDCap, .zip CSV archive, "
+            "or CSV directory) to export."
+        ),
     )
     to_odm_parser.add_argument(
         "-o",
@@ -451,11 +487,14 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     # 3. validate
     val_parser = cmd_subparsers.add_parser(
         "validate",
-        help="Validate a data dictionary JSON file against model and schema rules.",
+        help="Validate a data dictionary source against model and schema rules.",
     )
     val_parser.add_argument(
         "file",
-        help="Path to data dictionary JSON file to validate.",
+        help=(
+            "Path to data dictionary source (.json, .xml, .csv REDCap, .zip CSV archive, "
+            "or CSV directory) to validate."
+        ),
     )
     val_parser.add_argument(
         "--schema",
@@ -472,10 +511,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     # 4. diff
     diff_parser = cmd_subparsers.add_parser(
         "diff",
-        help="Compare two data dictionary JSON files structurally.",
+        help="Compare two data dictionary sources structurally.",
     )
-    diff_parser.add_argument("old", help="Baseline data dictionary JSON file.")
-    diff_parser.add_argument("new", help="Updated data dictionary JSON file.")
+    diff_parser.add_argument(
+        "old",
+        help="Baseline data dictionary (.json, .xml, .csv REDCap, .zip CSV archive, or CSV dir).",
+    )
+    diff_parser.add_argument(
+        "new",
+        help="Updated data dictionary (.json, .xml, .csv REDCap, .zip CSV archive, or CSV dir).",
+    )
     diff_parser.add_argument(
         "--format",
         choices=["text", "json", "md"],

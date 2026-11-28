@@ -30,9 +30,9 @@ Retry policy
 * Idempotent methods (``GET``, ``PUT``, ``DELETE``, ``HEAD``, ``OPTIONS``) retry on:
 
   * ``httpx.RequestError`` network failures
-  * HTTP ``5xx`` responses
+  * HTTP ``408`` and ``5xx`` responses
 * All methods (including ``POST``/``PATCH``) retry on HTTP ``429`` rate limits.
-* Non-idempotent methods do not retry on network errors or ``5xx`` responses.
+* Non-idempotent methods do not retry on network errors, ``408``, or ``5xx`` responses.
 * Maximum attempts and backoff are configured via ``retry_config``
   (:class:`~imednet.core.retry.RetryConfig`) on
   :class:`~imednet.core.client.Client` and
@@ -62,19 +62,22 @@ Circuit breaker and probe leases
 * ``HTTPClientBase`` initializes a dedicated ``CircuitBreaker`` per client instance
   (``failure_threshold=5``, ``recovery_timeout=10.0`` seconds,
   ``half_open_max_probes=1``), isolating ``CircuitState`` across independent
-  ``Study`` clients.
-* ``CircuitState`` progresses through ``CLOSED``, ``OPEN``, and ``HALF_OPEN``:
-  five consecutive ``httpx.RequestError`` or HTTP ``5xx`` outcomes via
-  ``record_failure()`` open the breaker, causing new requests to fail immediately with
-  :class:`imednet.errors.CircuitBreakerError` (subclassing
-  :class:`imednet.errors.ImednetError` directly with ``attempt_count=0`` on
-  :class:`imednet.errors.DiagnosticContext`).
-* After ``recovery_timeout`` elapses, the next request transitions the breaker to
+  ``Study`` clients, alongside an LRU-bounded origin-keyed ``CircuitBreaker`` map
+  for terminal external redirect hops.
+* Each execution attempt acquires its own ``ProbeLease``. ``CircuitState`` progresses
+  through ``CLOSED``, ``OPEN``, and ``HALF_OPEN``: five consecutive
+  ``httpx.RequestError``, HTTP ``408``, or HTTP ``5xx`` outcomes via
+  ``record_failure()`` open the breaker, aborting pending retries and causing new
+  requests to fail immediately with :class:`imednet.errors.CircuitBreakerError`
+  (subclassing :class:`imednet.errors.ImednetError` directly with ``attempt_count=0``
+  on :class:`imednet.errors.DiagnosticContext`).
+* After ``recovery_timeout`` elapses, the next attempt transitions the breaker to
   ``HALF_OPEN`` and acquires a ``ProbeLease`` (enforcing ``half_open_max_probes=1``).
-  A ``2xx`` response calls ``record_success()`` and returns the breaker to ``CLOSED``;
-  a ``5xx`` or network error re-opens it; and early exits (task cancellation or
-  non-429 ``4xx`` responses) invoke ``ProbeLease.release_if_unsettled()`` so in-flight
-  probe capacity is never leaked.
+  Only an HTTP ``2xx`` response calls ``record_success()`` (returning the breaker to
+  ``CLOSED`` and advancing its monotonic epoch); HTTP ``408``, ``5xx``, or network
+  errors re-open it; and early exits (task cancellation, ``3xx`` redirects, or other
+  non-429 ``4xx`` responses) leave the lease unsettled for ``ProbeLease.release()`` so
+  in-flight probe capacity is never leaked and ``HALF_OPEN`` is not prematurely closed.
 * HTTP ``429`` responses invoke ``record_rate_limit()`` rather than
   ``record_failure()``: in ``CLOSED`` state they leave the consecutive failure counter
   untouched so rate-limited ``Subject``, ``Site``, ``Form``, ``Record``, ``Visit``,
@@ -389,13 +392,13 @@ Shared :class:`~imednet.spi.sink_base.SinkConfig` fields:
      - Pre-configured :class:`~imednet.spi.sink_base.StateProviderProtocol` instance overriding entry-point discovery.
    * - ``as_sdtm``
      - ``False``
-     - Transform exported ``Record`` payloads into standardized CDISC SDTM domain rows via :func:`~imednet.spi.models.transform_records_to_sdtm_rows` (automatically enabled when ``sdtm_domain`` is supplied).
+     - Transform exported ``Record`` payloads into standardized CDISC SDTM domain rows via :func:`~imednet.spi.models.transform_records_to_sdtm_rows` (automatically enabled when ``sdtm_domain`` is supplied unless ``as_sdtm=False`` is passed explicitly).
    * - ``sdtm_domain``
      - ``None``
-     - Optional 2-character CDISC SDTM domain code (for example ``"AE"``, ``"DM"``, or ``"VS"``) selecting the target domain for ``as_sdtm`` transformation.
+     - Optional 2-character CDISC SDTM domain code (for example ``"AE"``, ``"DM"``, or ``"VS"``) selecting the target domain for ``as_sdtm`` transformation or ``naming_convention="sdtm"`` alias resolution.
    * - ``preserve_record_id``
      - ``None``
-     - Optional override controlling whether ``RECORD_ID`` is retained on ``as_sdtm=True`` projections (defaults to ``True`` for idempotent and incremental exports so baseline and delta syncs merge and reconcile voided ``Record`` items deterministically; set ``False`` to opt into strict ``RECORD_ID``-free SDTM projections).
+     - Optional override controlling whether ``RECORD_ID`` is retained on ``as_sdtm=True`` projections (defaults to ``True`` only for incremental exports — when ``incremental=True``, ``modified_since`` is set, or ``state_provider`` is supplied — so delta syncs merge and reconcile voided ``Record`` items deterministically while full baseline SDTM exports omit EDC ``RECORD_ID`` columns by default; set ``True`` or ``False`` to override explicitly).
    * - ``standards_profile``
      - ``None``
      - Optional CDISC standards validation profile name (for example ``"drug"``, ``"device"``, or ``"general"``) or :class:`~imednet.models.standards.StandardsProfile` evaluated before sink writes.

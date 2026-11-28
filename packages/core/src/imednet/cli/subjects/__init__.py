@@ -24,7 +24,7 @@ from ..utils.write_helpers import (
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
-    keywords_str = ", ".join(k.keyword_name for k in s.keywords)
+    keywords_str = ", ".join(k.keyword_name for k in (s.keywords or ()))
     return {
         "subject_key": s.subject_key,
         "status": s.subject_status,

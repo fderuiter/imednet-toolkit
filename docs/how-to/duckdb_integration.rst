@@ -164,15 +164,18 @@ For incremental bronze/silver ``Record`` revision ingestion, use
 The key methods are
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.ingest_revisions`
 for incremental ``bronze_revisions`` (and ``record_revisions`` view) loads (defaulting
-to ``mask_phi=True`` and scoping ``mode="replace"`` refreshes to the target
-``study_key``),
+to ``mask_phi=True``, scoping ``mode="replace"`` refreshes to the target
+``study_key``, and optionally enforcing atomic 21 CFR Part 11 continuity and tombstone
+checks across merged ``bronze_revisions`` rows via ``validate_chain=True``),
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.build_silver_view`
 for current-state and SCD Type 2 history materialization (per-Study
 ``"silver_current_state_{study_key}"`` / ``"silver_records_history_{study_key}"`` and
 combined ``silver_current_state`` / ``silver_records_history``, including ``valid_from``,
 ``valid_to``, ``is_current``, and ``LAG()`` transition diff columns
 ``prev_record_status``, ``prev_data_revision``, ``prev_deleted``, ``data_changed``,
-and ``change_type``), and
+and ``change_type``—labeling initial ``record_revision == 1`` or unnumbered rows as
+``'created'`` and unanchored date-window rows with ``record_revision > 1`` as
+``'window_baseline'`` with ``data_changed IS NULL``), and
 :meth:`imednet_workflows.duckdb_centralizer.DuckDBIngestionWorkflow.close`
 (or a ``with`` block) to release the DuckDB connection cleanly.
 

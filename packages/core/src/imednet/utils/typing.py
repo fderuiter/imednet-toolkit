@@ -1,23 +1,34 @@
 """Type definitions for imednet SDK utilities."""
 
 import os
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, Union, runtime_checkable
+from collections.abc import Mapping, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ForwardRef,
+    Protocol,
+    TypeAlias,
+    Union,
+    runtime_checkable,
+)
 
 #: Generic JSON object type (mapping of string keys to arbitrary values).
 JsonDict = dict[str, Any]
 
 
 @runtime_checkable
-class _TabularDataFrameLike(Protocol):
-    """Runtime structural protocol for tabular DataFrame inputs without importing pandas."""
+class DataFrameLike(Protocol):
+    """Structural protocol for tabular DataFrame inputs without requiring pandas."""
 
     @property
     def columns(self) -> Any:
         """Return tabular column labels."""
 
-    def to_dict(self, *args: Any, **kwargs: Any) -> Any:
+    def to_dict(self) -> Any:
         """Convert tabular rows into Python dictionaries."""
+
+
+_TabularDataFrameLike = DataFrameLike
 
 
 if TYPE_CHECKING:
@@ -27,10 +38,13 @@ if TYPE_CHECKING:
 
     DataFrame: TypeAlias = pd.DataFrame
     RecordsInput: TypeAlias = (
-        Sequence[JsonDict | BaseRecordRequest] | pd.DataFrame | str | os.PathLike[str]
+        Sequence[BaseRecordRequest | Mapping[str, Any]] | DataFrameLike | str | os.PathLike[str]
     )
 else:
-    RecordsInput = Sequence[Any] | _TabularDataFrameLike | str | os.PathLike[str]
+    _BaseRecordRequestRef = ForwardRef("BaseRecordRequest", module="imednet.models.records")
+    RecordsInput = (
+        Sequence[_BaseRecordRequestRef | Mapping[str, Any]] | DataFrameLike | str | os.PathLike[str]
+    )
     globals().pop("DataFrame", None)
 
     def __getattr__(name: str) -> Any:
@@ -66,4 +80,4 @@ FilterValue = Union[  # noqa: UP007
     list[FilterScalar],
 ]
 
-__all__ = ["FilterScalar", "FilterValue", "ItemId", "JsonDict", "RecordsInput"]
+__all__ = ["DataFrameLike", "FilterScalar", "FilterValue", "ItemId", "JsonDict", "RecordsInput"]

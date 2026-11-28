@@ -7,14 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import (
-    Field,
-    RootModel,
-    SerializerFunctionWrapHandler,
-    ValidatorFunctionWrapHandler,
-    field_validator,
-    model_serializer,
-)
+from pydantic import Field, RootModel, ValidatorFunctionWrapHandler, field_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -62,8 +55,8 @@ class Keyword(ImednetBaseModel):
 
     keyword_name: str = Field("", alias="keywordName")
     keyword_key: str = Field("", alias="keywordKey")
-    keyword_id: int = Field(0, alias="keywordId")
-    date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
+    keyword_id: int | None = Field(default=None, alias="keywordId")
+    date_added: datetime | None = Field(default=None, alias="dateAdded")
 
     def __init__(
         self,
@@ -72,17 +65,17 @@ class Keyword(ImednetBaseModel):
         keywordName: str = "",
         keyword_key: str = "",
         keywordKey: str = "",
-        keyword_id: int = 0,
-        keywordId: int = 0,
-        date_added: datetime = ...,
-        dateAdded: datetime = ...,
+        keyword_id: int | None = None,
+        keywordId: int | None = None,
+        date_added: datetime | None = None,
+        dateAdded: datetime | None = None,
     ) -> None: ...
 
 class Record(ImednetBaseModel):
     """A data record for a subject, form, and visit."""
 
-    keywords: list[Keyword] = Field(default_factory=list, alias="keywords")
-    record_data: dict[str, Any] = Field(default_factory=dict, alias="recordData")
+    keywords: list[Keyword] | None = Field(default_factory=list[Keyword], alias="keywords")
+    record_data: dict[str, Any] | None = Field(default_factory=dict[str, Any], alias="recordData")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
     study_key: str | None = Field(default=None, alias="studyKey")
@@ -105,9 +98,9 @@ class Record(ImednetBaseModel):
     def __init__(
         self,
         *,
-        keywords: list[Keyword] = ...,
-        record_data: dict[str, Any] = ...,
-        recordData: dict[str, Any] = ...,
+        keywords: list[Keyword] | None = ...,
+        record_data: dict[str, Any] | None = ...,
+        recordData: dict[str, Any] | None = ...,
         record_status: RecordStatus | str | None = None,
         recordStatus: RecordStatus | str | None = None,
         deleted: bool | None = None,
@@ -179,10 +172,25 @@ class RecordData(RootModel[dict[str, Any]]):
     """Arbitrary record data as a dictionary."""
 
 class BaseRecordRequest(ImednetBaseModel):
-    """Base class for record creation/update requests."""
+    """Base class for record creation and update requests.
 
-    form_key: str = Field("", alias="formKey")
+    Declares all 14 optional iMednet REST API ``POST /records`` write attributes
+    with ``None`` defaults, forbids undeclared keys (``extra="forbid"``), and
+    serializes to camelCase keys omitting ``None`` and blank identifiers by default.
+    """
+
+    form_key: str | None = Field(default=None, alias="formKey")
     form_id: int | None = Field(default=None, alias="formId")
+    site_name: str | None = Field(default=None, alias="siteName")
+    site_id: int | None = Field(default=None, alias="siteId")
+    subject_key: str | None = Field(default=None, alias="subjectKey")
+    subject_id: int | None = Field(default=None, alias="subjectId")
+    subject_oid: str | None = Field(default=None, alias="subjectOid")
+    interval_name: str | None = Field(default=None, alias="intervalName")
+    interval_id: int | None = Field(default=None, alias="intervalId")
+    visit_id: int | None = Field(default=None, alias="visitId")
+    record_id: int | None = Field(default=None, alias="recordId")
+    record_oid: str | None = Field(default=None, alias="recordOid")
     record_status: RecordStatus | str | None = Field(default=None, alias="recordStatus")
     reason_for_change: str | None = Field(default=None, alias="reasonForChange")
     data: RecordData = Field(default_factory=lambda: RecordData({}), alias="data")
@@ -190,73 +198,12 @@ class BaseRecordRequest(ImednetBaseModel):
     def __init__(
         self,
         *,
-        form_key: str = "",
-        formKey: str = "",
+        form_key: str | None = None,
+        formKey: str | None = None,
         form_id: int | None = None,
         formId: int | None = None,
-        record_status: RecordStatus | str | None = None,
-        recordStatus: RecordStatus | str | None = None,
-        reason_for_change: str | None = None,
-        reasonForChange: str | None = None,
-        data: RecordData | dict[str, Any] = ...,
-    ) -> None: ...
-    @field_validator("record_status", mode="wrap")
-    @classmethod
-    def _validate_record_status(
-        cls, value: Any, handler: ValidatorFunctionWrapHandler
-    ) -> RecordStatus | str | None: ...
-    @field_validator("reason_for_change", mode="before")
-    @classmethod
-    def _normalize_optional_reason(cls, value: Any) -> str | None: ...
-    @model_serializer(mode="wrap")
-    def _serialize_omitting_unset_record_fields(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]: ...
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
-
-class RegisterSubjectRequest(BaseRecordRequest):
-    """Payload for registering (enrolling) a new subject.
-
-    Requires ``formKey`` (or ``formId``) and a site identifier (``siteName`` or ``siteId``).
-    Optional ``subjectKey``, ``subjectId``, and ``subjectOid`` attributes are omitted when
-    unset so server-assigned subject keys continue working by default; when
-    explicitly supplied, they are preserved for enrollment and deduplication.
-    """
-
-    site_name: str = Field(
-        "", alias="siteName", description="Name of the site where the subject is enrolled"
-    )
-    site_id: int | None = Field(
-        default=None,
-        alias="siteId",
-        description="Numeric ID of the site where the subject is enrolled",
-    )
-    subject_key: str | None = Field(
-        default=None, alias="subjectKey", description="Optional client-assigned subject key"
-    )
-    subject_id: int | None = Field(
-        default=None, alias="subjectId", description="Optional numeric subject ID"
-    )
-    subject_oid: str | None = Field(
-        default=None, alias="subjectOid", description="Optional subject OID"
-    )
-    interval_name: str = Field("", alias="intervalName")
-    interval_id: int | None = Field(default=None, alias="intervalId")
-
-    def __init__(
-        self,
-        *,
-        form_key: str = "",
-        formKey: str = "",
-        form_id: int | None = None,
-        formId: int | None = None,
-        record_status: RecordStatus | str | None = None,
-        recordStatus: RecordStatus | str | None = None,
-        reason_for_change: str | None = None,
-        reasonForChange: str | None = None,
-        data: RecordData | dict[str, Any] = ...,
-        site_name: str = "",
-        siteName: str = "",
+        site_name: str | None = None,
+        siteName: str | None = None,
         site_id: int | None = None,
         siteId: int | None = None,
         subject_key: str | None = None,
@@ -265,137 +212,198 @@ class RegisterSubjectRequest(BaseRecordRequest):
         subjectId: int | None = None,
         subject_oid: str | None = None,
         subjectOid: str | None = None,
-        interval_name: str = "",
-        intervalName: str = "",
+        interval_name: str | None = None,
+        intervalName: str | None = None,
         interval_id: int | None = None,
         intervalId: int | None = None,
-    ) -> None: ...
-    @field_validator("subject_key", "subject_oid", mode="before")
-    @classmethod
-    def _normalize_optional_subject_identifier(cls, value: Any) -> str | None: ...
-
-class UpdateScheduledRecordRequest(BaseRecordRequest):
-    """Payload for updating an existing scheduled record."""
-
-    subject_key: str = Field("", alias="subjectKey")
-    subject_id: int | None = Field(default=None, alias="subjectId")
-    subject_oid: str | None = Field(default=None, alias="subjectOid")
-    interval_name: str = Field("", alias="intervalName")
-    interval_id: int | None = Field(default=None, alias="intervalId")
-
-    def __init__(
-        self,
-        *,
-        form_key: str = "",
-        formKey: str = "",
-        form_id: int | None = None,
-        formId: int | None = None,
-        record_status: RecordStatus | str | None = None,
-        recordStatus: RecordStatus | str | None = None,
-        reason_for_change: str | None = None,
-        reasonForChange: str | None = None,
-        data: RecordData | dict[str, Any] = ...,
-        subject_key: str = "",
-        subjectKey: str = "",
-        subject_id: int | None = None,
-        subjectId: int | None = None,
-        subject_oid: str | None = None,
-        subjectOid: str | None = None,
-        interval_name: str = "",
-        intervalName: str = "",
-        interval_id: int | None = None,
-        intervalId: int | None = None,
-    ) -> None: ...
-    @field_validator("subject_oid", mode="before")
-    @classmethod
-    def _normalize_optional_subject_oid(cls, value: Any) -> str | None: ...
-
-class CreateNewRecordRequest(BaseRecordRequest):
-    """Payload for creating a new unscheduled record."""
-
-    subject_key: str = Field("", alias="subjectKey")
-    subject_id: int | None = Field(default=None, alias="subjectId")
-    subject_oid: str | None = Field(default=None, alias="subjectOid")
-    interval_name: str = Field("", alias="intervalName")
-    interval_id: int | None = Field(default=None, alias="intervalId")
-
-    def __init__(
-        self,
-        *,
-        form_key: str = "",
-        formKey: str = "",
-        form_id: int | None = None,
-        formId: int | None = None,
-        record_status: RecordStatus | str | None = None,
-        recordStatus: RecordStatus | str | None = None,
-        reason_for_change: str | None = None,
-        reasonForChange: str | None = None,
-        data: RecordData | dict[str, Any] = ...,
-        subject_key: str = "",
-        subjectKey: str = "",
-        subject_id: int | None = None,
-        subjectId: int | None = None,
-        subject_oid: str | None = None,
-        subjectOid: str | None = None,
-        interval_name: str = "",
-        intervalName: str = "",
-        interval_id: int | None = None,
-        intervalId: int | None = None,
-    ) -> None: ...
-    @field_validator("subject_oid", mode="before")
-    @classmethod
-    def _normalize_optional_subject_oid(cls, value: Any) -> str | None: ...
-
-class UpdateRecordRequest(BaseRecordRequest):
-    """Payload for updating an existing record by record/visit/subject identifiers."""
-
-    record_id: int | None = Field(default=None, alias="recordId")
-    record_oid: str | None = Field(default=None, alias="recordOid")
-    visit_id: int | None = Field(default=None, alias="visitId")
-    subject_key: str = Field("", alias="subjectKey")
-    subject_id: int | None = Field(default=None, alias="subjectId")
-    subject_oid: str | None = Field(default=None, alias="subjectOid")
-    interval_name: str = Field("", alias="intervalName")
-    interval_id: int | None = Field(default=None, alias="intervalId")
-    site_name: str = Field("", alias="siteName")
-    site_id: int | None = Field(default=None, alias="siteId")
-
-    def __init__(
-        self,
-        *,
-        form_key: str = "",
-        formKey: str = "",
-        form_id: int | None = None,
-        formId: int | None = None,
-        record_status: RecordStatus | str | None = None,
-        recordStatus: RecordStatus | str | None = None,
-        reason_for_change: str | None = None,
-        reasonForChange: str | None = None,
-        data: RecordData | dict[str, Any] = ...,
+        visit_id: int | None = None,
+        visitId: int | None = None,
         record_id: int | None = None,
         recordId: int | None = None,
         record_oid: str | None = None,
         recordOid: str | None = None,
-        visit_id: int | None = None,
-        visitId: int | None = None,
-        subject_key: str = "",
-        subjectKey: str = "",
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
+    ) -> None: ...
+    @field_validator("record_status", mode="wrap")
+    @classmethod
+    def _validate_request_record_status(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> RecordStatus | str | None: ...
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]: ...
+
+class RegisterSubjectRequest(BaseRecordRequest):
+    """Payload for registering (enrolling) a new subject.
+
+    Typically supplies ``formKey`` (or ``formId``) and a site identifier
+    (``siteName`` or ``siteId``). Optional ``subjectKey``, ``subjectId``, and
+    ``subjectOid`` attributes are omitted when ``None`` or blank so
+    server-assigned subject keys continue working by default; when explicitly
+    supplied, they are preserved for enrollment and deduplication.
+    """
+
+    def __init__(
+        self,
+        *,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
         subject_id: int | None = None,
         subjectId: int | None = None,
         subject_oid: str | None = None,
         subjectOid: str | None = None,
-        interval_name: str = "",
-        intervalName: str = "",
+        interval_name: str | None = None,
+        intervalName: str | None = None,
         interval_id: int | None = None,
         intervalId: int | None = None,
-        site_name: str = "",
-        siteName: str = "",
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
+    ) -> None: ...
+
+class UpdateScheduledRecordRequest(BaseRecordRequest):
+    """Payload for updating an existing scheduled record.
+
+    Targets a scheduled form instance via ``formKey``/``formId``,
+    ``subjectKey``/``subjectId``/``subjectOid``, and ``intervalName``/``intervalId``
+    (or ``visitId``), with optional ``recordStatus`` and ``reasonForChange``.
+    """
+
+    def __init__(
+        self,
+        *,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
         site_id: int | None = None,
         siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
     ) -> None: ...
-    @field_validator("record_oid", "subject_oid", mode="before")
-    @classmethod
-    def _normalize_optional_oid(cls, value: Any) -> str | None: ...
+
+class CreateNewRecordRequest(BaseRecordRequest):
+    """Payload for creating a new unscheduled record.
+
+    Targets a form and subject via ``formKey``/``formId`` and
+    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, interval,
+    status, and audit reason attributes.
+    """
+
+    def __init__(
+        self,
+        *,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
+    ) -> None: ...
+
+class UpdateRecordRequest(BaseRecordRequest):
+    """Payload for directly updating an existing record by identifier.
+
+    Targets an existing record via ``recordId``, ``recordOid``, or ``visitId``,
+    with optional ``formKey``/``formId``, ``recordStatus``, ``reasonForChange``,
+    and clinical ``data`` updates.
+    """
+
+    def __init__(
+        self,
+        *,
+        form_key: str | None = None,
+        formKey: str | None = None,
+        form_id: int | None = None,
+        formId: int | None = None,
+        site_name: str | None = None,
+        siteName: str | None = None,
+        site_id: int | None = None,
+        siteId: int | None = None,
+        subject_key: str | None = None,
+        subjectKey: str | None = None,
+        subject_id: int | None = None,
+        subjectId: int | None = None,
+        subject_oid: str | None = None,
+        subjectOid: str | None = None,
+        interval_name: str | None = None,
+        intervalName: str | None = None,
+        interval_id: int | None = None,
+        intervalId: int | None = None,
+        visit_id: int | None = None,
+        visitId: int | None = None,
+        record_id: int | None = None,
+        recordId: int | None = None,
+        record_oid: str | None = None,
+        recordOid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        recordStatus: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        reasonForChange: str | None = None,
+        data: RecordData | dict[str, Any] = ...,
+    ) -> None: ...
 
 __all__ = [
     "ALLOWED_RECORD_TRANSITIONS",

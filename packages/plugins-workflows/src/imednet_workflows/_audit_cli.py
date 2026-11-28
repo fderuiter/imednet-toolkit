@@ -37,6 +37,7 @@ from imednet.spi.utils import (
     redact_sensitive_text,
     sanitize_csv_formula,
     sanitize_diagnostic_text,
+    sdk_governance_context,
 )
 
 if TYPE_CHECKING:
@@ -58,11 +59,17 @@ def _resolve_audit_odm_target(output: str) -> Path | None:
     return None
 
 
+def _is_ephemeral_memory_db(db_path: str) -> bool:
+    """Return True when *db_path* targets an in-memory DuckDB instance."""
+    stripped = db_path.strip().lower()
+    return stripped == ":memory:" or stripped.startswith(":memory:")
+
+
 def setup_audit_parsers(
     sub: argparse._SubParsersAction[Any],
     *,
     resolve_attr: Callable[[str], Any],
-    resolve_custom_phi_fields: Callable[[str | None], set[str]],
+    resolve_custom_phi_fields: Callable[..., set[str]],
     mask_workflow_item: Callable[..., Any],
     emit_line: Callable[..., None],
 ) -> None:
@@ -149,7 +156,7 @@ def setup_audit_parsers(
         from imednet.spi.models import RecordRevision, validate_record_revision_chain
 
         resolved_format = resolve_output_format(output_format)
-        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
+        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key, sdk=sdk))
         parsed_filters = parse_filter_args(
             filters,
             model=RecordRevision,
@@ -199,32 +206,37 @@ def setup_audit_parsers(
                 sys.exit(1)
 
         if output:
-            odm_target = _resolve_audit_odm_target(output)
-            if odm_target is not None:
-                from imednet.spi.cdisc import build_odm_archive, to_odm_file
+            with sdk_governance_context(sdk):
+                odm_target = _resolve_audit_odm_target(output)
+                if odm_target is not None:
+                    from imednet.spi.cdisc import build_odm_archive, to_odm_file
 
-                custom_phi = resolve_custom_phi_fields(study_key) if mask_phi else set()
-                archive = build_odm_archive(
-                    study_key,
-                    revisions=revisions,
+                    custom_phi = (
+                        resolve_custom_phi_fields(study_key, sdk=sdk) if mask_phi else set()
+                    )
+                    archive = build_odm_archive(
+                        study_key,
+                        revisions=revisions,
+                        mask_phi=mask_phi,
+                        custom_phi_keys=custom_phi or None,
+                    )
+                    to_odm_file(
+                        archive, odm_target, mask_phi=mask_phi, custom_phi_keys=custom_phi or None
+                    )
+                    emit_line(f"Saved {len(revisions)} audit_trail to {odm_target}")
+                    return
+                export_list_to_file(
+                    revisions,
+                    "audit_trail",
+                    output,
+                    study_key=study_key,
                     mask_phi=mask_phi,
-                    custom_phi_keys=custom_phi or None,
                 )
-                to_odm_file(
-                    archive, odm_target, mask_phi=mask_phi, custom_phi_keys=custom_phi or None
-                )
-                emit_line(f"Saved {len(revisions)} audit_trail to {odm_target}")
-                return
-            export_list_to_file(
-                revisions,
-                "audit_trail",
-                output,
-                study_key=study_key,
-                mask_phi=mask_phi,
-            )
             return
 
-        masked_revisions = mask_workflow_item(revisions, study_key=study_key, mask_phi=mask_phi)
+        masked_revisions = mask_workflow_item(
+            revisions, study_key=study_key, mask_phi=mask_phi, sdk=sdk
+        )
         if resolved_format == "json":
             display_list(masked_revisions, "record_revisions", output_format="json")
             return
@@ -317,8 +329,11 @@ def setup_audit_parsers(
     ingest_parser.add_argument(
         "--db-path",
         dest="db_path",
-        default=":memory:",
-        help="Path to DuckDB database file or ':memory:' (default: :memory:).",
+        default="./audit_lakehouse.duckdb",
+        help=(
+            "Path to DuckDB database file, or ':memory:' when paired with -o/--output "
+            "(default: ./audit_lakehouse.duckdb)."
+        ),
     )
     ingest_parser.add_argument(
         "--mode",
@@ -350,7 +365,7 @@ def setup_audit_parsers(
         dest="validate_chain",
         action="store_true",
         default=False,
-        help="Validate monotonic 21 CFR Part 11 revision chain invariants prior to ingestion.",
+        help="Validate monotonic 21 CFR Part 11 revision chain invariants during ingestion.",
     )
     ingest_parser.add_argument(
         "--allow-partial",
@@ -367,7 +382,7 @@ def setup_audit_parsers(
         dest="include_deleted",
         action="store_true",
         default=False,
-        help="Include deleted=True revisions in the materialized silver_current_state view.",
+        help="Include deleted=True revisions in silver_current_state and -o/--output exports.",
     )
     ingest_parser.add_argument(
         "-o",
@@ -382,7 +397,7 @@ def setup_audit_parsers(
     def ingest_revisions_cmd(
         sdk: ImednetSDK,
         study_key: str,
-        db_path: str = ":memory:",
+        db_path: str = "./audit_lakehouse.duckdb",
         mode: Literal["append", "replace"] = "append",
         start_date: str | None = None,
         end_date: str | None = None,
@@ -394,53 +409,58 @@ def setup_audit_parsers(
         output_format: str | None = None,
         no_interactive: bool = False,
     ) -> None:
-        from imednet.spi.models import validate_record_revision_chain
+        del no_interactive
+        if _is_ephemeral_memory_db(db_path) and not output:
+            print_error(
+                "Error: Ephemeral '--db-path :memory:' discards ingested tables on exit when no "
+                "export file is specified. Omit '--db-path' (or pass '--db-path "
+                "./audit_lakehouse.duckdb') to persist DuckDB tables, or add "
+                "'-o/--output <path.json|path.csv>' to export history."
+            )
+            sys.exit(1)
 
         resolved_format = resolve_output_format(output_format)
-        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
+        study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key, sdk=sdk))
 
-        if validate_chain:
-            effective_partial = (
-                allow_partial if allow_partial is not None else bool(start_date or end_date)
-            )
-            revisions = resolve_attr("DataExtractionWorkflow")(sdk).extract_audit_trail(
-                study_key=study_key,
-                start_date=start_date,
-                end_date=end_date,
-                sort="recordRevision,asc",
-            )
-            try:
-                validate_record_revision_chain(revisions, allow_partial=effective_partial)
-            except ValueError as exc:
-                sanitized_err = redact_cli_secrets(
-                    sanitize_diagnostic_text(
-                        redact_sensitive_text(str(exc), registry=study_reg),
-                        registry=study_reg,
-                    )
-                )
-                print_error(f"Chain validation failed: {sanitized_err}")
-                sys.exit(1)
+        chain_kwargs: dict[str, Any] = {}
+        if validate_chain or allow_partial is not None:
+            chain_kwargs["validate_chain"] = validate_chain
+            chain_kwargs["allow_partial"] = allow_partial
 
         history_rows: list[dict[str, Any]] = []
         workflow_cls = resolve_attr("DuckDBIngestionWorkflow")
         with workflow_cls(sdk, db_path=db_path, mask_phi=mask_phi) as lakehouse:
-            inserted = lakehouse.ingest_revisions(
-                study_key,
-                start_date=start_date,
-                end_date=end_date,
-                mode=mode,
-                mask_phi=mask_phi,
-            )
+            try:
+                inserted = lakehouse.ingest_revisions(
+                    study_key,
+                    start_date=start_date,
+                    end_date=end_date,
+                    mode=mode,
+                    mask_phi=mask_phi,
+                    **chain_kwargs,
+                )
+            except ValueError as exc:
+                if validate_chain:
+                    sanitized_err = redact_cli_secrets(
+                        sanitize_diagnostic_text(
+                            redact_sensitive_text(str(exc), registry=study_reg),
+                            registry=study_reg,
+                        )
+                    )
+                    print_error(f"Chain validation failed: {sanitized_err}")
+                    sys.exit(1)
+                raise
             lakehouse.build_silver_view(study_key, include_deleted=include_deleted)
             if output:
                 conn = getattr(lakehouse, "_connection", None)
                 execute_fn = getattr(conn, "execute", None)
                 if callable(execute_fn):
                     cursor = execute_fn(
-                        "SELECT * FROM silver_records_history WHERE study_key = ? "
+                        "SELECT * FROM silver_records_history "
+                        "WHERE study_key = ? AND (? OR NOT COALESCE(deleted, FALSE)) "
                         "ORDER BY record_id ASC NULLS LAST, record_revision ASC NULLS LAST, "
                         "record_revision_id ASC NULLS LAST",
-                        [study_key],
+                        [study_key, bool(include_deleted)],
                     )
                     desc = getattr(cursor, "description", None)
                     if isinstance(desc, (list, tuple)) and desc:
@@ -451,6 +471,8 @@ def setup_audit_parsers(
                                 row_dict[col_name] = (
                                     cell.isoformat() if isinstance(cell, datetime) else cell
                                 )
+                            if not include_deleted and bool(row_dict.get("deleted")):
+                                continue
                             history_rows.append(row_dict)
 
         if output:
@@ -463,7 +485,7 @@ def setup_audit_parsers(
                 sys.exit(1)
             fmt, target = resolved_target
             sanitized_rows = [
-                mask_workflow_item(row, study_key=study_key, mask_phi=mask_phi)
+                mask_workflow_item(row, study_key=study_key, mask_phi=mask_phi, sdk=sdk)
                 for row in history_rows
             ]
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -516,7 +538,7 @@ def setup_audit_parsers(
             [summary_row],
             "ingested revisions",
             details=[summary_row],
-            interactive=False if no_interactive else None,
+            interactive=False,
             output_format=resolved_format,
         )
 
@@ -530,6 +552,14 @@ def setup_audit_parsers(
         study_key = resolve_study_key(ingest_parser, args, required=True)
         assert study_key is not None
         validate_cli_path_segment(study_key, name="study_key")
+        if _is_ephemeral_memory_db(str(getattr(args, "db_path", ""))) and not output_arg:
+            print_error(
+                "Error: Ephemeral '--db-path :memory:' discards ingested tables on exit when no "
+                "export file is specified. Omit '--db-path' (or pass '--db-path "
+                "./audit_lakehouse.duckdb') to persist DuckDB tables, or add "
+                "'-o/--output <path.json|path.csv>' to export history."
+            )
+            sys.exit(1)
         study_reg = build_study_sensitivity_registry(resolve_custom_phi_fields(study_key))
 
         try:

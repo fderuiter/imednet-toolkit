@@ -29,8 +29,8 @@ class FormStructure(ImednetBaseModel):
     disabled: bool | None = Field(default=None, alias="disabled")
     epro_form: bool = Field(..., alias="eproForm")
     allow_copy: bool = Field(..., alias="allowCopy")
-    date_created: datetime = Field(..., alias="dateCreated")
-    date_modified: datetime = Field(..., alias="dateModified")
+    date_created: datetime | None = Field(default=None, alias="dateCreated")
+    date_modified: datetime | None = Field(default=None, alias="dateModified")
 
     # Nested variables
     variables: list[Variable] = Field(default_factory=list)
@@ -55,8 +55,8 @@ class IntervalStructure(ImednetBaseModel):
     interval_description: str = Field(..., alias="intervalDescription")
     interval_group_name: str = Field(..., alias="intervalGroupName")
     disabled: bool | None = Field(default=None, alias="disabled")
-    date_created: datetime = Field(..., alias="dateCreated")
-    date_modified: datetime = Field(..., alias="dateModified")
+    date_created: datetime | None = Field(default=None, alias="dateCreated")
+    date_modified: datetime | None = Field(default=None, alias="dateModified")
 
     # Nested forms
     forms: list[FormStructure] = Field(default_factory=list)

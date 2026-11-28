@@ -621,10 +621,10 @@ def test_post_503_counts_once_per_call_and_retry_after_clamps_to_max(
         assert client._circuit_breaker._consecutive_failures == 3
         assert client._circuit_breaker.state == CircuitState.CLOSED
 
-        # 4xx response does not increment breaker failures (resets consecutive failures on connection)
+        # 4xx response neither increments nor resets consecutive breaker failures
         with pytest.raises(errors.BadRequestError):
             client.post("/400", json={"data": 1})
-        assert client._circuit_breaker._consecutive_failures == 0
+        assert client._circuit_breaker._consecutive_failures == 3
 
     # Verify Retry-After clamping on both 429 and 503 responses
     recorded_sleeps: list[float] = []
@@ -839,7 +839,9 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
             with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
                 sync_poller.run("STUDY1", f"B-503-{i}", interval=0, timeout=5)
 
-        assert sync_sdk._client._external_circuit_breaker.state == CircuitState.OPEN
+        assert (
+            sync_sdk._client._get_external_circuit_breaker(S3_RESULT_URL).state == CircuitState.OPEN
+        )
         assert sync_sdk._client._circuit_breaker.state == CircuitState.CLOSED
         assert sync_sdk._client._circuit_breaker.consecutive_failures == 0
 
@@ -868,7 +870,10 @@ async def test_external_result_url_503s_and_local_nan_errors_keep_edc_circuit_br
             with pytest.raises(JobFailedError, match="failed to fetch resultUrl"):
                 await async_poller.run("STUDY1", f"AB-503-{i}", interval=0, timeout=5)
 
-        assert async_sdk._async_client._external_circuit_breaker.state == CircuitState.OPEN
+        assert (
+            async_sdk._async_client._get_external_circuit_breaker(S3_RESULT_URL).state
+            == CircuitState.OPEN
+        )
         assert async_sdk._async_client._circuit_breaker.state == CircuitState.CLOSED
         assert async_sdk._async_client._circuit_breaker.consecutive_failures == 0
 
@@ -989,3 +994,159 @@ async def test_job_errors_inherit_imednet_error_and_private_same_origin_result_u
         with pytest.raises(ImednetError) as async_untrusted_exc:
             await async_sdk.jobs.fetch_result("https://192.168.1.50/results/untrusted.json")
         assert isinstance(async_untrusted_exc.value, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_origin_scoped_external_breakers_spare_other_hosts_and_lru_evict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Five 503s on one external host spare other origins, 302-to-503 chains reopen HALF_OPEN, and LRU bounds memory."""
+    now = 100.0
+    monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
+
+    resolved_hosts: list[str] = []
+
+    def fake_getaddrinfo(host: str, port: int, *_args, **_kwargs):
+        resolved_hosts.append(host)
+        return [(2, 1, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("imednet.core.http_client_base.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("imednet.core.client.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("imednet.core.async_client.socket.getaddrinfo", fake_getaddrinfo)
+
+    bad_url = "https://bad-origin.example.com/export.json?token=raw-secret-token"
+    good_url = "https://good-origin.example.com/export.json"
+    chain_url = "https://bad-origin.example.com/hop-302"
+
+    seen_headers: dict[str, dict[str, str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers[f"{request.url.host}{request.url.path}"] = dict(request.headers)
+        host = request.url.host
+        path = request.url.path
+        if host == "edc.synthetic.imednet.test":
+            if path == "/api/v1/edc/jobs/1/result":
+                return httpx.Response(302, headers={"Location": bad_url})
+            if path == "/api/v1/edc/jobs/2/result":
+                return httpx.Response(302, headers={"Location": "/api/v1/edc/downloads/2"})
+            if path == "/api/v1/edc/downloads/2":
+                return httpx.Response(503, json={"error": "edc download down"})
+            return httpx.Response(200, json={"ok": True})
+        if host == "bad-origin.example.com":
+            if path == "/hop-302":
+                return httpx.Response(302, headers={"Location": bad_url})
+            return httpx.Response(503, json={"error": "origin down"})
+        if host == "good-origin.example.com":
+            return httpx.Response(200, json={"status": "healthy"})
+        if host.startswith("transient-hop-"):
+            return httpx.Response(302, headers={"Location": good_url})
+        if host.startswith("lru-host-"):
+            return httpx.Response(200, json={"host": host})
+        return httpx.Response(404)
+
+    # Sync verification: per-origin isolation, 302->503 HALF_OPEN reopen, auth stripping, SSRF DNS, query redaction, and LRU
+    with ImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url=EDC_BASE_URL,
+        retries=0,
+        transport=httpx.MockTransport(handler),
+    ) as sdk:
+        client = sdk._client
+        for _ in range(5):
+            with pytest.raises(errors.ServerError) as srv_exc:
+                client.fetch_external_url(bad_url)
+            assert srv_exc.value.url == "https://bad-origin.example.com/export.json?token=***"
+
+        bad_breaker = client._get_external_circuit_breaker(bad_url)
+        assert bad_breaker.state is CircuitState.OPEN
+        assert bad_breaker.epoch == 1
+
+        # 6th call to bad-origin fails fast, while good-origin and EDC remain CLOSED and succeed
+        with pytest.raises(errors.CircuitBreakerError):
+            client.fetch_external_url(bad_url)
+        good_resp = client.fetch_external_url(good_url)
+        assert good_resp.json() == {"status": "healthy"}
+        assert client._get_external_circuit_breaker(good_url).state is CircuitState.CLOSED
+        assert client._circuit_breaker.state is CircuitState.CLOSED
+
+        # Advance past recovery_timeout: 302 -> 503 chain in fetch_external_url reopens HALF_OPEN (not closed by 302!)
+        now = 115.0
+        with pytest.raises(errors.ServerError):
+            client.fetch_external_url(chain_url)
+        assert bad_breaker.state is CircuitState.OPEN
+        assert bad_breaker.epoch == 2
+
+        # Advance past recovery_timeout: JobsEndpoint.fetch_result cross-origin 302 -> 503 reopens HALF_OPEN
+        now = 130.0
+        with pytest.raises(errors.ServerError) as job_ext_exc:
+            sdk.jobs.fetch_result(f"{EDC_BASE_URL}/api/v1/edc/jobs/1/result")
+        assert job_ext_exc.value.url == "https://bad-origin.example.com/export.json?token=***"
+        assert bad_breaker.state is CircuitState.OPEN
+        assert bad_breaker.epoch == 3
+        assert "x-api-key" not in {
+            k.lower() for k in seen_headers["bad-origin.example.com/export.json"]
+        }
+        assert any(host == "bad-origin.example.com" for host in resolved_hosts)
+
+        # Same-origin JobsEndpoint.fetch_result 302 -> 503 reopens primary EDC HALF_OPEN breaker
+        client._circuit_breaker.failure_threshold = 1
+        with pytest.raises(errors.ServerError):
+            client.get("/api/v1/edc/downloads/2")
+        assert client._circuit_breaker.state is CircuitState.OPEN
+        now = 145.0
+        with pytest.raises(errors.ServerError):
+            sdk.jobs.fetch_result("/api/v1/edc/jobs/2/result")
+        assert client._circuit_breaker.state is CircuitState.OPEN
+
+        # Bounded LRU eviction & untrusted intermediate 302 hops not evicting terminal origins
+        client._external_circuit_breakers.clear()
+        client._max_external_circuit_breakers = 3
+        for idx in (1, 2, 3):
+            assert (
+                client.fetch_external_url(f"https://lru-host-{idx}.example.com/ok").status_code
+                == 200
+            )
+        # Touch lru-host-1 so lru-host-2 becomes least-recently-used, then add lru-host-4
+        assert client.fetch_external_url("https://lru-host-1.example.com/ok").status_code == 200
+        assert client.fetch_external_url("https://lru-host-4.example.com/ok").status_code == 200
+        tracked_hosts = [origin[1] for origin in client._external_circuit_breakers]
+        assert tracked_hosts == [
+            "lru-host-3.example.com",
+            "lru-host-1.example.com",
+            "lru-host-4.example.com",
+        ]
+        # Intermediate 302 hops to good-origin only insert good-origin (1 eviction), not transient-hop-*
+        assert (
+            client.fetch_external_url("https://transient-hop-1.example.com/go").status_code == 200
+        )
+        assert "transient-hop-1.example.com" not in [
+            origin[1] for origin in client._external_circuit_breakers
+        ]
+        assert len(client._external_circuit_breakers) == 3
+
+    # Async verification: per-origin isolation and 302 -> 503 HALF_OPEN reopen
+    async with AsyncImednetSDK(
+        api_key="k",
+        security_key="s",
+        base_url=EDC_BASE_URL,
+        retries=0,
+        transport=httpx.MockTransport(handler),
+    ) as async_sdk:
+        aclient = async_sdk._async_client
+        for _ in range(5):
+            with pytest.raises(errors.ServerError):
+                await aclient.fetch_external_url(bad_url)
+        async_bad_breaker = aclient._get_external_circuit_breaker(bad_url)
+        assert async_bad_breaker.state is CircuitState.OPEN
+        assert (await aclient.fetch_external_url(good_url)).status_code == 200
+
+        now = 200.0
+        with pytest.raises(errors.ServerError):
+            await aclient.fetch_external_url(chain_url)
+        assert async_bad_breaker.state is CircuitState.OPEN
+
+        now = 220.0
+        with pytest.raises(errors.ServerError):
+            await async_sdk.jobs.fetch_result(f"{EDC_BASE_URL}/api/v1/edc/jobs/1/result")
+        assert async_bad_breaker.state is CircuitState.OPEN

@@ -227,7 +227,7 @@ def test_compile_record_predicate_metadata_and_data_operators() -> None:
     )
     projected = proj_pred.apply(rec)
     assert projected is not None
-    assert projected.record_data == {}
+    assert projected.record_data is None
     assert rec.record_data["AGE"] == 45
     assert projected.record_status == RecordStatus.RECORD_COMPLETE
 

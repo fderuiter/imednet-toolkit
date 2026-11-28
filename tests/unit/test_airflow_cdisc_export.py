@@ -56,6 +56,7 @@ def test_airflow_export_operator_supports_odm_and_dataset_json(
     )
 
     sdk = MagicMock()
+    sdk._async_sdk = None
     sdk.forms.list.return_value = forms
     sdk.get_forms.return_value = forms
     sdk.variables.list.return_value = variables
@@ -107,3 +108,23 @@ def test_airflow_export_operator_supports_odm_and_dataset_json(
     assert validate_odm_xml(odm_out) == []
     assert dj_out.is_file()
     assert validate_dataset_json(dj_out) == []
+
+    csv_non_sdtm = tmp_path / "airflow_filtered_non_sdtm.csv"
+    with patch("apache_airflow_providers_imednet.operators.export.ImednetHook") as mock_hook_cls:
+        mock_hook_cls.return_value.get_conn.return_value = sdk
+        mock_hook_cls.return_value.get_sdk_client.return_value = sdk
+        op_csv = ImednetExportOperator(
+            task_id="export_csv_non_sdtm_domain_filter",
+            study_key="AIRFLOW_CDISC",
+            destination="csv",
+            output_path=str(csv_non_sdtm),
+            as_sdtm=False,
+            sdtm_domain="AE",
+            naming_convention="sdtm",
+        )
+        assert op_csv.as_sdtm is False
+        op_csv.execute(context={})
+
+    header = csv_non_sdtm.read_text(encoding="utf-8").splitlines()[0]
+    assert "STUDYID" in header
+    assert "AESEQ" not in header

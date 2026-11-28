@@ -30,22 +30,6 @@ def _extract_form_ref(
     return fk, fid
 
 
-def _extract_record_data(record: Mapping[str, Any] | BaseRecordRequest | Any) -> dict[str, Any]:
-    """Extract clinical variable data dictionary from a record mapping or BaseRecordRequest."""
-    if isinstance(record, Mapping):
-        raw_data = record.get("recordData", record.get("data", {}))
-    else:
-        raw_data = getattr(record, "record_data", None)
-        if raw_data is None:
-            raw_data = getattr(record, "data", {})
-    root_val = getattr(raw_data, "root", None)
-    if isinstance(root_val, Mapping):
-        return dict(root_val)
-    if isinstance(raw_data, Mapping):
-        return dict(raw_data)
-    return raw_data  # type: ignore[no-any-return]
-
-
 class _ValidatorMixin:
     """Shared logic for schema validators."""
 

@@ -403,13 +403,13 @@ async def test_six_attribute_jobs_response_fetches_result_url_strips_cross_origi
     tmp_path: Path,
 ) -> None:
     """create_batch(..., wait_for_completion=True) against a 6-attribute Job response fetches resultUrl safely."""
-    seen_requests: list[tuple[str, str, dict[str, str]]] = []
+    seen_requests: list[tuple[str, str | None, dict[str, str]]] = []
     batch_counter = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal batch_counter
         seen_requests.append(
-            (request.method, str(request.url), {k.lower(): v for k, v in request.headers.items()})
+            (request.method, request.url.host, {k.lower(): v for k, v in request.headers.items()})
         )
         if request.method == "POST" and request.url.path.endswith("/records"):
             batch_counter += 1
@@ -494,7 +494,7 @@ async def test_six_attribute_jobs_response_fetches_result_url_strips_cross_origi
         assert async_summary.enrolled_subject_keys == ["SUBJ-AUTO-3"]
 
         # 3. resolve_results=False skips fetching resultUrl
-        s3_before = sum(1 for _, u, _ in seen_requests if "s3.amazonaws.com" in u)
+        s3_before = sum(1 for _, host, _ in seen_requests if host == "s3.amazonaws.com")
         no_res_summary = sdk.records.create_batch(
             "STUDY1",
             [UpdateRecordRequest(recordId=9001, data={"V1": "skip"})],
@@ -503,7 +503,7 @@ async def test_six_attribute_jobs_response_fetches_result_url_strips_cross_origi
             resolve_results=False,
             interval=0.0,
         )
-        s3_after = sum(1 for _, u, _ in seen_requests if "s3.amazonaws.com" in u)
+        s3_after = sum(1 for _, host, _ in seen_requests if host == "s3.amazonaws.com")
         assert s3_after == s3_before
         assert no_res_summary.created_record_ids == []
 
@@ -1055,7 +1055,7 @@ async def test_enrollment_defaults_job_status_summary_and_tabular_edge_cases(
     )
     assert len(mixed) == 3
     assert mixed[1] == {"formId": 10, "data": {"AGE": 31}}
-    with pytest.raises(TypeError, match="mappings or BaseRecordRequest"):
+    with pytest.raises(TypeError, match="BaseRecordRequest or Mapping"):
         normalize_records_input([123])  # type: ignore[list-item]
 
     # 3. normalize_subject_registration_inputs applies default_form_id / default_site_id and schema lookup

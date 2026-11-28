@@ -151,3 +151,27 @@ def test_default_retry_policy_does_not_retry_unknown_method_on_server_error():
     state = RetryState(attempt_number=1, result=response, method=None)
 
     assert policy.should_retry(state) is False
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE", "HEAD", "OPTIONS"])
+def test_default_retry_policy_retries_idempotent_methods_on_408(method: str) -> None:
+    """DefaultRetryPolicy retries HTTP 408 Request Timeout for idempotent methods."""
+    policy = DefaultRetryPolicy()
+    request = httpx.Request(method, "https://example.com")
+    response = httpx.Response(408, request=request)
+    state = RetryState(attempt_number=1, result=response, method=method)
+
+    assert policy.should_retry(state) is True
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH", None])
+def test_default_retry_policy_does_not_retry_non_idempotent_or_unknown_on_408(
+    method: str | None,
+) -> None:
+    """DefaultRetryPolicy never retries HTTP 408 for non-idempotent or unknown methods."""
+    policy = DefaultRetryPolicy()
+    request = httpx.Request(method or "POST", "https://example.com")
+    response = httpx.Response(408, request=request)
+    state = RetryState(attempt_number=1, result=response, method=method)
+
+    assert policy.should_retry(state) is False

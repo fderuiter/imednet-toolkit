@@ -7,6 +7,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from imednet.cli.utils.export import resolve_cli_phi_fields
     from imednet.core.context import (
         extract_sdk_base_url,
         extract_sdk_security_key,
@@ -132,7 +133,14 @@ if TYPE_CHECKING:
         normalize_records_input,
         normalize_tabular_row,
     )
-    from imednet.utils.typing import FilterScalar, FilterValue, ItemId, JsonDict, RecordsInput
+    from imednet.utils.typing import (
+        DataFrameLike,
+        FilterScalar,
+        FilterValue,
+        ItemId,
+        JsonDict,
+        RecordsInput,
+    )
     from imednet.utils.url import (
         normalize_cache_origin,
         redact_sensitive_text,
@@ -154,6 +162,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "CompiledRecordPredicate",
     ),
     "DEFAULT_BATCH_CHUNK_SIZE": ("imednet.utils.batch_coordinator", "DEFAULT_BATCH_CHUNK_SIZE"),
+    "DataFrameLike": ("imednet.utils.typing", "DataFrameLike"),
     "DefaultRetryPolicy": ("imednet.core.retry", "DefaultRetryPolicy"),
     "ELIGIBLE_SITE_ENROLLMENT_STATUSES": (
         "imednet.utils.enrollment",
@@ -276,6 +285,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "redact_url_query": ("imednet.utils.url", "redact_url_query"),
     "reset_base_url_context": ("imednet.core.context", "reset_base_url_context"),
     "reset_security_key_context": ("imednet.core.context", "reset_security_key_context"),
+    "resolve_cli_phi_fields": ("imednet.cli.utils.export", "resolve_cli_phi_fields"),
     "resolve_enrichment_pipeline": (
         "imednet.integrations.enrichment",
         "resolve_enrichment_pipeline",
@@ -344,6 +354,7 @@ __all__ = [
     "BatchCoordinator",
     "BatchSubmissionSummary",
     "CompiledRecordPredicate",
+    "DataFrameLike",
     "DefaultRetryPolicy",
     "EnrichmentPipeline",
     "FilterScalar",
@@ -425,6 +436,7 @@ __all__ = [
     "redact_url_query",
     "reset_base_url_context",
     "reset_security_key_context",
+    "resolve_cli_phi_fields",
     "resolve_enrichment_pipeline",
     "resolve_sdk_base_url",
     "resolve_sdk_result_fetcher",

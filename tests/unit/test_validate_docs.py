@@ -23,12 +23,14 @@ from scripts.build_docs import (
 from scripts.validate_docs import (
     RETIRED_GITHUB_LABELS,
     WORKSPACE_PACKAGE_IDS,
+    _find_stale_schema_cache_claims,
     _verify_api_reference_parity,
     _verify_core_html,
     _verify_pagination_html,
     _verify_sdk_html,
     check_adr_records,
     check_cli_snippets,
+    check_clinical_guides_parity,
     check_compliance_html_links,
     check_diataxis_sidebar_isolation,
     check_documented_extras,
@@ -1053,6 +1055,7 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_adr_records() is False
     assert check_env_vars_documented() is False
     assert check_sdtm_and_phi_parity() is False
+    assert check_clinical_guides_parity() is False
     assert check_duckdb_relations_parity() is False
 
     empty_root = tmp_path / "empty_workspace"
@@ -1071,6 +1074,7 @@ def test_validate_docs_checks_pass_outside_repo_root_and_fail_fast_on_missing_di
     assert check_adr_records(empty_root) is True
     assert check_env_vars_documented(empty_root) is True
     assert check_sdtm_and_phi_parity(empty_root) is True
+    assert check_clinical_guides_parity(empty_root) is True
     assert check_duckdb_relations_parity(empty_root) is True
 
 
@@ -1377,7 +1381,7 @@ def test_check_duckdb_relations_parity_passes_repo_and_rejects_stale_names(tmp_p
 
 
 def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -> None:
-    """Sphinx renders RecordRevision.validate_chain and resolves imednet.spi.* links verified by check_compliance_html_links."""
+    """Sphinx renders RecordRevision.validate_chain and resolves imednet.spi.* and imednet.datadict.* links."""
     repo_root = Path(__file__).resolve().parents[2]
     src_dir = tmp_path / "docs_src"
     html_dir = tmp_path / "html_out"
@@ -1388,10 +1392,14 @@ def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -
         "Index\n=====\n\n.. toctree::\n\n"
         "   how-to/audit_compliance\n"
         "   how-to/record_mapping\n"
+        "   how-to/data_dictionary\n"
         "   explanation/architecture\n"
         "   explanation/api_overview\n"
+        "   explanation/schema_validation\n"
         "   reference/governance\n"
         "   reference/api/imednet.models\n"
+        "   reference/api/imednet.datadict\n"
+        "   reference/api/imednet.validation\n"
         "   reference/api/imednet.integrations\n"
         "   reference/api/imednet.auth\n"
         "   reference/api/imednet_workflows\n",
@@ -1412,8 +1420,21 @@ def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -
     )
     (src_dir / "how-to" / "record_mapping.rst").write_text(
         "Record Mapping\n==============\n\n"
-        "Call :func:`~imednet.spi.models.transform_records_to_sdtm_rows` and "
-        ":func:`~imednet.spi.sink_base.evaluate_standards_readiness`.\n",
+        "Call :func:`~imednet.spi.models.transform_records_to_sdtm_rows`, "
+        ":func:`~imednet.spi.sink_base.evaluate_standards_readiness`, and "
+        ":class:`~imednet.integrations.enrichment.EnrichmentPipeline`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "how-to" / "data_dictionary.rst").write_text(
+        "Data Dictionary\n===============\n\n"
+        "Use :class:`~imednet.datadict.RangeCheckConstraint` and "
+        ":func:`~imednet.datadict.validate_regex_pattern`.\n",
+        encoding="utf-8",
+    )
+    (src_dir / "explanation" / "schema_validation.rst").write_text(
+        "Schema Validation\n=================\n\n"
+        "Use :class:`~imednet.validation.cache.BaseSchemaCache` and "
+        ":func:`~imednet.validation.cache.validate_record_data`.\n",
         encoding="utf-8",
     )
     (src_dir / "reference" / "governance.rst").write_text(
@@ -1437,9 +1458,25 @@ def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -
         "   :members:\n",
         encoding="utf-8",
     )
+    (src_dir / "reference" / "api" / "imednet.datadict.rst").write_text(
+        "imednet.datadict\n================\n\n"
+        ".. automodule:: imednet.datadict\n"
+        "   :members:\n\n"
+        ".. automodule:: imednet.datadict.logic\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
+    (src_dir / "reference" / "api" / "imednet.validation.rst").write_text(
+        "imednet.validation\n==================\n\n"
+        ".. automodule:: imednet.validation.cache\n"
+        "   :members:\n",
+        encoding="utf-8",
+    )
     (src_dir / "reference" / "api" / "imednet.integrations.rst").write_text(
         "imednet.integrations\n====================\n\n"
         ".. automodule:: imednet.integrations.sink_base\n"
+        "   :members:\n\n"
+        ".. automodule:: imednet.integrations.enrichment\n"
         "   :members:\n",
         encoding="utf-8",
     )
@@ -1479,9 +1516,19 @@ def test_sphinx_shadowed_methods_and_spi_compliance_html_links(tmp_path: Path) -
 
     # Corrupting an anchor must fail check_compliance_html_links
     arch_html = html_dir / "explanation" / "architecture.html"
+    orig_arch = arch_html.read_text(encoding="utf-8")
     arch_html.write_text(
-        arch_html.read_text(encoding="utf-8").replace(
-            "#imednet.models.sdtm.transform_records_to_sdtm_rows", "#broken.anchor"
+        orig_arch.replace("#imednet.models.sdtm.transform_records_to_sdtm_rows", "#broken.anchor"),
+        encoding="utf-8",
+    )
+    assert check_compliance_html_links(html_dir, require_exists=True) is True
+    arch_html.write_text(orig_arch, encoding="utf-8")
+
+    # Corrupting a datadict re-export anchor must also fail check_compliance_html_links
+    dd_html = html_dir / "how-to" / "data_dictionary.html"
+    dd_html.write_text(
+        dd_html.read_text(encoding="utf-8").replace(
+            "#imednet.datadict.logic.RangeCheckConstraint", "#broken.range_check"
         ),
         encoding="utf-8",
     )
@@ -1628,3 +1675,145 @@ def test_sphinx_mini_build_emits_accessible_link_labels_and_rejects_regressions(
     )
     assert check_rendered_api_reference(subset_dir) is True
     mod_page.write_text(orig_mod, encoding="utf-8")
+
+
+def test_check_clinical_guides_parity_passes_repo_and_rejects_drift(tmp_path: Path) -> None:
+    """check_clinical_guides_parity fails when validation policies, regex caps, exports, or scoping rules drift."""
+    repo_root = Path(__file__).resolve().parents[2]
+    assert check_clinical_guides_parity(repo_root) is False
+
+    rel_files = (
+        "docs/explanation/schema_validation.rst",
+        "docs/how-to/data_dictionary.rst",
+        "docs/how-to/caching.rst",
+        "docs/how-to/record_mapping.rst",
+        "packages/core/src/imednet/datadict/__init__.py",
+    )
+    originals: dict[str, str] = {}
+    for rel in rel_files:
+        src_text = (repo_root / rel).read_text(encoding="utf-8")
+        originals[rel] = src_text
+        dst = tmp_path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(src_text, encoding="utf-8")
+
+    assert check_clinical_guides_parity(tmp_path) is False
+
+    def _assert_mutation_fails(rel: str, mutated_text: str) -> None:
+        target = tmp_path / rel
+        target.write_text(mutated_text, encoding="utf-8")
+        try:
+            assert check_clinical_guides_parity(tmp_path) is True, (
+                f"Expected check_clinical_guides_parity to fail on mutation to {rel}"
+            )
+        finally:
+            target.write_text(originals[rel], encoding="utf-8")
+
+    # 1. Stale BaseSchemaCache skip claims fail parity across all three schema guides
+    _assert_mutation_fails(
+        "docs/explanation/schema_validation.rst",
+        originals["docs/explanation/schema_validation.rst"]
+        + "\nBaseSchemaCache returns early—skipping required policies.\n",
+    )
+    _assert_mutation_fails(
+        "docs/explanation/schema_validation.rst",
+        originals["docs/explanation/schema_validation.rst"].replace(
+            "   * - Required Variable policies (``Yes`` raises error; ``Auto Query`` logs warning) on active Variables\n     - Enforced",
+            "   * - Required Variable policies (``Yes`` raises error; ``Auto Query`` logs warning) on active Variables\n     - Skipped",
+        ),
+    )
+    _assert_mutation_fails(
+        "docs/how-to/caching.rst",
+        originals["docs/how-to/caching.rst"]
+        + "\n- **Skipped by** ``SchemaCache``: Required Variable policies (``Yes`` and ``Auto Query``).\n",
+    )
+    _assert_mutation_fails(
+        "docs/how-to/data_dictionary.rst",
+        originals["docs/how-to/data_dictionary.rst"]
+        + "\nUnlike SchemaCache (which only checks Form existence, unknown Variables, and basic scalar types).\n",
+    )
+
+    # 2. Removing masked_phi / ***MASKED*** or _retired_form_variables fails parity
+    _assert_mutation_fails(
+        "docs/explanation/schema_validation.rst",
+        originals["docs/explanation/schema_validation.rst"].replace(
+            "``***MASKED***``", "``REDACTED``"
+        ),
+    )
+    _assert_mutation_fails(
+        "docs/explanation/schema_validation.rst",
+        originals["docs/explanation/schema_validation.rst"].replace(
+            "``_retired_form_variables``", "``_legacy_vars``"
+        ),
+    )
+
+    # 3. Mutating regex caps (512, 256, 1024), unsafe_regex, or ODM comparators fails parity
+    for token, replacement in (
+        ("``512``", "``999``"),
+        ("``256``", "``128``"),
+        ("``1024``", "``4096``"),
+        ("unsafe_regex", "bad_pattern"),
+        ("``NOTIN``", "``EXCL``"),
+        ("range_check_soft", "soft_warn"),
+    ):
+        _assert_mutation_fails(
+            "docs/how-to/data_dictionary.rst",
+            originals["docs/how-to/data_dictionary.rst"].replace(token, replacement),
+        )
+
+    # 4. Omitting RangeCheckConstraint or validate_regex_pattern from imednet.datadict.__all__ fails parity
+    _assert_mutation_fails(
+        "packages/core/src/imednet/datadict/__init__.py",
+        originals["packages/core/src/imednet/datadict/__init__.py"].replace(
+            '"RangeCheckConstraint",\n', ""
+        ),
+    )
+    _assert_mutation_fails(
+        "packages/core/src/imednet/datadict/__init__.py",
+        originals["packages/core/src/imednet/datadict/__init__.py"].replace(
+            '"validate_regex_pattern",\n', ""
+        ),
+    )
+
+    # 5. Mutating EnrichmentPipeline scoping, fallback_value, or domain.variable terminology fails parity
+    for token, replacement in (
+        ("``(domain, source_form_key, source_variable_name)``", "``(source_variable_name,)``"),
+        ("``fallback_value``", "``default_val``"),
+        ("``domain.variable``", "``raw_var``"),
+        ('domain="AE"', 'study="STUDY"'),
+        ('form_key="F_AE"', 'site="SITE"'),
+    ):
+        _assert_mutation_fails(
+            "docs/how-to/record_mapping.rst",
+            originals["docs/how-to/record_mapping.rst"].replace(token, replacement),
+        )
+
+
+def test_find_stale_schema_cache_claims_handles_multiline_and_adversarial_inputs_linearly() -> None:
+    """_find_stale_schema_cache_claims detects multiline RST bullets without regex backtracking."""
+    import time
+
+    assert _find_stale_schema_cache_claims(
+        "- **Skipped by** ``BaseSchemaCache``:\n"
+        "  Choice codelist membership, and Required\n"
+        "  Variable policies.\n"
+    ) == ["Skipped by bullet listing Required Variable policies"]
+
+    assert (
+        _find_stale_schema_cache_claims(
+            "- **Skipped by** ``BaseSchemaCache``:\n"
+            "  Choice codelist membership and XML rules.\n\n"
+            "Active Required Variable policies are enforced.\n"
+        )
+        == []
+    )
+
+    # Adversarial CodeQL ReDoS inputs with thousands of repeated '  \n' / continuation lines run in O(N)
+    adversarial_blank_lines = "- **skipped by**\n" + ("  \n" * 5000) + "Required Variable\n"
+    adversarial_continuations = "- **skipped by**\n" + ("  item\n" * 5000) + "end\n"
+
+    start = time.perf_counter()
+    assert _find_stale_schema_cache_claims(adversarial_blank_lines) == []
+    assert _find_stale_schema_cache_claims(adversarial_continuations) == []
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.25, f"Expected linear-time scan (<0.25s), took {elapsed:.3f}s"
