@@ -5,6 +5,7 @@ Provides an incremental record centralization pipeline using DuckDB.
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Iterable, Sequence
 from contextlib import suppress
@@ -14,16 +15,19 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, Self
 from uuid import uuid4
 
+from imednet.spi.models import validate_record_revision_chain
 from imednet.spi.utils import (
     SensitivityRegistry,
     build_study_sensitivity_registry,
+    global_sensitivity_registry,
     is_async_facade,
     mask_clinical_phi,
-    mask_custom_phi_recursive,
     maybe_to_thread,
     parse_iso_datetime,
+    resolve_cli_phi_fields,
     resolve_enrichment_pipeline,
     sanitize_diagnostic_text,
+    sdk_governance_context,
 )
 
 from ._workflow_helpers import ensure_sync_workflow_mode
@@ -34,7 +38,19 @@ if TYPE_CHECKING:
     from imednet.spi.models import RecordRevision
 
 
+_ORIG_RESOLVE_PIPELINE = resolve_enrichment_pipeline
 _SAFE_STUDY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
+
+
+def _extractor_accepts_kwarg(fn: Any, kwarg: str) -> bool:
+    """Return True when *fn* accepts *kwarg* or arbitrary ``**kwargs``."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == kwarg for p in params)
+
+
 _BRONZE_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
     ("study_key", "object"),
     ("record_revision_id", "Int64"),
@@ -118,6 +134,59 @@ class _DuckDBCentralizerBase:
             if row[1] is None or last_index_by_key[(row[0], row[1])] == idx
         ]
 
+    def _validate_merged_bronze_chains_sync(
+        self,
+        study_keys: Sequence[str],
+        *,
+        allow_partial: bool,
+    ) -> None:
+        """Validate monotonic chain and tombstone invariants across merged bronze_revisions."""
+        for sk in study_keys:
+            merged_rows = self._connection.execute(
+                """
+                SELECT
+                    study_key,
+                    record_revision_id,
+                    record_id,
+                    record_oid,
+                    record_revision,
+                    data_revision,
+                    record_status,
+                    deleted,
+                    date_created
+                FROM bronze_revisions
+                WHERE study_key = ?
+                ORDER BY
+                    record_id ASC NULLS LAST,
+                    record_oid ASC NULLS LAST,
+                    record_revision ASC NULLS FIRST,
+                    date_created ASC NULLS LAST,
+                    record_revision_id ASC NULLS LAST
+                """,
+                [sk],
+            ).fetchall()
+            if not merged_rows:
+                continue
+            merged_payloads = [
+                {
+                    "study_key": row[0],
+                    "record_revision_id": row[1],
+                    "record_id": row[2],
+                    "record_oid": (
+                        f"rev:{row[1]}"
+                        if row[2] is None and row[3] == "***MASKED***" and row[1] is not None
+                        else row[3]
+                    ),
+                    "record_revision": row[4],
+                    "data_revision": row[5],
+                    "record_status": row[6],
+                    "deleted": row[7],
+                    "date_created": row[8],
+                }
+                for row in merged_rows
+            ]
+            validate_record_revision_chain(merged_payloads, allow_partial=allow_partial)
+
     def _ingest_fetched_revisions_sync(
         self,
         study_key: str,
@@ -125,10 +194,13 @@ class _DuckDBCentralizerBase:
         *,
         mode: Literal["append", "replace"],
         effective_mask_phi: bool,
+        validate_chain: bool = False,
+        effective_allow_partial: bool = False,
     ) -> int:
         """Write extracted RecordRevision models into the DuckDB bronze_revisions table."""
+        revisions_list = list(revisions)
         rows = self._deduplicate_rows(
-            self._to_rows(study_key, revisions, mask_phi=effective_mask_phi)
+            self._to_rows(study_key, revisions_list, mask_phi=effective_mask_phi)
         )
         staging_relation = self._build_staging_relation(rows) if rows else None
 
@@ -141,11 +213,25 @@ class _DuckDBCentralizerBase:
                         "DELETE FROM bronze_revisions WHERE study_key = ?",
                         [study_key],
                     )
+                    if validate_chain:
+                        validate_record_revision_chain(
+                            revisions_list,
+                            allow_partial=effective_allow_partial,
+                        )
                     self._connection.execute("COMMIT")
                 except BaseException:
                     with suppress(Exception):
                         self._connection.execute("ROLLBACK")
                     raise
+            elif validate_chain:
+                validate_record_revision_chain(
+                    revisions_list,
+                    allow_partial=effective_allow_partial,
+                )
+                self._validate_merged_bronze_chains_sync(
+                    [study_key],
+                    allow_partial=effective_allow_partial,
+                )
             return 0
 
         existing_overlap_count = 0
@@ -235,6 +321,16 @@ class _DuckDBCentralizerBase:
                     FROM "{view_name}"
                     """
                 self._connection.execute(insert_query)  # nosem
+                if validate_chain:
+                    validate_record_revision_chain(
+                        revisions_list,
+                        allow_partial=effective_allow_partial,
+                    )
+                    affected_keys = sorted({str(row[0]) for row in rows} | {study_key})
+                    self._validate_merged_bronze_chains_sync(
+                        affected_keys,
+                        allow_partial=effective_allow_partial,
+                    )
                 self._connection.execute("COMMIT")
             except BaseException:
                 with suppress(Exception):
@@ -377,8 +473,12 @@ class _DuckDBCentralizerBase:
                 data_changed,
                 CASE
                     WHEN COALESCE(deleted, FALSE) AND NOT COALESCE(prev_deleted, FALSE) THEN 'deleted'
-                    WHEN NOT _has_prev THEN 'created'
-                    WHEN data_changed THEN 'data_updated'
+                    WHEN NOT _has_prev THEN
+                        CASE
+                            WHEN record_revision IS NULL OR record_revision <= 1 THEN 'created'
+                            ELSE 'window_baseline'
+                        END
+                    WHEN COALESCE(data_changed, FALSE) THEN 'data_updated'
                     WHEN record_status IS DISTINCT FROM prev_record_status THEN 'status_changed'
                     ELSE 'metadata_updated'
                 END AS change_type,
@@ -409,7 +509,12 @@ class _DuckDBCentralizerBase:
                     LAG(data_revision) OVER rev_window AS prev_data_revision,
                     LAG(deleted) OVER rev_window AS prev_deleted,
                     CASE
-                        WHEN LAG(1) OVER rev_window IS NULL THEN COALESCE(data_revision, 0) > 0
+                        WHEN LAG(1) OVER rev_window IS NULL THEN
+                            CASE
+                                WHEN record_revision IS NULL OR record_revision <= 1
+                                    THEN COALESCE(data_revision, 0) > 0
+                                ELSE CAST(NULL AS BOOLEAN)
+                            END
                         ELSE COALESCE(data_revision, 0) > COALESCE(LAG(data_revision) OVER rev_window, 0)
                     END AS data_changed,
                     COALESCE(date_created, last_updated) AS valid_from,
@@ -530,16 +635,22 @@ class _DuckDBCentralizerBase:
         """Internal helper to convert RecordRevision models into database rows."""
         self._validate_study_key(study_key)
         effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
-        phi_context_cache: dict[str, tuple[set[str], SensitivityRegistry]] = {}
+        phi_context_cache: dict[str, SensitivityRegistry] = {}
+        sdk_ref = getattr(self, "_sdk", None)
 
-        def _resolve_phi_context(sk: str) -> tuple[set[str], SensitivityRegistry]:
+        def _resolve_phi_context(sk: str) -> SensitivityRegistry:
             if sk not in phi_context_cache:
-                pipeline = resolve_enrichment_pipeline(sk)
-                custom_keys = set(pipeline.phi_keys) if pipeline is not None else set()
-                phi_context_cache[sk] = (
-                    custom_keys,
-                    build_study_sensitivity_registry(custom_keys),
-                )
+                custom_keys = set(resolve_cli_phi_fields(sk, sdk=sdk_ref))
+                if resolve_enrichment_pipeline is not _ORIG_RESOLVE_PIPELINE:
+                    with sdk_governance_context(sdk_ref):
+                        pipeline = resolve_enrichment_pipeline(sk)
+                    if pipeline is not None and getattr(pipeline, "phi_keys", None):
+                        custom_keys.update(
+                            str(k)
+                            for k in pipeline.phi_keys
+                            if not global_sensitivity_registry.is_exempt(str(k))
+                        )
+                phi_context_cache[sk] = build_study_sensitivity_registry(custom_keys)
             return phi_context_cache[sk]
 
         for revision in revisions:
@@ -547,6 +658,13 @@ class _DuckDBCentralizerBase:
             rev_study_key = self._validate_study_key(raw_study_key) if raw_study_key else study_key
             rev_study_str = str(rev_study_key)
             deleted_val = getattr(revision, "deleted", False)
+
+            record_revision_id = self._optional_int(getattr(revision, "record_revision_id", None))
+            record_id = self._optional_int(getattr(revision, "record_id", None))
+            site_id = self._optional_int(getattr(revision, "site_id", None))
+            interval_id = self._optional_int(getattr(revision, "interval_id", None))
+            date_created = self._optional_timestamp(getattr(revision, "date_created", None))
+            last_updated = self._optional_timestamp(getattr(revision, "last_updated", None))
 
             record_oid = self._optional_str(getattr(revision, "record_oid", None))
             form_key = self._optional_str(getattr(revision, "form_key", None))
@@ -557,7 +675,7 @@ class _DuckDBCentralizerBase:
             reason_val = self._optional_str(getattr(revision, "reason_for_change", None))
 
             if effective_mask_phi:
-                custom_phi_keys, active_registry = _resolve_phi_context(rev_study_str)
+                active_registry = _resolve_phi_context(rev_study_str)
                 raw_str_map: dict[str, Any] = {
                     k: v
                     for k, v in (
@@ -573,8 +691,6 @@ class _DuckDBCentralizerBase:
                 }
                 if raw_str_map:
                     masked_map = mask_clinical_phi(raw_str_map, registry=active_registry)
-                    if custom_phi_keys:
-                        masked_map = mask_custom_phi_recursive(masked_map, custom_phi_keys)
                     record_oid = masked_map.get("record_oid")
                     form_key = masked_map.get("form_key")
                     subject_key = masked_map.get("subject_key")
@@ -584,16 +700,26 @@ class _DuckDBCentralizerBase:
                     reason_val = masked_map.get("reason_for_change")
                     if isinstance(reason_val, str) and reason_val != "***MASKED***":
                         reason_val = sanitize_diagnostic_text(reason_val, registry=active_registry)
+                if active_registry.is_sensitive("record_revision_id"):
+                    record_revision_id = None
+                if active_registry.is_sensitive("site_id"):
+                    site_id = None
+                if active_registry.is_sensitive("interval_id"):
+                    interval_id = None
+                if active_registry.is_sensitive("date_created"):
+                    date_created = None
+                if active_registry.is_sensitive("last_updated"):
+                    last_updated = None
 
             yield (
                 rev_study_str,
-                self._optional_int(getattr(revision, "record_revision_id", None)),
-                self._optional_int(getattr(revision, "record_id", None)),
+                record_revision_id,
+                record_id,
                 record_oid,
                 form_key,
                 subject_key,
-                self._optional_int(getattr(revision, "site_id", None)),
-                self._optional_int(getattr(revision, "interval_id", None)),
+                site_id,
+                interval_id,
                 record_status,
                 self._optional_int(getattr(revision, "record_revision", None)),
                 self._optional_int(getattr(revision, "data_revision", None)),
@@ -601,8 +727,8 @@ class _DuckDBCentralizerBase:
                 role_val,
                 reason_val,
                 False if deleted_val is None else bool(deleted_val),
-                self._optional_timestamp(getattr(revision, "date_created", None)),
-                self._optional_timestamp(getattr(revision, "last_updated", None)),
+                date_created,
+                last_updated,
             )
 
     @staticmethod
@@ -680,17 +806,26 @@ class AsyncDuckDBIngestionWorkflow(_DuckDBCentralizerBase):
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
         mask_phi: bool | None = None,
+        validate_chain: bool = False,
+        allow_partial: bool | None = None,
     ) -> int:
         """Asynchronously fetch RecordRevisions and write to the bronze_revisions table."""
         self._validate_study_key(study_key)
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be one of: 'append', 'replace'")
         effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
+        effective_allow_partial = (
+            bool(allow_partial) if allow_partial is not None else bool(start_date or end_date)
+        )
+        fetch_kwargs: dict[str, Any] = {}
+        if validate_chain and _extractor_accepts_kwarg(self._extractor.extract_audit_trail, "sort"):
+            fetch_kwargs["sort"] = "recordRevision,asc"
 
         revisions = await self._extractor.extract_audit_trail(
             study_key,
             start_date=start_date,
             end_date=end_date,
+            **fetch_kwargs,
         )
         return await maybe_to_thread(
             self._ingest_fetched_revisions_sync,
@@ -698,6 +833,8 @@ class AsyncDuckDBIngestionWorkflow(_DuckDBCentralizerBase):
             revisions,
             mode=mode,
             effective_mask_phi=effective_mask_phi,
+            validate_chain=bool(validate_chain),
+            effective_allow_partial=effective_allow_partial,
         )
 
     async def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:
@@ -739,6 +876,8 @@ class DuckDBIngestionWorkflow(_DuckDBCentralizerBase):
         end_date: str | None = None,
         mode: Literal["append", "replace"] = "append",
         mask_phi: bool | None = None,
+        validate_chain: bool = False,
+        allow_partial: bool | None = None,
     ) -> int:
         """Fetch RecordRevisions and write to the bronze_revisions table."""
         ensure_sync_workflow_mode(
@@ -751,17 +890,26 @@ class DuckDBIngestionWorkflow(_DuckDBCentralizerBase):
         if mode not in {"append", "replace"}:
             raise ValueError("mode must be one of: 'append', 'replace'")
         effective_mask_phi = self._mask_phi if mask_phi is None else bool(mask_phi)
+        effective_allow_partial = (
+            bool(allow_partial) if allow_partial is not None else bool(start_date or end_date)
+        )
+        fetch_kwargs: dict[str, Any] = {}
+        if validate_chain and _extractor_accepts_kwarg(self._extractor.extract_audit_trail, "sort"):
+            fetch_kwargs["sort"] = "recordRevision,asc"
 
         revisions = self._extractor.extract_audit_trail(
             study_key,
             start_date=start_date,
             end_date=end_date,
+            **fetch_kwargs,
         )
         return self._ingest_fetched_revisions_sync(
             study_key,
             revisions,
             mode=mode,
             effective_mask_phi=effective_mask_phi,
+            validate_chain=bool(validate_chain),
+            effective_allow_partial=effective_allow_partial,
         )
 
     def build_silver_view(self, study_key: str, *, include_deleted: bool = False) -> None:

@@ -23,6 +23,9 @@ from imednet.spi.cdisc import (
     DatasetJsonEnvelope,
     build_dataset_json_bundle,
     build_dataset_json_envelope,
+    deduplicate_sdtm_rows,
+    format_nested_variable_name,
+    prefix_colliding_variable_name,
 )
 from imednet.spi.endpoints import Record as RecordModel
 from imednet.spi.endpoints import Variable as VariableModel
@@ -35,6 +38,9 @@ from imednet.spi.models import (
     _iter_sorted_sdtm_frames,
     _SdtmNormalizer,
     format_iso8601_dtc,
+    format_variable_name,
+    normalize_naming_convention,
+    resolve_sdtm_domain,
 )
 from imednet.spi.models import (
     transform_records_to_sdtm as _core_transform_records_to_sdtm,
@@ -164,7 +170,7 @@ def transform_records_to_dataset_json(
     *,
     forms: Iterable[Any] = (),
     variables: Iterable[Any] = (),
-    as_sdtm: bool = False,
+    as_sdtm: bool | None = None,
     domain: str | None = None,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -216,7 +222,7 @@ def transform_records_to_dataset_json_bundle(
     *,
     forms: Iterable[Any] = (),
     variables: Iterable[Any] = (),
-    as_sdtm: bool = False,
+    as_sdtm: bool | None = None,
     domain: str | None = None,
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
@@ -1062,7 +1068,13 @@ class RecordMapper:
         pipeline = self._get_enrichment_pipeline(sk_str)
         if pipeline is not None:
             parsed = pipeline.process(parsed, mask_phi=should_mask)
-        return {**meta, **parsed}
+        merged_row = dict(meta)
+        for pk, pv in parsed.items():
+            if pk in meta:
+                merged_row[f"var_{pk}"] = pv
+            else:
+                merged_row[pk] = pv
+        return merged_row
 
     def _uses_standard_parse_record(self) -> bool:
         """Return True when ``self._parse_record`` has not been overridden or monkeypatched."""
@@ -1242,8 +1254,11 @@ class RecordMapper:
         *,
         mask_phi: bool | None = None,
         study_key: str | None = None,
+        naming_convention: str | None = None,
+        domain: str | None = None,
     ) -> pd.DataFrame:
         """Create the output DataFrame from parsed rows."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         df = pd.DataFrame(rows)
         if df.empty:
             return df
@@ -1282,14 +1297,15 @@ class RecordMapper:
             "dateCreated",
         ]
 
-        unique_effective_var_keys = list(
-            dict.fromkeys(key for key in effective_var_keys if key not in meta_cols)
-        )
+        unique_effective_var_keys = list(dict.fromkeys(effective_var_keys))
+        var_source_cols: list[tuple[str, str]] = []
         for key in unique_effective_var_keys:
-            if key not in df.columns:
-                df[key] = pd.NA
+            src_col = f"var_{key}" if key in meta_cols else key
+            if src_col not in df.columns:
+                df[src_col] = pd.NA
+            var_source_cols.append((key, src_col))
 
-        df = df[meta_cols + unique_effective_var_keys]
+        df = df[meta_cols + [src_col for _, src_col in var_source_cols]]
         if should_mask:
             collapsed_phi_keys = {_collapse_alnum_key(pk) for pk in pipeline_phi_keys}
 
@@ -1304,18 +1320,23 @@ class RecordMapper:
                 if _is_header_sensitive(mcol):
                     df[mcol] = "***MASKED***"
 
-            sensitive_vars: list[str] = []
-            for key in unique_effective_var_keys:
+            sensitive_src_cols: list[str] = []
+            for key, src_col in var_source_cols:
                 if _is_header_sensitive(key):
-                    sensitive_vars.append(key)
+                    sensitive_src_cols.append(src_col)
                     continue
                 if use_labels:
                     mapped_label = str(label_map.get(key, key))
                     if mapped_label != key and _is_header_sensitive(mapped_label):
-                        sensitive_vars.append(key)
+                        sensitive_src_cols.append(src_col)
+                        continue
+                if canonical_conv is not None:
+                    formatted_cand = format_nested_variable_name(key, canonical_conv, domain=domain)
+                    if formatted_cand != key and _is_header_sensitive(formatted_cand):
+                        sensitive_src_cols.append(src_col)
 
-            for key in sensitive_vars:
-                df[key] = "***MASKED***"
+            for src_col in sensitive_src_cols:
+                df[src_col] = "***MASKED***"
 
             current_reg_snap = global_sensitivity_registry.snapshot()
             ingress_verified = (
@@ -1328,9 +1349,9 @@ class RecordMapper:
                 isinstance(rows, _IngressPreparedRows) and rows.has_nested_containers
             )
             if should_scan_containers:
-                sensitive_var_set = set(sensitive_vars)
+                sensitive_var_set = set(sensitive_src_cols)
                 non_sensitive_vars = [
-                    key for key in unique_effective_var_keys if key not in sensitive_var_set
+                    src_col for _, src_col in var_source_cols if src_col not in sensitive_var_set
                 ]
                 if non_sensitive_vars:
                     var_frame = df[non_sensitive_vars]
@@ -1347,9 +1368,34 @@ class RecordMapper:
                         else:
                             df[col] = _mask_series_nested_containers(target, pipeline_phi_keys)
 
-        if use_labels:
-            rename_map = {key: label_map.get(key, key) for key in unique_effective_var_keys}
-            df = df.rename(columns=rename_map)
+        final_meta_cols = (
+            [
+                format_variable_name(mcol, canonical_conv, domain=domain, is_metadata=True)
+                for mcol in meta_cols
+            ]
+            if canonical_conv is not None
+            else list(meta_cols)
+        )
+        reserved_meta_lower = {mc.lower() for mc in final_meta_cols}
+        used_lower = set(reserved_meta_lower)
+        final_var_cols: list[str] = []
+        for key, _ in var_source_cols:
+            if use_labels:
+                raw_target = str(label_map.get(key, key))
+            elif canonical_conv is not None:
+                raw_target = format_nested_variable_name(key, canonical_conv, domain=domain)
+            else:
+                raw_target = key
+            unique_target = prefix_colliding_variable_name(
+                raw_target,
+                reserved_meta_lower,
+                convention=None if use_labels else canonical_conv,
+                used_lower=used_lower,
+            )
+            final_var_cols.append(unique_target)
+
+        df = df.copy()
+        df.columns = pd.Index(final_meta_cols + final_var_cols)
 
         effective_phi_keys: Iterable[str] = (
             (rows.phi_keys | required_phi_snap)
@@ -1374,10 +1420,12 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        naming_convention: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield mapped record DataFrames in bounded chunks."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         if as_sdtm:
             target_domain = domain or "AE"
             yield from self.iter_sdtm_dataframes(
@@ -1386,6 +1434,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                naming_convention=canonical_conv,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
             )
@@ -1423,6 +1472,9 @@ class RecordMapper:
                 label_map,
                 use_labels_as_columns,
                 mask_phi=mask_phi,
+                study_key=study_key,
+                naming_convention=canonical_conv,
+                domain=domain,
             )
             if df.empty:
                 continue
@@ -1445,6 +1497,8 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
+        domain: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         records: Iterable[RecordModel] | None = None,
@@ -1452,6 +1506,7 @@ class RecordMapper:
         """Generate a nested JSON tree structure up to three levels deep."""
         from imednet_workflows.study_structure import get_study_structure
 
+        canonical_conv = normalize_naming_convention(naming_convention)
         self._active_study_key = study_key
         should_mask = self.mask_phi if mask_phi is None else mask_phi
         pipeline = self._get_enrichment_pipeline(study_key)
@@ -1518,9 +1573,54 @@ class RecordMapper:
             "recordStatus",
             "dateCreated",
         }
+        subj_node_k = (
+            format_variable_name("subject_key", canonical_conv, domain=domain, is_metadata=True)
+            if canonical_conv is not None
+            else "subject_key"
+        )
+        visits_node_k = (
+            format_variable_name("visits", canonical_conv, domain=domain, is_metadata=True)
+            if canonical_conv is not None
+            else "visits"
+        )
+        visit_id_k = (
+            format_variable_name("visit_id", canonical_conv, domain=domain, is_metadata=True)
+            if canonical_conv is not None
+            else "visit_id"
+        )
+        forms_node_k = (
+            format_variable_name("forms", canonical_conv, domain=domain, is_metadata=True)
+            if canonical_conv is not None
+            else "forms"
+        )
+        form_id_k = (
+            format_variable_name("form_id", canonical_conv, domain=domain, is_metadata=True)
+            if canonical_conv is not None
+            else "form_id"
+        )
+        records_node_k = (
+            format_variable_name("records", canonical_conv, domain=domain, is_metadata=True)
+            if canonical_conv is not None
+            else "records"
+        )
+        parent_rec_k = (
+            format_variable_name(
+                "parent_record_id", canonical_conv, domain=domain, is_metadata=True
+            )
+            if canonical_conv is not None
+            else "parent_record_id"
+        )
+
         collapsed_phi_keys = {_collapse_alnum_key(pk) for pk in pipeline_phi_keys}
         standard_parse = self._uses_standard_parse_record()
         tree: dict[str, dict[str, Any]] = {}
+
+        def _is_sensitive_key(header: str) -> bool:
+            return global_sensitivity_registry.is_sensitive(header) or (
+                bool(collapsed_phi_keys)
+                and not global_sensitivity_registry.is_exempt(header)
+                and _collapse_alnum_key(header) in collapsed_phi_keys
+            )
 
         for rec in record_iter:
             if rec.form_id not in form_models:
@@ -1554,34 +1654,9 @@ class RecordMapper:
                         parsed_data = mask_custom_phi_recursive(parsed_data, pipeline_phi_keys)
                 else:
                     for k in list(parsed_data):
-                        if global_sensitivity_registry.is_sensitive(k) or (
-                            bool(collapsed_phi_keys)
-                            and not global_sensitivity_registry.is_exempt(k)
-                            and _collapse_alnum_key(k) in collapsed_phi_keys
-                        ):
+                        raw_var_k = k[4:] if (k.startswith("var_") and k[4:] in meta_keys) else k
+                        if _is_sensitive_key(raw_var_k):
                             parsed_data[k] = "***MASKED***"
-
-            if use_labels_as_keys:
-                remapped: dict[str, Any] = {}
-                for k, v in parsed_data.items():
-                    if k in meta_keys:
-                        remapped[k] = v
-                    else:
-                        lbl = label_map.get(k)
-                        target_key = lbl if lbl is not None else k
-                        if target_key not in meta_keys:
-                            if should_mask and (
-                                global_sensitivity_registry.is_sensitive(target_key)
-                                or (
-                                    bool(collapsed_phi_keys)
-                                    and not global_sensitivity_registry.is_exempt(target_key)
-                                    and _collapse_alnum_key(target_key) in collapsed_phi_keys
-                                )
-                            ):
-                                remapped[target_key] = "***MASKED***"
-                            else:
-                                remapped[target_key] = v
-                parsed_data = remapped
 
             # Automatically perform lookups for parent record identifiers using available metadata
             resolved_parent_id = getattr(rec, "parent_record_id", None)
@@ -1590,49 +1665,110 @@ class RecordMapper:
                     f"{rec.visit_id}_{rec.form_id}" if rec.visit_id is not None else None
                 )
 
-            if "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") is None:
+            if use_labels_as_keys or canonical_conv is not None:
+                remapped: dict[str, Any] = {}
+                used_rec_lower: set[str] = {parent_rec_k.lower()}
+                reserved_rec_meta: set[str] = {parent_rec_k.lower()}
+                for k, v in parsed_data.items():
+                    if k in meta_keys:
+                        target_mk = (
+                            format_variable_name(k, canonical_conv, domain=domain, is_metadata=True)
+                            if canonical_conv is not None
+                            else k
+                        )
+                        remapped[target_mk] = v
+                        used_rec_lower.add(target_mk.lower())
+                        reserved_rec_meta.add(target_mk.lower())
+                    else:
+                        orig_vk = k[4:] if (k.startswith("var_") and k[4:] in meta_keys) else k
+                        val_out = (
+                            resolved_parent_id
+                            if (orig_vk == "parent_record_id" and v is None)
+                            else v
+                        )
+                        if use_labels_as_keys:
+                            lbl = label_map.get(orig_vk)
+                            base_vk = lbl if lbl is not None else orig_vk
+                        elif canonical_conv is not None:
+                            base_vk = format_nested_variable_name(
+                                orig_vk, canonical_conv, domain=domain
+                            )
+                        else:
+                            base_vk = orig_vk
+                        unique_vk = prefix_colliding_variable_name(
+                            base_vk,
+                            reserved_rec_meta,
+                            convention=None if use_labels_as_keys else canonical_conv,
+                            used_lower=used_rec_lower,
+                        )
+                        if should_mask and (
+                            _is_sensitive_key(base_vk) or _is_sensitive_key(unique_vk)
+                        ):
+                            remapped[unique_vk] = "***MASKED***"
+                        else:
+                            remapped[unique_vk] = val_out
+                if parent_rec_k not in remapped or remapped.get(parent_rec_k) is None:
+                    remapped[parent_rec_k] = resolved_parent_id
+                if (
+                    use_labels_as_keys
+                    and "parentRecordId" in remapped
+                    and remapped["parentRecordId"] is None
+                ):
+                    remapped["parentRecordId"] = resolved_parent_id
+                parsed_data = remapped
+            elif (
+                "parent_record_id" not in parsed_data or parsed_data.get("parent_record_id") is None
+            ):
                 parsed_data["parent_record_id"] = resolved_parent_id
-                if use_labels_as_keys and "parentRecordId" in parsed_data:
-                    parsed_data["parentRecordId"] = resolved_parent_id
 
             subj_key = rec.subject_key
             if subj_key not in tree:
-                tree[subj_key] = {"subject_key": subj_key, "visits": {}, "forms": {}}  # type: ignore
+                tree[subj_key] = {  # type: ignore
+                    subj_node_k: subj_key,
+                    visits_node_k: {},
+                    forms_node_k: {},
+                }
 
             subj_node = tree[subj_key]  # type: ignore
             form_id = rec.form_id
 
             visit_id = rec.visit_id
             if visit_id is None:
-                if form_id not in subj_node["forms"]:
-                    subj_node["forms"][form_id] = {"form_id": form_id, "records": []}
-                subj_node["forms"][form_id]["records"].append(parsed_data)
+                if form_id not in subj_node[forms_node_k]:
+                    subj_node[forms_node_k][form_id] = {form_id_k: form_id, records_node_k: []}
+                subj_node[forms_node_k][form_id][records_node_k].append(parsed_data)
             else:
-                if visit_id not in subj_node["visits"]:
-                    subj_node["visits"][visit_id] = {"visit_id": visit_id, "forms": {}}
+                if visit_id not in subj_node[visits_node_k]:
+                    subj_node[visits_node_k][visit_id] = {
+                        visit_id_k: visit_id,
+                        forms_node_k: {},
+                    }
 
-                visit_node = subj_node["visits"][visit_id]
+                visit_node = subj_node[visits_node_k][visit_id]
 
-                if form_id not in visit_node["forms"]:
-                    visit_node["forms"][form_id] = {"form_id": form_id, "records": []}
+                if form_id not in visit_node[forms_node_k]:
+                    visit_node[forms_node_k][form_id] = {
+                        form_id_k: form_id,
+                        records_node_k: [],
+                    }
 
-                form_node = visit_node["forms"][form_id]
-                form_node["records"].append(parsed_data)
+                form_node = visit_node[forms_node_k][form_id]
+                form_node[records_node_k].append(parsed_data)
 
         # 3. Convert dicts to lists
         result = []
         for subj_key, subj in tree.items():  # noqa: B007
             subj_visits = []
-            for visit_id, visit in subj["visits"].items():  # noqa: B007
+            for visit_id, visit in subj[visits_node_k].items():  # noqa: B007
                 visit_forms = []
-                for form_id, form in visit["forms"].items():  # noqa: B007
+                for form_id, form in visit[forms_node_k].items():  # noqa: B007
                     visit_forms.append(form)
-                visit["forms"] = visit_forms
+                visit[forms_node_k] = visit_forms
                 subj_visits.append(visit)
-            subj["visits"] = subj_visits
-            unscheduled_forms = list(subj.pop("forms", {}).values())
+            subj[visits_node_k] = subj_visits
+            unscheduled_forms = list(subj.pop(forms_node_k, {}).values())
             if unscheduled_forms:
-                subj["forms"] = unscheduled_forms
+                subj[forms_node_k] = unscheduled_forms
             result.append(subj)
 
         return result
@@ -1674,18 +1810,68 @@ class RecordMapper:
         domain: str,
         study_key: str,
         should_mask: bool,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
     ) -> pd.DataFrame:
+        canonical_conv = normalize_naming_convention(naming_convention)
         if not frames:
-            return transform_records_to_sdtm(
+            empty_df = transform_records_to_sdtm(
                 [],
                 domain=domain,
                 study_key=study_key,
                 mask_phi=should_mask,
                 enrichment_pipeline=self._get_enrichment_pipeline(study_key),
+                preserve_record_id=preserve_record_id,
+            )
+            return self._apply_sdtm_df_naming_convention(
+                empty_df, domain=domain, naming_convention=canonical_conv
             )
         combined = pd.concat(frames, ignore_index=True)
+        dom_clean = resolve_sdtm_domain(domain)
+        if not combined.empty and dom_clean == "DM" and (canonical_conv in (None, "sdtm")):
+            deduped_rows = deduplicate_sdtm_rows(combined.to_dict(orient="records"))
+            combined = pd.DataFrame(deduped_rows, columns=combined.columns)
         combined.attrs["imednet_sdtm_redacted"] = bool(should_mask)
-        return combined
+        return self._apply_sdtm_df_naming_convention(
+            combined, domain=domain, naming_convention=canonical_conv
+        )
+
+    @staticmethod
+    def _apply_sdtm_df_naming_convention(
+        df: pd.DataFrame,
+        *,
+        domain: str,
+        naming_convention: str | None,
+    ) -> pd.DataFrame:
+        canonical_conv = normalize_naming_convention(naming_convention)
+        if canonical_conv is None or canonical_conv == "sdtm" or len(df.columns) == 0:
+            return df
+        dom_clean = resolve_sdtm_domain(domain)
+        sdtm_meta = {"STUDYID", "DOMAIN", "USUBJID", f"{dom_clean}SEQ", "RECORD_ID"}
+        used_lower: set[str] = set()
+        new_cols: list[str] = []
+        for col in df.columns:
+            col_s = str(col)
+            is_meta = col_s in sdtm_meta
+            base = format_variable_name(
+                col_s, canonical_conv, domain=dom_clean, is_metadata=is_meta
+            )
+            if is_meta and base.lower() not in used_lower:
+                used_lower.add(base.lower())
+                new_cols.append(base)
+            else:
+                new_cols.append(
+                    prefix_colliding_variable_name(
+                        base,
+                        convention=canonical_conv,
+                        used_lower=used_lower,
+                    )
+                )
+        out = df.copy()
+        out.columns = pd.Index(new_cols)
+        if df.attrs.get("imednet_sdtm_redacted"):
+            out.attrs["imednet_sdtm_redacted"] = True
+        return out
 
     def sdtm_dataframe(
         self,
@@ -1695,10 +1881,13 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` transformed into a CDISC SDTM domain dataset."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         should_mask = self.mask_phi if mask_phi is None else mask_phi
         frames = list(
             self.iter_sdtm_dataframes(
@@ -1707,6 +1896,7 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                preserve_record_id=preserve_record_id,
                 mask_phi=should_mask,
                 include_deleted=include_deleted,
             )
@@ -1716,6 +1906,8 @@ class RecordMapper:
             domain=domain,
             study_key=study_key,
             should_mask=should_mask,
+            naming_convention=canonical_conv,
+            preserve_record_id=preserve_record_id,
         )
 
     @staticmethod
@@ -1756,10 +1948,13 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> Iterator[pd.DataFrame]:
         """Yield chunked pandas DataFrames transformed into an SDTM domain dataset."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         if variable_whitelist is not None and len(variable_whitelist) == 0:
             return
         effective_include_deleted = (
@@ -1883,6 +2078,7 @@ class RecordMapper:
             include_deleted=effective_include_deleted,
             mask_phi=should_mask,
             pipeline=pipeline,
+            preserve_record_id=preserve_record_id,
         )
         if normalizer.remaps_usubjid:
             source_is_ordered = False
@@ -1906,7 +2102,11 @@ class RecordMapper:
             source_is_ordered=source_is_ordered,
         ):
             if not df.empty:
-                yield df
+                yield self._apply_sdtm_df_naming_convention(
+                    df,
+                    domain=domain,
+                    naming_convention=canonical_conv,
+                )
 
     @staticmethod
     def _peek_mock_sdtm_stream_order(
@@ -1927,17 +2127,18 @@ class RecordMapper:
             prepared = normalizer.prepare_record(rec, idx)
             if prepared is None:
                 continue
+            cur_usubjid = prepared.usubjid or ""
             if last_usubjid is None:
-                last_usubjid = prepared.usubjid
+                last_usubjid = cur_usubjid
                 current_subj_rows = 1
                 continue
-            if prepared.usubjid == last_usubjid:
+            if cur_usubjid == last_usubjid:
                 current_subj_rows += 1
                 continue
-            if prepared.usubjid < last_usubjid:
+            if cur_usubjid < last_usubjid:
                 return itertools.chain(peeked, rec_iter), False
             completed_rows += current_subj_rows
-            last_usubjid = prepared.usubjid
+            last_usubjid = cur_usubjid
             current_subj_rows = 1
             if completed_rows >= chunk_size:
                 break
@@ -2041,10 +2242,13 @@ class RecordMapper:
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Return a :class:`pandas.DataFrame` of records for a study."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         if as_sdtm:
             target_domain = domain or "AE"
             return self.sdtm_dataframe(
@@ -2053,6 +2257,8 @@ class RecordMapper:
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                naming_convention=canonical_conv,
+                preserve_record_id=preserve_record_id,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
             )
@@ -2064,6 +2270,8 @@ class RecordMapper:
                 use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                domain=domain,
+                naming_convention=canonical_conv,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
             )
@@ -2078,7 +2286,7 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
-        as_sdtm: bool = False,
+        as_sdtm: bool | None = None,
         domain: str | None = None,
         naming_convention: str | None = None,
         preserve_record_id: bool = False,
@@ -2090,6 +2298,8 @@ class RecordMapper:
         records: Iterable[Any] | None = None,
     ) -> DatasetJsonEnvelope:
         """Emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        canonical_conv = normalize_naming_convention(naming_convention)
+        effective_sdtm = bool(domain) if as_sdtm is None else bool(as_sdtm)
         self._active_study_key = study_key
         should_mask = self.mask_phi if mask_phi is None else mask_phi
         effective_include_deleted = (
@@ -2101,7 +2311,7 @@ class RecordMapper:
 
             study_forms = self._iter_sdk_lookup_items(study_key, "forms", "get_forms")
             study_visits = self._iter_sdk_lookup_items(study_key, "visits", "get_visits")
-            if not (as_sdtm or domain):
+            if not effective_sdtm:
                 self._fetch_variable_metadata(
                     study_key,
                     variable_whitelist=variable_whitelist,
@@ -2131,12 +2341,12 @@ class RecordMapper:
                 forms=study_forms,
                 variables=study_vars,
                 visits=study_visits,
-                as_sdtm=as_sdtm,
+                as_sdtm=effective_sdtm,
                 sdtm_domain=domain,
                 use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
-                naming_convention=naming_convention,
+                naming_convention=canonical_conv,
                 preserve_record_id=preserve_record_id,
                 include_deleted=effective_include_deleted,
                 mask_phi=should_mask,
@@ -2155,7 +2365,7 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
-        as_sdtm: bool = False,
+        as_sdtm: bool | None = None,
         domain: str | None = None,
         naming_convention: str | None = None,
         preserve_record_id: bool = False,
@@ -2167,6 +2377,8 @@ class RecordMapper:
         records: Iterable[Any] | None = None,
     ) -> DatasetJsonBundle:
         """Emit a ``DatasetJsonBundle`` mapping each Form or SDTM domain to a flat v1.1 envelope."""
+        canonical_conv = normalize_naming_convention(naming_convention)
+        effective_sdtm = bool(domain) if as_sdtm is None else bool(as_sdtm)
         self._active_study_key = study_key
         should_mask = self.mask_phi if mask_phi is None else mask_phi
         effective_include_deleted = (
@@ -2178,7 +2390,7 @@ class RecordMapper:
 
             study_forms = self._iter_sdk_lookup_items(study_key, "forms", "get_forms")
             study_visits = self._iter_sdk_lookup_items(study_key, "visits", "get_visits")
-            if not (as_sdtm or domain):
+            if not effective_sdtm:
                 self._fetch_variable_metadata(
                     study_key,
                     variable_whitelist=variable_whitelist,
@@ -2208,12 +2420,12 @@ class RecordMapper:
                 forms=study_forms,
                 variables=study_vars,
                 visits=study_visits,
-                as_sdtm=as_sdtm,
+                as_sdtm=effective_sdtm,
                 sdtm_domain=domain,
                 use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
-                naming_convention=naming_convention,
+                naming_convention=canonical_conv,
                 preserve_record_id=preserve_record_id,
                 include_deleted=effective_include_deleted,
                 mask_phi=should_mask,
@@ -2232,6 +2444,7 @@ class RecordMapper:
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
         preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
@@ -2247,6 +2460,7 @@ class RecordMapper:
             form_whitelist=form_whitelist,
             as_sdtm=True,
             domain=domain,
+            naming_convention=naming_convention,
             preserve_record_id=preserve_record_id,
             mask_phi=mask_phi,
             include_deleted=include_deleted,
@@ -2279,22 +2493,22 @@ class _AsyncMapperSdkShim:
         self._sync_sdk = delegate_sdk
         self.forms = type("_F", (), {"list": lambda _s, **_kw: list(forms)})()
 
-    def get_variables(self, **_kw: Any) -> list[Any]:
+    def get_variables(self, *_a: Any, **_kw: Any) -> list[Any]:
         return list(self._variables)
 
-    def get_forms(self, **_kw: Any) -> list[Any]:
+    def get_forms(self, *_a: Any, **_kw: Any) -> list[Any]:
         return list(self._forms)
 
-    def get_sites(self, **_kw: Any) -> list[Any]:
+    def get_sites(self, *_a: Any, **_kw: Any) -> list[Any]:
         return list(self._sites)
 
-    def get_intervals(self, **_kw: Any) -> list[Any]:
+    def get_intervals(self, *_a: Any, **_kw: Any) -> list[Any]:
         return list(self._intervals)
 
-    def get_visits(self, **_kw: Any) -> list[Any]:
+    def get_visits(self, *_a: Any, **_kw: Any) -> list[Any]:
         return list(self._visits)
 
-    def get_records(self, **kw: Any) -> list[Any]:
+    def get_records(self, *_a: Any, **kw: Any) -> list[Any]:
         fid = kw.get("formId")
         if fid is not None:
             return [r for r in self._records if getattr(r, "form_id", None) == fid]
@@ -2474,10 +2688,12 @@ class AsyncRecordMapper(RecordMapper):
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        naming_convention: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> AsyncIterator[pd.DataFrame]:
         """Asynchronously yield mapped record DataFrames in bounded chunks."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         if as_sdtm:
             async for df in self.iter_sdtm_dataframes(
                 study_key=study_key,
@@ -2485,6 +2701,7 @@ class AsyncRecordMapper(RecordMapper):
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                naming_convention=canonical_conv,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
             ):
@@ -2508,6 +2725,8 @@ class AsyncRecordMapper(RecordMapper):
                         use_labels_as_columns=use_labels_as_columns,
                         variable_whitelist=variable_whitelist,
                         form_whitelist=form_whitelist,
+                        domain=domain,
+                        naming_convention=canonical_conv,
                         mask_phi=mask_phi,
                         include_deleted=include_deleted,
                     )
@@ -2527,10 +2746,13 @@ class AsyncRecordMapper(RecordMapper):
         *,
         as_sdtm: bool = False,
         domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Asynchronously return a :class:`pandas.DataFrame` of records for a study."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         if as_sdtm:
             return await self.sdtm_dataframe(
                 study_key=study_key,
@@ -2538,6 +2760,8 @@ class AsyncRecordMapper(RecordMapper):
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                naming_convention=canonical_conv,
+                preserve_record_id=preserve_record_id,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
             )
@@ -2549,6 +2773,8 @@ class AsyncRecordMapper(RecordMapper):
                 use_labels_as_columns=use_labels_as_columns,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                domain=domain,
+                naming_convention=canonical_conv,
                 mask_phi=mask_phi,
                 include_deleted=include_deleted,
             )
@@ -2563,11 +2789,14 @@ class AsyncRecordMapper(RecordMapper):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
+        domain: str | None = None,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
         records: Iterable[RecordModel] | AsyncIterable[RecordModel] | None = None,
     ) -> list[dict[str, Any]]:
         """Asynchronously generate a nested JSON tree structure up to three levels deep."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         mat_records: list[RecordModel] | None = None
         if records is not None:
             mat_records = (
@@ -2591,6 +2820,8 @@ class AsyncRecordMapper(RecordMapper):
                     use_labels_as_keys=use_labels_as_keys,
                     variable_whitelist=variable_whitelist,
                     form_whitelist=form_whitelist,
+                    naming_convention=canonical_conv,
+                    domain=domain,
                     mask_phi=mask_phi,
                     include_deleted=include_deleted,
                     records=mat_records,
@@ -2606,10 +2837,13 @@ class AsyncRecordMapper(RecordMapper):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> AsyncIterator[pd.DataFrame]:
         """Asynchronously yield chunked pandas DataFrames transformed into an SDTM domain."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         shim = await self._build_shim(
             study_key,
             visit_key=visit_key,
@@ -2628,6 +2862,8 @@ class AsyncRecordMapper(RecordMapper):
                         visit_key=visit_key,
                         variable_whitelist=variable_whitelist,
                         form_whitelist=form_whitelist,
+                        naming_convention=canonical_conv,
+                        preserve_record_id=preserve_record_id,
                         mask_phi=mask_phi,
                         include_deleted=include_deleted,
                     )
@@ -2645,10 +2881,13 @@ class AsyncRecordMapper(RecordMapper):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
     ) -> pd.DataFrame:
         """Asynchronously return a DataFrame transformed into a CDISC SDTM domain dataset."""
+        canonical_conv = normalize_naming_convention(naming_convention)
         should_mask = self.mask_phi if mask_phi is None else mask_phi
         frames = [
             df
@@ -2658,6 +2897,7 @@ class AsyncRecordMapper(RecordMapper):
                 visit_key=visit_key,
                 variable_whitelist=variable_whitelist,
                 form_whitelist=form_whitelist,
+                preserve_record_id=preserve_record_id,
                 mask_phi=should_mask,
                 include_deleted=include_deleted,
             )
@@ -2667,6 +2907,8 @@ class AsyncRecordMapper(RecordMapper):
             domain=domain,
             study_key=study_key,
             should_mask=should_mask,
+            naming_convention=canonical_conv,
+            preserve_record_id=preserve_record_id,
         )
 
     async def to_dataset_json(  # type: ignore[override]
@@ -2677,7 +2919,7 @@ class AsyncRecordMapper(RecordMapper):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
-        as_sdtm: bool = False,
+        as_sdtm: bool | None = None,
         domain: str | None = None,
         naming_convention: str | None = None,
         preserve_record_id: bool = False,
@@ -2689,6 +2931,8 @@ class AsyncRecordMapper(RecordMapper):
         records: Iterable[Any] | AsyncIterable[Any] | None = None,
     ) -> DatasetJsonEnvelope:
         """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        canonical_conv = normalize_naming_convention(naming_convention)
+        effective_sdtm = bool(domain) if as_sdtm is None else bool(as_sdtm)
         mat_records: list[Any] | None = None
         if records is not None:
             mat_records = (
@@ -2699,7 +2943,7 @@ class AsyncRecordMapper(RecordMapper):
             visit_key=visit_key,
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
-            need_variables=not bool(as_sdtm or domain),
+            need_variables=not effective_sdtm,
             pre_records=mat_records,
         )
         orig = self.sdk
@@ -2712,9 +2956,9 @@ class AsyncRecordMapper(RecordMapper):
                     use_labels_as_columns=use_labels_as_columns,
                     variable_whitelist=variable_whitelist,
                     form_whitelist=form_whitelist,
-                    as_sdtm=as_sdtm,
+                    as_sdtm=effective_sdtm,
                     domain=domain,
-                    naming_convention=naming_convention,
+                    naming_convention=canonical_conv,
                     preserve_record_id=preserve_record_id,
                     mask_phi=mask_phi,
                     include_deleted=include_deleted,
@@ -2734,7 +2978,7 @@ class AsyncRecordMapper(RecordMapper):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
-        as_sdtm: bool = False,
+        as_sdtm: bool | None = None,
         domain: str | None = None,
         naming_convention: str | None = None,
         preserve_record_id: bool = False,
@@ -2746,6 +2990,8 @@ class AsyncRecordMapper(RecordMapper):
         records: Iterable[Any] | AsyncIterable[Any] | None = None,
     ) -> DatasetJsonBundle:
         """Asynchronously emit a ``DatasetJsonBundle`` for CDASH Forms or SDTM domains."""
+        canonical_conv = normalize_naming_convention(naming_convention)
+        effective_sdtm = bool(domain) if as_sdtm is None else bool(as_sdtm)
         mat_records: list[Any] | None = None
         if records is not None:
             mat_records = (
@@ -2756,7 +3002,7 @@ class AsyncRecordMapper(RecordMapper):
             visit_key=visit_key,
             variable_whitelist=variable_whitelist,
             form_whitelist=form_whitelist,
-            need_variables=not bool(as_sdtm or domain),
+            need_variables=not effective_sdtm,
             pre_records=mat_records,
         )
         orig = self.sdk
@@ -2769,9 +3015,9 @@ class AsyncRecordMapper(RecordMapper):
                     use_labels_as_columns=use_labels_as_columns,
                     variable_whitelist=variable_whitelist,
                     form_whitelist=form_whitelist,
-                    as_sdtm=as_sdtm,
+                    as_sdtm=effective_sdtm,
                     domain=domain,
-                    naming_convention=naming_convention,
+                    naming_convention=canonical_conv,
                     preserve_record_id=preserve_record_id,
                     mask_phi=mask_phi,
                     include_deleted=include_deleted,
@@ -2791,6 +3037,7 @@ class AsyncRecordMapper(RecordMapper):
         variable_whitelist: list[str] | None = None,
         form_whitelist: list[int] | None = None,
         *,
+        naming_convention: str | None = None,
         preserve_record_id: bool = False,
         mask_phi: bool | None = None,
         include_deleted: bool | None = None,
@@ -2806,6 +3053,7 @@ class AsyncRecordMapper(RecordMapper):
             form_whitelist=form_whitelist,
             as_sdtm=True,
             domain=domain,
+            naming_convention=naming_convention,
             preserve_record_id=preserve_record_id,
             mask_phi=mask_phi,
             include_deleted=include_deleted,

@@ -7,7 +7,7 @@ import re
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationInfo, model_validator
 
 from imednet.models.base import ImednetBaseModel
 
@@ -77,7 +77,9 @@ class QueryComment(ImednetBaseModel):
 class Query(ImednetBaseModel):
     """Represents a data query (discrepancy) raised on a record."""
 
-    query_comments: list[QueryComment] = Field(default_factory=list, alias="queryComments")
+    query_comments: list[QueryComment] | None = Field(
+        default_factory=list[QueryComment], alias="queryComments"
+    )
     status: QueryStatus = Field(default=QueryStatus.OPEN, alias="status")
     study_key: str | None = Field(default=None, alias="studyKey")
     subject_id: int | None = Field(default=None, alias="subjectId")
@@ -96,8 +98,8 @@ class Query(ImednetBaseModel):
     def __init__(
         self,
         *,
-        query_comments: list[QueryComment] = ...,
-        queryComments: list[QueryComment] = ...,
+        query_comments: list[QueryComment] | None = ...,
+        queryComments: list[QueryComment] | None = ...,
         status: QueryStatus = QueryStatus.OPEN,
         study_key: str | None = None,
         studyKey: str | None = None,
@@ -125,7 +127,7 @@ class Query(ImednetBaseModel):
     ) -> None: ...
     @model_validator(mode="before")
     @classmethod
-    def _resolve_legacy_status(cls, data: Any) -> Any: ...
+    def _resolve_legacy_status(cls, data: Any, info: ValidationInfo) -> Any: ...
     def transition_to(self, target_status: QueryStatus | str) -> QueryStatus: ...
     def update_status(self, target_status: QueryStatus | str) -> QueryStatus: ...
     def can_transition_to(self, target_status: QueryStatus | str) -> bool: ...

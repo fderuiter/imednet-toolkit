@@ -50,7 +50,7 @@ class Role(ImednetBaseModel):
 class User(ImednetBaseModel):
     """A user account in the system."""
 
-    roles: list[Role] = Field(default_factory=list, alias="roles")
+    roles: list[Role] | None = Field(default_factory=list[Role], alias="roles")
     user_id: str | None = Field(default=None, alias="userId")
     login: str | None = Field(default=None, alias="login")
     first_name: str | None = Field(default=None, alias="firstName")
@@ -61,7 +61,7 @@ class User(ImednetBaseModel):
     def __init__(
         self,
         *,
-        roles: list[Role] = ...,
+        roles: list[Role] | None = ...,
         user_id: str | None = None,
         userId: str | None = None,
         login: str | None = None,

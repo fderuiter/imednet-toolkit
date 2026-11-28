@@ -161,10 +161,19 @@ def test_job_status_progress_parsing() -> None:
 
 def test_optional_vs_non_optional_container_normalizers() -> None:
     """Optional list/dict fields preserve None while non-optional fields keep empty defaults."""
+    from typing import Any
+
+    from pydantic import Field
+
+    from imednet.models.base import ImednetBaseModel
     from imednet.models.intervals import Interval
     from imednet.models.jobs import Job
     from imednet.models.records import Record
     from imednet_workflows.study_structure import _build_study_structure
+
+    class _NonOptionalContainers(ImednetBaseModel):
+        tags: list[str] = Field(default_factory=list)
+        payload: dict[str, Any] = Field(default_factory=dict)
 
     assert Interval(forms=None).forms is None
     assert Interval().forms is None
@@ -177,9 +186,13 @@ def test_optional_vs_non_optional_container_normalizers() -> None:
     assert rec_default.keywords == []
     assert rec_default.record_data == {}
 
-    rec_explicit_none = Record(keywords=None, record_data=None)  # type: ignore[arg-type]
-    assert rec_explicit_none.keywords == []
-    assert rec_explicit_none.record_data == {}
+    rec_explicit_none = Record(keywords=None, record_data=None)
+    assert rec_explicit_none.keywords is None
+    assert rec_explicit_none.record_data is None
+
+    non_opt_explicit_none = _NonOptionalContainers(tags=None, payload=None)  # type: ignore[arg-type]
+    assert non_opt_explicit_none.tags == []
+    assert non_opt_explicit_none.payload == {}
 
     structure = _build_study_structure("S1", [Interval(intervalId=1, forms=None)], [], [])
     assert len(structure.intervals) == 1

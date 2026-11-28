@@ -59,6 +59,12 @@ from imednet.datadict.loaders.cdisc_odm import (
     load_from_cdisc_odm,
     load_odm_archive,
 )
+from imednet.models.sdtm import (
+    deduplicate_sdtm_rows,
+    extract_sdtm_composite_key,
+    format_nested_variable_name,
+    prefix_colliding_variable_name,
+)
 
 __all__ = [
     "DATASET_JSON_110_SCHEMA_PATH",
@@ -92,6 +98,9 @@ __all__ = [
     "build_dataset_json_bundle",
     "build_dataset_json_envelope",
     "build_odm_archive",
+    "deduplicate_sdtm_rows",
+    "extract_sdtm_composite_key",
+    "format_nested_variable_name",
     "get_dataset_json_schema",
     "load_cdisc_odm_archive",
     "load_dataset_json",
@@ -106,6 +115,7 @@ __all__ = [
     "map_revisions_to_audit_records",
     "map_sites_and_users_to_admin_data",
     "normalize_odm_datetime",
+    "prefix_colliding_variable_name",
     "to_dataset_json",
     "to_dataset_json_file",
     "to_odm_file",

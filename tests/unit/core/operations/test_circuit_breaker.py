@@ -25,12 +25,16 @@ from imednet.core.operations.circuit_breaker import (
 )
 from imednet.core.retry import RetryConfig, RetryPolicy, RetryState
 from imednet.errors import (
+    ApiError,
+    BadRequestError,
     ExportBatchError,
     ExportConfigurationError,
+    ForbiddenError,
     NotFoundError,
     RateLimitError,
     RequestError,
     ServerError,
+    UnauthorizedError,
 )
 from imednet.integrations.sink_base import ExportSink, SinkConfig
 from imednet.sdk import AsyncImednetSDK, ImednetSDK
@@ -213,19 +217,28 @@ def test_sync_base_exception_releases_half_open_probe_slot(monkeypatch) -> None:
     assert breaker.state is CircuitState.CLOSED
 
 
-def test_http_404_during_half_open_closes_breaker_and_raises_not_found(
-    respx_mock, monkeypatch
+@pytest.mark.parametrize(
+    ("status_code", "expected_exc"),
+    [
+        (400, BadRequestError),
+        (401, UnauthorizedError),
+        (403, ForbiddenError),
+        (404, NotFoundError),
+    ],
+)
+def test_http_400_401_403_404_preserve_closed_failures_and_release_half_open_probes(
+    respx_mock,
+    monkeypatch,
+    status_code: int,
+    expected_exc: type[ApiError],
 ) -> None:
-    """An HTTP 404 during HALF_OPEN closes the client breaker and raises NotFoundError with 0 failures."""
+    """HTTP 400/401/403/404 preserve CLOSED failure counts and release HALF_OPEN probes without closing."""
     now = 100.0
     monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
 
-    respx_mock.get(f"{BASE_URL}/subjects/missing").mock(
-        side_effect=[
-            httpx.Response(503, json={"message": "unavailable"}),
-            httpx.Response(404, json={"message": "subject not found"}),
-        ]
-    )
+    respx_mock.get(f"{BASE_URL}/fail-once").respond(503, json={"message": "unavailable"})
+    respx_mock.get(f"{BASE_URL}/client-err").respond(status_code, json={"message": "client err"})
+    respx_mock.get(f"{BASE_URL}/healthy").respond(200, json={"ok": True})
 
     with Client(
         api_key="k",
@@ -234,27 +247,53 @@ def test_http_404_during_half_open_closes_breaker_and_raises_not_found(
         retry_config=RetryConfig(retries=0, backoff_factor=0),
     ) as client:
         breaker = client._circuit_breaker
-        breaker.failure_threshold = 1
+        breaker.failure_threshold = 2
         breaker.recovery_timeout = 5.0
 
+        # 1st 503 -> 1 failure in CLOSED; 4xx preserves consecutive_failures == 1
         with pytest.raises(ServerError):
-            client.get("/subjects/missing")
-        assert breaker.state is CircuitState.OPEN
+            client.get("/fail-once")
+        assert breaker.state is CircuitState.CLOSED
         assert breaker.consecutive_failures == 1
 
-        now = 110.0
-        with pytest.raises(NotFoundError):
-            client.get("/subjects/missing")
+        with pytest.raises(expected_exc):
+            client.get("/client-err")
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.consecutive_failures == 1
 
+        # 2nd 503 opens the breaker (epoch 1)
+        with pytest.raises(ServerError):
+            client.get("/fail-once")
+        assert breaker.state is CircuitState.OPEN
+        assert breaker.epoch == 1
+
+        # Advance past recovery_timeout: 4xx releases HALF_OPEN probe and leaves state HALF_OPEN
+        now = 110.0
+        with pytest.raises(expected_exc):
+            client.get("/client-err")
+        assert breaker.state is CircuitState.HALF_OPEN
+        assert breaker.half_open_probes == 0
+        assert breaker.epoch == 1
+
+        # Subsequent 200 probe closes HALF_OPEN and increments _epoch
+        resp = client.get("/healthy")
+        assert resp.status_code == 200
         assert breaker.state is CircuitState.CLOSED
         assert breaker.consecutive_failures == 0
         assert breaker.half_open_probes == 0
+        assert breaker.epoch == 2
 
 
-def test_http_3xx_and_non_429_4xx_count_as_healthy_connectivity(respx_mock) -> None:
-    """HTTP 2xx, 3xx, and non-429 4xx reset consecutive failures rather than counting as outages."""
+def test_http_3xx_leaves_closed_failures_and_half_open_probes_unsettled(
+    respx_mock, monkeypatch
+) -> None:
+    """HTTP 3xx leaves CLOSED failure counts untouched and releases HALF_OPEN probes unclosed."""
+    now = 50.0
+    monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
+
     respx_mock.get(f"{BASE_URL}/redirect").respond(302, headers={"Location": f"{BASE_URL}/dest"})
     respx_mock.get(f"{BASE_URL}/fail").respond(500)
+    respx_mock.get(f"{BASE_URL}/dest").respond(200, json={"ok": True})
 
     with Client(
         api_key="k",
@@ -262,14 +301,33 @@ def test_http_3xx_and_non_429_4xx_count_as_healthy_connectivity(respx_mock) -> N
         base_url=BASE_URL,
         retry_config=RetryConfig(retries=0, backoff_factor=0),
     ) as client:
+        breaker = client._circuit_breaker
+        breaker.failure_threshold = 2
+        breaker.recovery_timeout = 5.0
+
         with pytest.raises(ServerError):
             client.get("/fail")
-        assert client._circuit_breaker.consecutive_failures == 1
+        assert breaker.consecutive_failures == 1
 
         resp = client.get("/redirect")
         assert resp.status_code == 302
-        assert client._circuit_breaker.consecutive_failures == 0
-        assert client._circuit_breaker.state is CircuitState.CLOSED
+        assert breaker.consecutive_failures == 1
+        assert breaker.state is CircuitState.CLOSED
+
+        with pytest.raises(ServerError):
+            client.get("/fail")
+        assert breaker.state is CircuitState.OPEN
+
+        now = 60.0
+        hop_resp = client.get("/redirect")
+        assert hop_resp.status_code == 302
+        assert breaker.state is CircuitState.HALF_OPEN
+        assert breaker.half_open_probes == 0
+
+        ok_resp = client.get("/dest")
+        assert ok_resp.status_code == 200
+        assert breaker.state is CircuitState.CLOSED
+        assert breaker.consecutive_failures == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -336,8 +394,8 @@ def test_http_429_preserves_failure_count_and_returns_half_open_probe_to_open(
     now = 10.0
     monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
 
-    respx_mock.get(f"{BASE_URL}/server-err").respond(500)
-    respx_mock.get(f"{BASE_URL}/rate-limit").respond(429)
+    server_route = respx_mock.get(f"{BASE_URL}/server-err").respond(500)
+    rl_route = respx_mock.get(f"{BASE_URL}/rate-limit").respond(429)
 
     with Client(
         api_key="k",
@@ -346,34 +404,38 @@ def test_http_429_preserves_failure_count_and_returns_half_open_probe_to_open(
         retry_config=RetryConfig(retries=1, backoff_factor=0),
     ) as client:
         breaker = client._circuit_breaker
-        breaker.failure_threshold = 2
+        breaker.failure_threshold = 4
         breaker.recovery_timeout = 5.0
 
-        # 1st 500 -> 1 failure
+        # 1st GET /server-err with retries=1 -> 2 attempts -> 2 failures
         with pytest.raises(ServerError):
             client.get("/server-err")
-        assert breaker.consecutive_failures == 1
+        assert server_route.call_count == 2
+        assert breaker.consecutive_failures == 2
         assert breaker.state is CircuitState.CLOSED
 
-        # 429 in CLOSED leaves consecutive_failures at 1 (neither incremented nor reset to 0)
+        # 429 in CLOSED leaves consecutive_failures at 2 (neither incremented nor reset to 0)
         with pytest.raises(RateLimitError):
             client.get("/rate-limit")
-        assert breaker.consecutive_failures == 1
+        assert rl_route.call_count == 2
+        assert breaker.consecutive_failures == 2
         assert breaker.state is CircuitState.CLOSED
 
-        # 2nd 500 -> reaches threshold 2 -> OPEN (epoch 1)
+        # 2nd GET /server-err -> 2 attempts -> reaches threshold 4 -> OPEN (epoch 1)
         with pytest.raises(ServerError):
             client.get("/server-err")
         assert breaker.state is CircuitState.OPEN
         assert breaker.epoch == 1
 
-        # Advance past recovery_timeout; HALF_OPEN probe receives 429 -> returns to OPEN (epoch 2)
+        # Advance past recovery_timeout; HALF_OPEN probe receives 429 -> returns to OPEN immediately (0 OPEN retries)
         now = 20.0
-        with pytest.raises(RateLimitError):
+        with pytest.raises(RateLimitError) as rl_exc:
             client.get("/rate-limit")
+        assert rl_exc.value.attempt_count == 1
+        assert rl_route.call_count == 3
         assert breaker.state is CircuitState.OPEN
         assert breaker.epoch == 2
-        assert breaker.consecutive_failures == 2
+        assert breaker.consecutive_failures == 4
         assert breaker.half_open_probes == 0
 
         # Immediate follow-up call fails fast because breaker returned to OPEN
@@ -567,7 +629,7 @@ async def test_direct_executor_fallback_uses_global_circuit_breaker_and_skips_ca
     assert sync_exec.circuit_breaker is global_breaker
     with pytest.raises(RequestError):
         sync_exec("GET", f"{BASE_URL}/ping")
-    assert global_breaker.consecutive_failures == 1
+    assert global_breaker.consecutive_failures == 2
 
     calls = 0
 
@@ -588,7 +650,7 @@ async def test_direct_executor_fallback_uses_global_circuit_breaker_and_skips_ca
     with pytest.raises(asyncio.CancelledError):
         await async_exec("GET", f"{BASE_URL}/ping")
     assert calls == 1
-    assert global_breaker.consecutive_failures == 1
+    assert global_breaker.consecutive_failures == 2
 
 
 @pytest.mark.asyncio
@@ -623,3 +685,164 @@ async def test_circuit_breaker_error_subclasses_imednet_error_and_attaches_conte
     assert cb_exc.value.method == "GET"
     assert cb_exc.value.url == "/down?api_key=***"
     assert cb_exc.value.attempt_count == 0
+
+
+def test_circuit_breaker_validates_thresholds_probes_and_timeouts() -> None:
+    """CircuitBreaker rejects booleans, non-positive thresholds/probes, and negative or non-finite timeouts."""
+    zero_timeout_cb = CircuitBreaker(
+        failure_threshold=1, recovery_timeout=0, half_open_max_probes=1
+    )
+    assert zero_timeout_cb.recovery_timeout == 0.0
+
+    for bad_int in (True, False, 0, -1, -100, 1.5, "5", None):
+        with pytest.raises(ValueError, match="failure_threshold"):
+            CircuitBreaker(failure_threshold=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="half_open_max_probes"):
+            CircuitBreaker(half_open_max_probes=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="failure_threshold"):
+            zero_timeout_cb.failure_threshold = bad_int  # type: ignore[assignment]
+        with pytest.raises(ValueError, match="half_open_max_probes"):
+            zero_timeout_cb.half_open_max_probes = bad_int  # type: ignore[assignment]
+
+    for bad_timeout in (True, False, -0.001, -5, float("nan"), float("inf"), float("-inf"), "10"):
+        with pytest.raises(ValueError, match="recovery_timeout"):
+            CircuitBreaker(recovery_timeout=bad_timeout)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="recovery_timeout"):
+            zero_timeout_cb.recovery_timeout = bad_timeout  # type: ignore[assignment]
+
+
+def test_half_open_to_closed_increments_epoch_and_ignores_stale_probe_failure(monkeypatch) -> None:
+    """Closing HALF_OPEN on 2xx increments _epoch so late sibling probe failures are ignored."""
+    now = 10.0
+    monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
+
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=5.0, half_open_max_probes=2)
+    breaker.record_failure()
+    assert breaker.state is CircuitState.OPEN
+    assert breaker.epoch == 1
+
+    now = 20.0
+    probe_1 = breaker.acquire()
+    probe_2 = breaker.acquire()
+    assert breaker.state is CircuitState.HALF_OPEN
+    assert breaker.epoch == 1
+
+    probe_1.record_success()
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.epoch == 2
+    assert breaker.consecutive_failures == 0
+    assert breaker.half_open_probes == 0
+
+    # Stale probe_2 from epoch 1 failing or rate-limiting after closure must not corrupt epoch 2.
+    probe_2.record_failure()
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.consecutive_failures == 0
+    assert breaker.epoch == 2
+
+
+@pytest.mark.parametrize("status_code", [503, 408])
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_default_executors_open_after_5_responses_send_1_probe_and_zero_open_retries(
+    respx_mock,
+    monkeypatch,
+    status_code: int,
+    asynchronous: bool,
+) -> None:
+    """Default executors open after 5 consecutive 503/408 responses, send 1 HALF_OPEN probe, and send 0 OPEN retries."""
+    now = 100.0
+    monkeypatch.setattr("imednet.core.operations.circuit_breaker.time.monotonic", lambda: now)
+
+    route = respx_mock.get(f"{BASE_URL}/unstable").mock(
+        side_effect=[
+            httpx.Response(status_code, json={"error": "timeout_or_unavailable"}) for _ in range(6)
+        ]
+        + [httpx.Response(200, json={"ok": True})]
+    )
+
+    if asynchronous:
+        async with AsyncClient(
+            api_key="k",
+            security_key="s",
+            base_url=BASE_URL,
+            retry_config=RetryConfig(backoff_factor=0.0),
+        ) as client:
+            breaker = client._circuit_breaker
+            # Call 1 (default retries=3 -> 4 attempts): 4 failures, still CLOSED
+            with pytest.raises(ApiError) as first_exc:
+                await client.get("/unstable")
+            assert first_exc.value.attempt_count == 4
+            assert route.call_count == 4
+            assert breaker.consecutive_failures == 4
+            assert breaker.state is CircuitState.CLOSED
+
+            # Call 2: 5th failure opens breaker on attempt 1 and sends 0 OPEN retries
+            with pytest.raises(ApiError) as second_exc:
+                await client.get("/unstable")
+            assert second_exc.value.attempt_count == 1
+            assert route.call_count == 5
+            assert breaker.state is CircuitState.OPEN
+            assert breaker.epoch == 1
+
+            # Call 3 while OPEN: 0 upstream wire attempts
+            with pytest.raises(CircuitBreakerError) as open_exc:
+                await client.get("/unstable")
+            assert open_exc.value.attempt_count == 0
+            assert route.call_count == 5
+
+            # Advance past recovery_timeout: HALF_OPEN sends 1 probe and 0 OPEN retries on failure
+            now = 115.0
+            with pytest.raises(ApiError) as probe_fail_exc:
+                await client.get("/unstable")
+            assert probe_fail_exc.value.attempt_count == 1
+            assert route.call_count == 6
+            assert breaker.state is CircuitState.OPEN
+            assert breaker.epoch == 2
+
+            # Advance past recovery_timeout again: 200 closes HALF_OPEN and increments _epoch
+            now = 130.0
+            ok = await client.get("/unstable")
+            assert ok.status_code == 200
+            assert route.call_count == 7
+            assert breaker.state is CircuitState.CLOSED
+            assert breaker.epoch == 3
+    else:
+        with Client(
+            api_key="k",
+            security_key="s",
+            base_url=BASE_URL,
+            retry_config=RetryConfig(backoff_factor=0.0),
+        ) as client:
+            breaker = client._circuit_breaker
+            with pytest.raises(ApiError) as first_exc:
+                client.get("/unstable")
+            assert first_exc.value.attempt_count == 4
+            assert route.call_count == 4
+            assert breaker.consecutive_failures == 4
+            assert breaker.state is CircuitState.CLOSED
+
+            with pytest.raises(ApiError) as second_exc:
+                client.get("/unstable")
+            assert second_exc.value.attempt_count == 1
+            assert route.call_count == 5
+            assert breaker.state is CircuitState.OPEN
+            assert breaker.epoch == 1
+
+            with pytest.raises(CircuitBreakerError) as open_exc:
+                client.get("/unstable")
+            assert open_exc.value.attempt_count == 0
+            assert route.call_count == 5
+
+            now = 115.0
+            with pytest.raises(ApiError) as probe_fail_exc:
+                client.get("/unstable")
+            assert probe_fail_exc.value.attempt_count == 1
+            assert route.call_count == 6
+            assert breaker.state is CircuitState.OPEN
+            assert breaker.epoch == 2
+
+            now = 130.0
+            ok = client.get("/unstable")
+            assert ok.status_code == 200
+            assert route.call_count == 7
+            assert breaker.state is CircuitState.CLOSED
+            assert breaker.epoch == 3

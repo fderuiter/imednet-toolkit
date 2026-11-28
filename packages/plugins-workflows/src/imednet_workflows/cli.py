@@ -10,7 +10,6 @@ readiness validation, and state ledger management.
 from __future__ import annotations
 
 import argparse
-import builtins
 import contextlib
 import io
 import os
@@ -36,6 +35,7 @@ from imednet.spi.cli import (
     display_list,
     emit_json,
     fetching_status,
+    flush_stdout,
     is_json_output_mode,
     load_offline_schema,
     parse_email_notify,
@@ -50,9 +50,11 @@ from imednet.spi.cli import (
     simulation_mode_context,
     validate_cli_path_segment,
     with_sdk,
+    write_stdout,
 )
-from imednet.spi.models import PROFILE_REGISTRY
+from imednet.spi.models import PROFILE_REGISTRY, StudyConfiguration
 from imednet.spi.utils import (
+    EnrichmentPipeline,
     PathTraversalValidationError,
     SensitivityRegistry,
     build_study_sensitivity_registry,
@@ -60,8 +62,10 @@ from imednet.spi.utils import (
     mask_clinical_phi,
     mask_custom_phi_recursive,
     redact_sensitive_text,
+    resolve_cli_phi_fields,
     resolve_study_configuration,
     sanitize_diagnostic_text,
+    sdk_governance_context,
     validate_path_segment,
 )
 from imednet.spi.validation import DataDictionary, ValidationSchemaProtocol
@@ -70,6 +74,8 @@ from ._audit_cli import setup_audit_parsers
 
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
+
+_ORIG_RESOLVE_STUDY_CONFIG = resolve_study_configuration
 
 DEFAULT_LEDGER_PATH: str = os.environ.get(
     "IMEDNET_WORKFLOW_LEDGER_PATH",
@@ -118,8 +124,7 @@ def _emit_line(text: str = "", *, err: bool = False) -> None:
     if err:
         print_error(sanitized)
         return
-    with contextlib.suppress(BrokenPipeError, OSError):
-        builtins.print(sanitized, file=sys.stdout)
+    write_stdout(sanitized)
 
 
 def _reject_interactive_json_mode(interactive: bool, output_format: str | None) -> None:
@@ -138,6 +143,7 @@ def _exit_uat_validation_error(
     exc: BaseException | str,
     *,
     study_key: str | None = None,
+    sdk: Any = None,
 ) -> NoReturn:
     """Emit a secret- and PHI-redacted UAT validation error to stderr and exit 1."""
     safe_phi_study: str | None = None
@@ -145,7 +151,7 @@ def _exit_uat_validation_error(
         with contextlib.suppress(Exception):
             validate_path_segment(study_key.strip(), name="study_key")
             safe_phi_study = study_key.strip()
-    custom_phi = _resolve_custom_phi_fields(safe_phi_study)
+    custom_phi = _resolve_custom_phi_fields(safe_phi_study, sdk=sdk)
     sanitized = _sanitize_uat_error_text(str(exc), custom_phi_fields=custom_phi)
     prefix = "" if sanitized.startswith("Validation Error:") else "Validation Error: "
     print_error(f"{prefix}{sanitized}")
@@ -257,6 +263,7 @@ def _emit_uat_json_failure(
     study_key: str | None,
     dry_run: bool,
     failure_phase: str = "PREFLIGHT",
+    sdk: Any = None,
 ) -> NoReturn:
     """Emit a single PHI-masked, secret-redacted failed uat_run JSON envelope and exit 1."""
     from .uat import UATRunResult, UATWorkflowState
@@ -267,7 +274,7 @@ def _emit_uat_json_failure(
         with contextlib.suppress(Exception):
             validate_path_segment(resolved_study, name="study_key")
             safe_phi_study = resolved_study
-    custom_phi = _resolve_custom_phi_fields(safe_phi_study)
+    custom_phi = _resolve_custom_phi_fields(safe_phi_study, sdk=sdk)
     now = datetime.now(UTC)
     failed_result = UATRunResult.model_construct(
         study_key=resolved_study,
@@ -391,24 +398,45 @@ def _serialize_uat_run_result(
     return masked if isinstance(masked, dict) else item
 
 
-def _resolve_custom_phi_fields(study_key: str | None) -> set[str]:
-    """Return study-configured custom PHI field names when available."""
-    if not study_key:
+def _resolve_custom_phi_fields(study_key: str | None, *, sdk: Any = None) -> set[str]:
+    """Return normalized study-configured custom PHI field keys within active SDK origin."""
+    sk = (study_key or "").strip()
+    if not sk:
         return set()
-    cfg = resolve_study_configuration(study_key)
-    if cfg is not None and cfg.phi_fields:
-        return set(cfg.phi_fields)
-    return set()
+    if resolve_study_configuration is _ORIG_RESOLVE_STUDY_CONFIG:
+        return set(resolve_cli_phi_fields(sk, sdk=sdk))
+    with sdk_governance_context(sdk):
+        cfg = resolve_study_configuration(sk)
+    if cfg is None:
+        return set()
+    raw_fields = getattr(cfg, "phi_fields", None)
+    if not raw_fields:
+        return set()
+    non_exempt = [
+        str(k)
+        for k in raw_fields
+        if str(k).strip() and not global_sensitivity_registry.is_exempt(str(k))
+    ]
+    if not non_exempt:
+        return set()
+    return set(
+        EnrichmentPipeline(StudyConfiguration(study_key="PHI", phi_fields=non_exempt)).phi_keys
+    )
 
 
-def _is_key_phi_sensitive(key: str, custom_phi_fields: set[str]) -> bool:
+def _is_key_phi_sensitive(
+    key: str,
+    custom_phi_fields: set[str],
+    *,
+    registry: SensitivityRegistry | None = None,
+) -> bool:
     """Return True if *key* matches global or study-configured PHI sensitivity rules."""
-    if global_sensitivity_registry.is_sensitive(key):
-        return True
-    if custom_phi_fields:
-        probe = mask_custom_phi_recursive({key: "probe"}, custom_phi_fields)
-        return bool(isinstance(probe, Mapping) and probe.get(key) == "***MASKED***")
-    return False
+    active_registry = (
+        registry if registry is not None else build_study_sensitivity_registry(custom_phi_fields)
+    )
+    if active_registry.is_exempt(key):
+        return False
+    return active_registry.is_sensitive(key)
 
 
 def _mask_workflow_value(
@@ -434,7 +462,7 @@ def _mask_workflow_value(
         rebuilt: dict[Any, Any] = {}
         for k, v in value.items():
             key_str = str(k)
-            if _is_key_phi_sensitive(key_str, custom_phi_fields):
+            if _is_key_phi_sensitive(key_str, custom_phi_fields, registry=active_registry):
                 rebuilt[k] = "***MASKED***"
                 if v != "***MASKED***":
                     changed = True
@@ -495,10 +523,11 @@ def _mask_workflow_value(
             if raw_val is None:
                 continue
             alias = getattr(finfo, "alias", None)
-            if _is_key_phi_sensitive(fname, custom_phi_fields) or (
-                isinstance(alias, str) and _is_key_phi_sensitive(alias, custom_phi_fields)
+            if _is_key_phi_sensitive(fname, custom_phi_fields, registry=active_registry) or (
+                isinstance(alias, str)
+                and _is_key_phi_sensitive(alias, custom_phi_fields, registry=active_registry)
             ):
-                if isinstance(raw_val, str) and raw_val != "***MASKED***":
+                if raw_val != "***MASKED***":
                     updates[fname] = "***MASKED***"
                 continue
             if isinstance(raw_val, str) and fname == "reason_for_change":
@@ -545,11 +574,12 @@ def _mask_workflow_item(
     *,
     study_key: str | None = None,
     mask_phi: bool = True,
+    sdk: Any = None,
 ) -> Any:
     """Apply default and study-configured PHI masking to *payload* when enabled."""
     if not mask_phi:
         return payload
-    custom_phi_fields = _resolve_custom_phi_fields(study_key)
+    custom_phi_fields = _resolve_custom_phi_fields(study_key, sdk=sdk)
     return _mask_workflow_value(payload, custom_phi_fields=custom_phi_fields)
 
 
@@ -563,14 +593,20 @@ def _to_serializable(value: Any) -> Any:
         return [_to_serializable(item) for item in value]
     model_dump = getattr(type(value), "model_dump", None)
     if callable(model_dump):
-        dumped = value.model_dump(mode="json")
+        try:
+            dumped = value.model_dump(mode="json", warnings=False)
+        except TypeError:
+            dumped = value.model_dump(mode="json")
         if dumped is not value and isinstance(
             dumped, (Mapping, list, tuple, str, int, float, bool)
         ):
             return _to_serializable(dumped)
     instance_dump = getattr(value, "model_dump", None)
     if callable(instance_dump):
-        dumped = instance_dump()
+        try:
+            dumped = instance_dump(warnings=False)
+        except TypeError:
+            dumped = instance_dump()
         if dumped is not value and isinstance(
             dumped, (Mapping, list, tuple, str, int, float, bool)
         ):
@@ -583,13 +619,14 @@ def _sanitize_workflow_payload(
     *,
     study_key: str | None = None,
     mask_phi: bool = True,
+    sdk: Any = None,
 ) -> Any:
     """Serialize *payload* and apply default + study-configured PHI masking when enabled."""
     serialized = _to_serializable(payload)
     if not mask_phi:
         return serialized
     masked = mask_clinical_phi(serialized)
-    custom_phi = _resolve_custom_phi_fields(study_key)
+    custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk)
     if custom_phi:
         masked = mask_custom_phi_recursive(masked, custom_phi)
     return masked
@@ -1158,7 +1195,9 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 visit_filter=parsed_visit_filter,
             )
 
-        masked_records = _mask_workflow_item(records, study_key=study_key, mask_phi=mask_phi)
+        masked_records = _mask_workflow_item(
+            records, study_key=study_key, mask_phi=mask_phi, sdk=sdk
+        )
 
         if resolved_format == "json":
             display_list(masked_records, "records", output_format="json")
@@ -1392,9 +1431,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 if not is_json_output_mode():
                     print_progress(f"Wrote UAT specification for study '{study_key}' to '{dest}'.")
                 return
-            with contextlib.suppress(BrokenPipeError, OSError):
-                sys.stdout.write(f"{serialized}\n")
-                sys.stdout.flush()
+            if write_stdout(serialized):
+                flush_stdout()
         except (ValueError, OSError) as exc:
             _exit_uat_validation_error(exc)
 
@@ -1709,7 +1747,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             if json_mode:
                 last_res = getattr(workflow, "last_result", None)
                 if last_res is not None and isinstance(getattr(last_res, "run_id", None), str):
-                    custom_phi = _resolve_custom_phi_fields(study_key)
+                    custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk)
                     item = _serialize_uat_run_result(
                         last_res,
                         study_key=study_key,
@@ -1723,16 +1761,17 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                     study_key=study_key,
                     dry_run=dry_run,
                     failure_phase="PREFLIGHT",
+                    sdk=sdk,
                 )
             if isinstance(exc, (ValueError, OSError)):
-                _exit_uat_validation_error(exc)
+                _exit_uat_validation_error(exc, study_key=study_key, sdk=sdk)
             raise
 
         result_state = getattr(result, "state", None)
         is_success = bool(result.overall_success) and result_state != UATWorkflowState.FAILED
 
         if json_mode:
-            custom_phi = _resolve_custom_phi_fields(study_key)
+            custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk)
             item = _serialize_uat_run_result(
                 result,
                 study_key=study_key,
@@ -1988,7 +2027,8 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
         target_domain = (
             resolve_sdtm_domain(sdtm_domain, fallback="") if sdtm_domain else ""
         ) or None
-        study_cfg = resolve_study_configuration(study_key)
+        with sdk_governance_context(sdk):
+            study_cfg = resolve_study_configuration(study_key)
 
         def _fetch_inputs() -> tuple[list[Any], list[Any], list[Any]]:
             forms = list(sdk.forms.list(study_key=study_key))
@@ -2164,7 +2204,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             form_domain_map=cli_form_map if (cli_form_map or raw_forms) else None,
         )
 
-        custom_phi = _resolve_custom_phi_fields(study_key) if mask_phi else []
+        custom_phi = _resolve_custom_phi_fields(study_key, sdk=sdk) if mask_phi else []
         if mask_phi and study_cfg is not None:
             cfg_phi = getattr(study_cfg, "phi_fields", None) or []
             if cfg_phi:
@@ -2283,6 +2323,7 @@ def setup_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
                 payload,
                 study_key=study_key,
                 mask_phi=mask_phi,
+                sdk=sdk,
             )
             emit_json([sanitized_payload], "standards_readiness")
         else:
@@ -2397,7 +2438,7 @@ def setup_subject_parser(subparsers: argparse._SubParsersAction[Any]) -> None:
             print_error(f"Error: Subject '{subject_key}' not found in study '{study_key}'.")
             sys.exit(1)
 
-        masked_data = _mask_workflow_item(data, study_key=study_key, mask_phi=mask_phi)
+        masked_data = _mask_workflow_item(data, study_key=study_key, mask_phi=mask_phi, sdk=sdk)
 
         if resolved_format == "json":
             emit_json([masked_data], "subject_data")

@@ -507,3 +507,91 @@ async def test_tenant_scoped_study_configuration_phi_masking_across_cdisc_workfl
         "TENANT_ST"
     )
     assert async_annots[0].comment == "***MASKED***"
+
+
+@pytest.mark.asyncio
+async def test_record_mapper_and_async_record_mapper_naming_and_sdtm_contracts() -> None:
+    """RecordMapper and AsyncRecordMapper honor naming_convention, preserve_record_id, DM deduplication, and explicit as_sdtm=False."""
+    from unittest.mock import AsyncMock
+
+    from imednet_workflows.record_mapper import AsyncRecordMapper
+
+    sdk, records = _build_workflow_sdk()
+    extra_vars = [
+        *sdk.variables.list(),
+        Variable(
+            variable_id=4,
+            variable_name="form_key",
+            label="Form Key Var",
+            variable_type="text",
+            form_id=101,
+            form_key="DM",
+            sequence=3,
+        ),
+    ]
+    sdk.variables.list.return_value = extra_vars
+    sdk.get_variables.return_value = extra_vars
+    records.append(
+        Record(
+            record_id=3,
+            study_key="CDISC_WF",
+            subject_id=500,
+            subject_key="SUBJ-100",
+            site_id=1,
+            form_id=101,
+            form_key="DM",
+            date_modified="2026-02-02T10:00:00Z",
+            record_data={"SUBJID": "100", "SEX": "F", "form_key": "nested_collision"},
+        )
+    )
+    sdk.get_intervals.return_value = []
+    sdk.get_subjects.return_value = []
+    sdk.get_visits.return_value = []
+    sdk._async_sdk = None
+
+    mapper = RecordMapper(sdk)
+    camel_df = mapper.dataframe(
+        "CDISC_WF",
+        form_whitelist=[101],
+        use_labels_as_columns=False,
+        naming_convention="camelCase",
+    )
+    assert "recordId" in camel_df.columns
+    assert "var_formKey" in camel_df.columns
+
+    non_sdtm_filtered = mapper.dataframe(
+        "CDISC_WF",
+        as_sdtm=False,
+        domain="DM",
+        use_labels_as_columns=False,
+        naming_convention="snake_case",
+    )
+    assert "record_id" in non_sdtm_filtered.columns
+    assert "USUBJID" not in non_sdtm_filtered.columns
+
+    dm_sdtm = mapper.sdtm_dataframe("CDISC_WF", domain="DM", preserve_record_id=True)
+    assert len(dm_sdtm) == 1
+    assert dm_sdtm["SEX"].iloc[0] == "F"
+    assert int(dm_sdtm["RECORD_ID"].iloc[0]) == 3
+
+    hier = mapper.build_hierarchy("CDISC_WF", naming_convention="camelCase")
+    assert hier[0]["subjectKey"] == "SUBJ-100"
+
+    async_sdk = MagicMock()
+    async_sdk.get_forms = AsyncMock(return_value=sdk.forms.list())
+    async_sdk.get_variables = AsyncMock(return_value=sdk.variables.list())
+    async_sdk.get_records = AsyncMock(return_value=[r.model_copy(deep=True) for r in records])
+    async_sdk.get_intervals = AsyncMock(return_value=[])
+    async_sdk.get_subjects = AsyncMock(return_value=[])
+    async_sdk.get_visits = AsyncMock(return_value=[])
+
+    amapper = AsyncRecordMapper(async_sdk)
+    adm_df = await amapper.sdtm_dataframe("CDISC_WF", domain="DM", preserve_record_id=True)
+    assert len(adm_df) == 1
+    assert int(adm_df["RECORD_ID"].iloc[0]) == 3
+
+    ahier = await amapper.build_hierarchy("CDISC_WF", naming_convention="sdtm")
+    assert ahier[0]["USUBJID"] == "SUBJ-100"
+
+    adj = await amapper.sdtm_dataset_json("CDISC_WF", domain="DM", preserve_record_id=True)
+    assert validate_dataset_json(adj) == []

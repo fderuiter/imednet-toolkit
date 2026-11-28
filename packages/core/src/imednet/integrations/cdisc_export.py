@@ -33,6 +33,7 @@ from imednet.datadict.exchange import (
 )
 from imednet.datadict.loaders.cdisc_odm import load_odm_archive
 from imednet.datadict.models import DataDictionary
+from imednet.errors import ExportConfigurationError
 from imednet.integrations._export_contracts import (
     filter_records_by_form_whitelist,
     resolve_config_manifest_path,
@@ -46,6 +47,7 @@ from imednet.integrations.sink_base import (
     SinkConfig,
     apply_quality_gate,
     commit_sdtm_lineage,
+    deduplicate_sdtm_rows,
     extract_record_id,
     is_incremental_sink_config,
     iter_batches,
@@ -124,7 +126,7 @@ def _build_cdisc_sink_config(
     *,
     config: SinkConfig | None,
     mask_phi: bool,
-    as_sdtm: bool = False,
+    as_sdtm: bool | None = None,
     sdtm_domain: str | None = None,
     naming_convention: str | None = None,
     preserve_record_id: bool | None = None,
@@ -139,11 +141,16 @@ def _build_cdisc_sink_config(
                 overrides[k] = remaining.pop(k)
         if not mask_phi and config.mask_phi:
             overrides["mask_phi"] = False
-        if as_sdtm and not config.as_sdtm:
-            overrides["as_sdtm"] = True
+        if as_sdtm is not None and as_sdtm != config.as_sdtm:
+            overrides["as_sdtm"] = as_sdtm
         if sdtm_domain is not None and config.sdtm_domain is None:
             overrides["sdtm_domain"] = sdtm_domain
-            overrides["as_sdtm"] = True
+            if (
+                as_sdtm is None
+                and "as_sdtm" not in overrides
+                and not getattr(config, "_as_sdtm_explicit", False)
+            ):
+                overrides["as_sdtm"] = True
         if naming_convention is not None and config.naming_convention is None:
             overrides["naming_convention"] = naming_convention
         if preserve_record_id is not None and config.preserve_record_id is None:
@@ -163,8 +170,8 @@ def _build_cdisc_sink_config(
             extra_kwargs[k] = v
 
     cfg_kwargs.setdefault("mask_phi", mask_phi)
-    if as_sdtm:
-        cfg_kwargs.setdefault("as_sdtm", True)
+    if as_sdtm is not None:
+        cfg_kwargs.setdefault("as_sdtm", as_sdtm)
     if sdtm_domain is not None:
         cfg_kwargs.setdefault("sdtm_domain", sdtm_domain)
     if naming_convention is not None:
@@ -228,12 +235,15 @@ def _extract_existing_odm_records(
     """Reconstruct synthetic Record dicts from an existing ``OdmArchive`` for incremental upsert."""
     dd = existing_archive.data_dictionary
     oid_to_var: dict[tuple[str, str], str] = {}
+    ig_oid_to_form_key: dict[str, str] = {}
     for form in dd.forms:
         extra_form = form.extraAttributes if isinstance(form.extraAttributes, Mapping) else {}
         preserved_ig = extra_form.get("itemGroupOID")
         ig_oids = [f"IG.{form.formKey}", f"IG_{form.formKey}"]
         if isinstance(preserved_ig, str) and preserved_ig.strip():
             ig_oids.append(preserved_ig.strip())
+        for ig_oid in ig_oids:
+            ig_oid_to_form_key[ig_oid] = form.formKey
         for var in form.variables:
             extra_var = var.extraAttributes if isinstance(var.extraAttributes, Mapping) else {}
             preserved_it = extra_var.get("itemOID")
@@ -268,28 +278,31 @@ def _extract_existing_odm_records(
                 ):
                     se_oid_to_interval_name[v_oid.strip()] = v_name.strip()
 
-    def _collect_form_records(
-        fd: Any,
+    def _collect_item_groups(
+        item_groups: Sequence[Any],
         *,
-        subj_key: str,
+        form_key: str,
+        subj_key: str | None,
         site_oid: str | None,
         visit_id: int | None,
         interval_name: str | None,
         study_event_oid: str | None,
         study_event_repeat_key: str | None,
     ) -> None:
-        if getattr(fd, "transaction_type", None) == "Remove":
-            return
-        form_key = fd.form_oid.removeprefix("F.")
-        for ig in fd.item_groups:
+        for ig in item_groups:
             if getattr(ig, "transaction_type", None) == "Remove":
                 continue
             rep_key = ig.item_group_repeat_key
             if rep_key and rep_key in exclude_record_ids:
                 continue
             rec_id: int | str | None = None
+            rec_oid: str | None = None
             if rep_key is not None:
-                rec_id = int(rep_key) if rep_key.isdigit() else rep_key
+                if rep_key.isdigit():
+                    rec_id = int(rep_key)
+                else:
+                    rec_id = rep_key
+                    rec_oid = rep_key
             rec_data: dict[str, Any] = {}
             for item in ig.items:
                 if getattr(item, "transaction_type", None) == "Remove":
@@ -315,6 +328,7 @@ def _extract_existing_odm_records(
                 "interval_name": interval_name,
                 "form_key": form_key,
                 "record_id": rec_id,
+                "record_oid": rec_oid,
                 "record_data": rec_data,
             }
             if study_event_oid:
@@ -323,7 +337,47 @@ def _extract_existing_odm_records(
                 rec_entry["study_event_repeat_key"] = study_event_repeat_key
             retained.append(rec_entry)
 
+    def _collect_form_records(
+        fd: Any,
+        *,
+        subj_key: str | None,
+        site_oid: str | None,
+        visit_id: int | None,
+        interval_name: str | None,
+        study_event_oid: str | None,
+        study_event_repeat_key: str | None,
+    ) -> None:
+        if getattr(fd, "transaction_type", None) == "Remove":
+            return
+        form_key = fd.form_oid.removeprefix("F.")
+        _collect_item_groups(
+            fd.item_groups,
+            form_key=form_key,
+            subj_key=subj_key,
+            site_oid=site_oid,
+            visit_id=visit_id,
+            interval_name=interval_name,
+            study_event_oid=study_event_oid,
+            study_event_repeat_key=study_event_repeat_key,
+        )
+
     retained: list[dict[str, Any]] = []
+    for ref_container in getattr(existing_archive, "reference_data", ()):
+        for ig in ref_container.item_groups:
+            if getattr(ig, "transaction_type", None) == "Remove":
+                continue
+            mapped_fk = ig_oid_to_form_key.get(ig.item_group_oid)
+            if mapped_fk is not None:
+                _collect_item_groups(
+                    (ig,),
+                    form_key=mapped_fk,
+                    subj_key=None,
+                    site_oid=None,
+                    visit_id=None,
+                    interval_name=None,
+                    study_event_oid=None,
+                    study_event_repeat_key=None,
+                )
     for cdata in existing_archive.clinical_data:
         for subj in cdata.subjects:
             if getattr(subj, "transaction_type", None) == "Remove":
@@ -364,6 +418,27 @@ def _extract_existing_odm_records(
     return retained
 
 
+def _retain_static_odm_reference_data(existing_archive: Any) -> list[OdmReferenceData]:
+    """Return non-form static ``OdmReferenceData`` blocks from *existing_archive*."""
+    dd = existing_archive.data_dictionary
+    form_ig_oids: set[str] = set()
+    for form in dd.forms:
+        form_ig_oids.add(f"IG.{form.formKey}")
+        form_ig_oids.add(f"IG_{form.formKey}")
+        extra_form = form.extraAttributes if isinstance(form.extraAttributes, Mapping) else {}
+        preserved_ig = extra_form.get("itemGroupOID")
+        if isinstance(preserved_ig, str) and preserved_ig.strip():
+            form_ig_oids.add(preserved_ig.strip())
+    static_refs: list[OdmReferenceData] = []
+    for ref_container in getattr(existing_archive, "reference_data", ()):
+        kept_igs = tuple(
+            ig for ig in ref_container.item_groups if ig.item_group_oid not in form_ig_oids
+        )
+        if kept_igs:
+            static_refs.append(ref_container.model_copy(update={"item_groups": kept_igs}))
+    return static_refs
+
+
 class _OdmArchiveSink(ExportSink):
     """Streaming CDISC ODM 1.3.2 archive sink supporting incremental upserts and voided pruning."""
 
@@ -386,6 +461,7 @@ class _OdmArchiveSink(ExportSink):
         file_oid: str | None = None,
         creation_datetime: str | None = None,
         manifest_path: str | None = None,
+        enrichment_pipeline: Any = None,
         phi_keys: Collection[str] | None = None,
     ) -> None:
         super().__init__(config)
@@ -404,11 +480,23 @@ class _OdmArchiveSink(ExportSink):
         self._file_oid = file_oid
         self._creation_datetime = creation_datetime
         self._manifest_path = manifest_path
+        self._pipeline = enrichment_pipeline
         self._phi_keys = set(phi_keys or ())
         self._staged_by_id: dict[str, Any] = {}
         self._unkeyed_records: list[Any] = []
         self._voided_ids: set[str] = set()
         self._flushed = False
+
+    def redact_batch(
+        self,
+        records: Sequence[Any],
+        *,
+        study_key: str | None = None,
+        config: SinkConfig | None = None,
+        phi_keys: Collection[str] | None = None,
+    ) -> Sequence[Any]:
+        """Defer PHI redaction to ``build_odm_archive`` so ``EnrichmentPipeline`` runs on raw records."""
+        return records
 
     def _project_record(self, rec: Any) -> Any:
         if self._variable_whitelist is None:
@@ -497,7 +585,7 @@ class _OdmArchiveSink(ExportSink):
                 )
                 merged_records = [*prior_records, *staged_records]
                 if not existing_ref_data and prior_archive.reference_data:
-                    existing_ref_data = list(prior_archive.reference_data)
+                    existing_ref_data = _retain_static_odm_reference_data(prior_archive)
             except Exception as exc:
                 logger.warning(
                     "Unable to merge existing ODM archive at '%s'; writing fresh snapshot: %s",
@@ -592,6 +680,7 @@ class _OdmArchiveSink(ExportSink):
                 creation_datetime=self._creation_datetime or prior_creation_dt,
                 mask_phi=self.config.mask_phi,
                 custom_phi_keys=self._phi_keys or None,
+                enrichment_pipeline=self._pipeline,
                 include_deleted=self.config.include_deleted,
             )
 
@@ -688,12 +777,12 @@ def _merge_dataset_json_envelopes(
         usubjid = row.get("USUBJID")
         if not st_id or not usubjid:
             return None
-        dom = prior_env.name
+        dom = str(row.get("DOMAIN") or prior_env.name).strip().upper()
+        if dom == "DM":
+            return (str(st_id), "DM", str(usubjid), None, None)
         seq_col = f"{dom}SEQ"
         if seq_col in row and row.get(seq_col) is not None:
             return (str(st_id), dom, str(usubjid), seq_col, row.get(seq_col))
-        if dom == "DM":
-            return (str(st_id), "DM", str(usubjid), None, None)
         return None
 
     superseded_ids = {
@@ -714,6 +803,8 @@ def _merge_dataset_json_envelopes(
         kept_prior.append(prow)
 
     combined_rows = [*kept_prior, *delta_rows]
+    if prior_env.name.strip().upper() == "DM":
+        combined_rows = deduplicate_sdtm_rows(combined_rows)
 
     unified_cols_by_name: dict[str, DatasetJsonColumn] = {
         col.name: col for col in prior_env.columns if col.name != "ITEMGROUPDATASEQ"
@@ -881,7 +972,11 @@ class _DatasetJsonSink(ExportSink):
 
         def _reconcile() -> int:
             reconciled = 0
-            effective_sdtm = bool(self.config.as_sdtm or self.config.sdtm_domain)
+            effective_sdtm = (
+                bool(self.config.as_sdtm)
+                if getattr(self.config, "_as_sdtm_explicit", False)
+                else bool(self.config.as_sdtm or self.config.sdtm_domain)
+            )
             for rec in records:
                 rid = extract_record_id(rec)
                 if rid is not None and not isinstance(rid, bool):
@@ -931,7 +1026,11 @@ class _DatasetJsonSink(ExportSink):
         ):
             return
 
-        effective_sdtm = bool(self.config.as_sdtm or self.config.sdtm_domain)
+        effective_sdtm = (
+            bool(self.config.as_sdtm)
+            if getattr(self.config, "_as_sdtm_explicit", False)
+            else bool(self.config.as_sdtm or self.config.sdtm_domain)
+        )
 
         with sdk_governance_context(self._sdk):
             forms = _safe_fetch_sdk_items(self._sdk, self._study_key, "forms", "get_forms")
@@ -1168,6 +1267,40 @@ class _DatasetJsonSink(ExportSink):
         self._voided_sdtm_keys.clear()
 
 
+def _reject_unsupported_odm_options(
+    config: SinkConfig | None,
+    kwargs: Mapping[str, Any],
+) -> None:
+    """Reject SDTM and naming convention options unsupported by CDISC ODM 1.3.2 XML exports."""
+    offending: list[str] = []
+    if kwargs.get("as_sdtm") is not None:
+        offending.append("as_sdtm")
+    if kwargs.get("sdtm_domain") is not None or kwargs.get("domain") is not None:
+        offending.append("sdtm_domain")
+    if kwargs.get("naming_convention") is not None:
+        offending.append("naming_convention")
+    if kwargs.get("preserve_record_id") is not None:
+        offending.append("preserve_record_id")
+    if config is not None:
+        if (
+            config.as_sdtm or getattr(config, "_as_sdtm_explicit", False)
+        ) and "as_sdtm" not in offending:
+            offending.append("as_sdtm")
+        if config.sdtm_domain is not None and "sdtm_domain" not in offending:
+            offending.append("sdtm_domain")
+        if config.naming_convention is not None and "naming_convention" not in offending:
+            offending.append("naming_convention")
+        if config.preserve_record_id is not None and "preserve_record_id" not in offending:
+            offending.append("preserve_record_id")
+    if offending:
+        joined = ", ".join(offending)
+        raise ExportConfigurationError(
+            f"CDISC ODM 1.3.2 export preserves EDC CRF metadata and does not support SDTM or "
+            f"naming convention options ({joined}). Use export_to_dataset_json or a tabular "
+            f"sink for SDTM and naming convention exports."
+        )
+
+
 def export_to_odm(
     sdk: ImednetSDK,
     study_key: str,
@@ -1188,6 +1321,7 @@ def export_to_odm(
     **kwargs: Any,
 ) -> None:
     """Export a study snapshot to CDISC ODM 1.3.2 XML with incremental checkpointing and PHI redaction."""
+    _reject_unsupported_odm_options(config, kwargs)
     manifest_arg = kwargs.pop("manifest_path", None)
     kwargs.setdefault("quality_gate_enabled", quality_gate_enabled)
     resolved_cfg = _build_cdisc_sink_config(
@@ -1225,6 +1359,7 @@ def export_to_odm(
         file_oid=file_oid,
         creation_datetime=creation_datetime,
         manifest_path=manifest_path,
+        enrichment_pipeline=pipeline,
         phi_keys=phi_keys,
     )
     run_streaming_export(
@@ -1248,7 +1383,7 @@ def export_to_dataset_json(
     use_labels_as_columns: bool = False,
     variable_whitelist: list[str] | None = None,
     form_whitelist: list[int] | None = None,
-    as_sdtm: bool = False,
+    as_sdtm: bool | None = None,
     sdtm_domain: str | None = None,
     naming_convention: str | None = None,
     preserve_record_id: bool | None = None,

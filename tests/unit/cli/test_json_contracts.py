@@ -188,8 +188,10 @@ def test_users_and_codings_json_complete_aliases_and_no_contamination(sdk, capsy
     assert user_payload["count"] == 1
     assert user_payload["items"][0]["userId"] == "U-JSON-1"
     assert user_payload["items"][0]["login"] == "jdoe_json"
+    assert user_payload["items"][0]["firstName"] == "John"
+    assert user_payload["items"][0]["lastName"] == "Doe"
     assert user_payload["items"][0]["userActiveInStudy"] is True
-    assert user_payload["items"][0]["name"] == "John Doe"
+    assert "name" not in user_payload["items"][0]
 
     coding = Coding.model_validate(
         {

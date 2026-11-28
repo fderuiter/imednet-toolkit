@@ -53,15 +53,15 @@ launch to open a study and monitor specific batch jobs immediately (or pass ``--
 without ``--study`` to stage ``QUEUED`` batches until a ``Study`` is selected), and pass
 ``--force`` only when intentionally bypassing TTY stream checks.
 
-When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
-``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
-table with live filtering and a side inspection panel:
+When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a valid
+non-``dumb`` ``TERM`` entry in terminfo), core list commands render results in
+``InteractiveDataGrid``, a curses-driven table with live filtering and record inspection:
 
 * ``Up`` / ``Down`` (or ``k`` / ``j``), ``Page Up`` / ``Page Down``, ``Home`` / ``End``: navigate rows.
 * ``Left`` / ``Right`` (or ``h`` / ``l``): scroll columns horizontally across wide tables.
-* ``/``: enter live search mode across table columns, record metadata, and form variables (``Enter`` or ``Esc`` exits search input; in normal mode, ``Esc`` closes an open side panel first and then clears the active filter).
+* ``/``: enter live search mode across table columns, record metadata, and form variables (``Enter`` commits search input; ``Esc`` cancels uncommitted search edits and restores the anchored selection; in normal mode, ``Esc`` closes an open inspection panel/modal first and then clears the active filter).
 * ``a``: load all remaining pages into ``InteractiveDataGrid`` when the initial 100-item TTY view is truncated, re-evaluating any active ``/`` filter.
-* ``Space``: toggle the side inspection panel (``[`` / ``]`` scrolls overflowing panel lines and ``{`` / ``}`` scrolls panel pages with ``Lines X-Y of Z`` ``▲`` / ``▼`` cues; ``Esc`` or ``Space`` closes the panel).
+* ``Space``: toggle record inspection—opening a split side panel on ``>= 50``-column terminals or a full-width detail modal on narrow ``24``–``49``-column panes (``[`` / ``]`` scrolls overflowing lines and ``{`` / ``}`` scrolls pages with ``Lines X-Y of Z`` ``▲`` / ``▼`` cues; ``Esc`` or ``Space`` closes the panel or modal).
 * ``q``: exit ``InteractiveDataGrid``.
 
 Set ``IMEDNET_NON_INTERACTIVE=1`` or pass ``--no-interactive`` (or pipe stdout in scripts

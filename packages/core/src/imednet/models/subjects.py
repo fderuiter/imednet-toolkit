@@ -123,8 +123,8 @@ class SubjectKeyword(ImednetBaseModel):
 
     keyword_name: str = Field("", alias="keywordName")
     keyword_key: str = Field("", alias="keywordKey")
-    keyword_id: int = Field(0, alias="keywordId")
-    date_added: datetime = Field(default_factory=datetime.now, alias="dateAdded")
+    keyword_id: int | None = Field(default=None, alias="keywordId")
+    date_added: datetime | None = Field(default=None, alias="dateAdded")
 
 
 SubjectKeyword = ModelEngine.get_model('SubjectKeyword', SubjectKeyword)
@@ -133,7 +133,9 @@ SubjectKeyword = ModelEngine.get_model('SubjectKeyword', SubjectKeyword)
 class Subject(ImednetBaseModel):
     """A subject (participant) in a study, with status and site info."""
 
-    keywords: list[SubjectKeyword] = Field(default_factory=list, alias="keywords")
+    keywords: list[SubjectKeyword] | None = Field(
+        default_factory=list[SubjectKeyword], alias="keywords"
+    )
     subject_status: SubjectStatus | str | None = Field(default=None, alias="subjectStatus")
     deleted: bool | None = Field(default=None, alias="deleted")
 

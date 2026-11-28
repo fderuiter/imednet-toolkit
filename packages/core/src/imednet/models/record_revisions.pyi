@@ -5,14 +5,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 
-from pydantic import Field, ValidatorFunctionWrapHandler, field_validator, model_validator
+from pydantic import (
+    Field,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
+)
 
 from imednet.models.base import ImednetBaseModel
 from imednet.models.records import RecordStatus
 
-def _coerce_optional_int_for_bounds(value: Any, field_name: str) -> int | None: ...
 def _parse_revision_timestamp(value: Any) -> datetime | None: ...
 def _validate_revision_bounds(record_revision: int | None, data_revision: int | None) -> None: ...
 
@@ -78,9 +83,11 @@ class RecordRevision(ImednetBaseModel):
         last_updated: str | None = None,
         lastUpdated: str | None = None,
     ) -> None: ...
-    @model_validator(mode="before")
+    @field_validator("record_revision", "data_revision", mode="before")
     @classmethod
-    def _validate_bounds(cls, data: Any) -> Any: ...
+    def _reject_bool_revisions(cls, value: Any, info: ValidationInfo) -> Any: ...
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> Self: ...
     @field_validator("record_status", mode="wrap")
     @classmethod
     def _validate_record_status(

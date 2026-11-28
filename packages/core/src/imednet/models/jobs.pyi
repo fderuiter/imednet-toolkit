@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from imednet.errors.base import ImednetError
 from imednet.models.base import ImednetBaseModel
@@ -135,7 +135,7 @@ class JobStatus(Job):
     ) -> None: ...
     @model_validator(mode="before")
     @classmethod
-    def _normalize_record_count_keys(cls, data: Any) -> Any: ...
+    def _normalize_record_count_keys(cls, data: Any, info: ValidationInfo) -> Any: ...
     @field_validator("progress", mode="before", check_fields=False)
     def _parse_progress(cls, v: Any) -> int | None: ...
     @staticmethod

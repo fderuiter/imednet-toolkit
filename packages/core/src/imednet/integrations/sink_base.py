@@ -109,6 +109,12 @@ from imednet.core.operations.circuit_breaker import CircuitBreaker
 from imednet.core.operations.executor import OperationRetryPolicy
 from imednet.errors import ExportConfigurationError, ExportError
 from imednet.integrations.enrichment import resolve_sink_phi_keys
+from imednet.models.sdtm import (
+    deduplicate_sdtm_rows,
+    extract_sdtm_composite_key,
+    format_nested_variable_name,
+    prefix_colliding_variable_name,
+)
 from imednet.models.standards import (
     _SDTM_RECORDS_SORT,
     PROFILE_REGISTRY,
@@ -384,7 +390,7 @@ class SinkConfig:
     ledger_path: str | Path | None = None
     state_provider: Any | None = field(default=None, repr=False)
     max_buffered_records: int | None = None
-    as_sdtm: bool = False
+    as_sdtm: bool = field(default=cast(bool, None))
     sdtm_domain: str | None = None
     standards_profile: str | Any | None = None
     min_standards_score: float | None = None
@@ -419,13 +425,19 @@ class SinkConfig:
                 "idempotent=True."
             )
         validate_max_buffered_records(self.max_buffered_records)
-        if not isinstance(self.as_sdtm, bool):
-            raise ValueError("as_sdtm must be a boolean")
+        if self.as_sdtm is None:
+            object.__setattr__(self, "_as_sdtm_explicit", False)
+            self.as_sdtm = False
+        else:
+            if not isinstance(self.as_sdtm, bool):
+                raise ValueError("as_sdtm must be a boolean")
+            object.__setattr__(self, "_as_sdtm_explicit", True)
         if self.sdtm_domain is not None:
             if not isinstance(self.sdtm_domain, str) or not self.sdtm_domain.strip():
                 raise ValueError("sdtm_domain must be a non-empty string when provided")
             self.sdtm_domain = resolve_sdtm_domain(self.sdtm_domain)
-            self.as_sdtm = True
+            if not getattr(self, "_as_sdtm_explicit", False):
+                self.as_sdtm = True
         if self.standards_profile is not None:
             try:
                 resolved_prof = resolve_standards_profile(self.standards_profile)
@@ -898,10 +910,7 @@ class ExportSink(ABC):
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
         active_cfg = config if config is not None else getattr(self, "config", None)
         should_mask = getattr(active_cfg, "mask_phi", True) is not False
-        raw_domain = getattr(active_cfg, "sdtm_domain", None)
-        is_sdtm = getattr(active_cfg, "as_sdtm", False) is True or (
-            isinstance(raw_domain, str) and bool(raw_domain.strip())
-        )
+        is_sdtm = resolve_effective_as_sdtm(active_cfg)
         if is_sdtm and getattr(self, "_delegates_sdtm_redaction", False):
             return records
         active_sk = study_key if study_key is not None else getattr(active_cfg, "study_key", None)
@@ -1144,10 +1153,7 @@ class AsyncExportSink(ABC):
         """Redact sensitive clinical PHI across ``records`` when ``config.mask_phi`` is enabled."""
         active_cfg = config if config is not None else getattr(self, "config", None)
         should_mask = getattr(active_cfg, "mask_phi", True) is not False
-        raw_domain = getattr(active_cfg, "sdtm_domain", None)
-        is_sdtm = getattr(active_cfg, "as_sdtm", False) is True or (
-            isinstance(raw_domain, str) and bool(raw_domain.strip())
-        )
+        is_sdtm = resolve_effective_as_sdtm(active_cfg)
         if is_sdtm and getattr(self, "_delegates_sdtm_redaction", False):
             return records
         active_sk = study_key if study_key is not None else getattr(active_cfg, "study_key", None)
@@ -2824,17 +2830,13 @@ def _extract_safe_config_options(config: Any) -> dict[str, Any]:
         else None
     )
 
-    raw_as_sdtm = config.as_sdtm if is_real_cfg else getattr(config, "as_sdtm", False)
-    as_sdtm = raw_as_sdtm if isinstance(raw_as_sdtm, bool) else False
-
     raw_sdtm_domain = config.sdtm_domain if is_real_cfg else getattr(config, "sdtm_domain", None)
     sdtm_domain = (
         resolve_sdtm_domain(raw_sdtm_domain)
         if isinstance(raw_sdtm_domain, str) and raw_sdtm_domain.strip()
         else None
     )
-    if sdtm_domain is not None:
-        as_sdtm = True
+    as_sdtm = resolve_effective_as_sdtm(config, sdtm_domain=sdtm_domain)
 
     raw_std_profile = (
         config.standards_profile if is_real_cfg else getattr(config, "standards_profile", None)
@@ -3059,60 +3061,37 @@ async def _async_try_fetch_study_forms(sdk: Any, study_key: str) -> list[Any]:
         return []
 
 
-def extract_sdtm_composite_key(
-    row: Mapping[str, Any],
-) -> tuple[str, str, str, str | None, int | None] | None:
-    """Return ``(STUDYID, DOMAIN, USUBJID, seq_col, seq_val)`` for a transformed SDTM row."""
-    study_id = row.get("STUDYID")
-    domain = row.get("DOMAIN")
-    usubjid = row.get("USUBJID")
-    if study_id is None or domain is None or usubjid is None:
-        return None
-    dom_str = str(domain).strip().upper()
-    if not dom_str:
-        return None
-    if dom_str == "DM":
-        return (str(study_id), "DM", str(usubjid), None, None)
-    seq_col = f"{dom_str}SEQ"
-    raw_seq = row.get(seq_col)
-    if raw_seq is None:
-        for cand_col, cand_val in row.items():
-            cand_str = str(cand_col)
-            if cand_str.endswith("SEQ") and cand_str.upper() != "DMSEQ" and cand_val is not None:
-                seq_col = cand_str
-                raw_seq = cand_val
-                break
-    if raw_seq is None or isinstance(raw_seq, bool):
-        return (str(study_id), dom_str, str(usubjid), seq_col, None)
-    try:
-        seq_val = int(raw_seq)
-    except (TypeError, ValueError):
-        try:
-            as_float = float(raw_seq)
-        except (TypeError, ValueError):
-            return (str(study_id), dom_str, str(usubjid), seq_col, None)
-        if math.isnan(as_float) or math.isinf(as_float) or not as_float.is_integer():
-            return (str(study_id), dom_str, str(usubjid), seq_col, None)
-        seq_val = int(as_float)
-    return (str(study_id), dom_str, str(usubjid), seq_col, seq_val)
-
-
-def deduplicate_sdtm_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate transformed SDTM rows by composite key ``(STUDYID, DOMAIN, USUBJID[, <DOM>SEQ])``."""
-    if len(rows) <= 1:
-        return list(rows)
-    dedup_index: dict[tuple[Any, ...], int] = {}
-    ordered_rows: list[dict[str, Any] | None] = []
-    for row in rows:
-        comp = extract_sdtm_composite_key(row)
-        if comp is None or (comp[1] != "DM" and comp[4] is None):
-            ordered_rows.append(row)
-            continue
-        if comp in dedup_index:
-            ordered_rows[dedup_index[comp]] = None
-        dedup_index[comp] = len(ordered_rows)
-        ordered_rows.append(row)
-    return [r for r in ordered_rows if r is not None]
+def resolve_effective_as_sdtm(
+    config: Any,
+    *,
+    as_sdtm: bool | None = None,
+    sdtm_domain: str | None = None,
+) -> bool:
+    """Resolve effective ``as_sdtm`` mode while honoring explicit ``as_sdtm=False``."""
+    if isinstance(as_sdtm, bool):
+        return as_sdtm
+    if config is None:
+        return bool(isinstance(sdtm_domain, str) and sdtm_domain.strip())
+    if isinstance(config, SinkConfig):
+        if (
+            isinstance(sdtm_domain, str)
+            and sdtm_domain.strip()
+            and not getattr(config, "_as_sdtm_explicit", False)
+        ):
+            return True
+        return bool(config.as_sdtm)
+    raw_as = getattr(config, "as_sdtm", None)
+    if raw_as is True:
+        return True
+    cfg_ns = getattr(config, "__dict__", None)
+    if isinstance(cfg_ns, Mapping) and "as_sdtm" in cfg_ns and cfg_ns["as_sdtm"] is False:
+        return False
+    if getattr(config, "_as_sdtm_explicit", False) and raw_as is False:
+        return False
+    raw_dom = sdtm_domain if sdtm_domain is not None else getattr(config, "sdtm_domain", None)
+    if isinstance(raw_dom, str) and raw_dom.strip():
+        return True
+    return bool(raw_as is True)
 
 
 def _resolve_lineage_target(
@@ -3719,7 +3698,7 @@ async def async_run_streaming_export(
             source_is_ordered = bool(getattr(records_source, "_sdtm_source_is_ordered", False))
         else:
             source_is_ordered = bool(opts["as_sdtm"] and _is_bound_real_async_records_endpoint(sdk))
-            if opts["sdtm_domain"] is not None:
+            if opts["as_sdtm"] and opts["sdtm_domain"] is not None:
                 if study_forms:
                     matched_forms = filter_forms_by_sdtm_domain(
                         study_forms,
@@ -3998,9 +3977,7 @@ def should_preserve_sdtm_record_id(
         extra_val = extra.get("preserve_record_id")
         if isinstance(extra_val, bool):
             return extra_val
-    return bool(
-        getattr(config, "idempotent", True) is not False or is_incremental_sink_config(config)
-    )
+    return is_incremental_sink_config(config)
 
 
 def bind_sdtm_stream_metadata(
@@ -4057,6 +4034,7 @@ __all__ = [
     "extract_record_timestamp",
     "extract_sdtm_composite_key",
     "filter_forms_by_sdtm_domain",
+    "format_nested_variable_name",
     "get_state_provider",
     "get_tabular_batch_stamp",
     "has_valid_tabular_batch_stamp",
@@ -4069,9 +4047,11 @@ __all__ = [
     "normalize_phi_keys_snapshot",
     "normalize_sink_value",
     "normalize_watermark_datetime",
+    "prefix_colliding_variable_name",
     "record_matches_sdtm_domain",
     "redact_batch_records",
     "rehydrate_sdtm_lineage",
+    "resolve_effective_as_sdtm",
     "resolve_form_sdtm_domain",
     "resolve_max_buffered_records",
     "resolve_voided_sdtm_keys",

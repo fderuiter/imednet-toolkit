@@ -8,7 +8,8 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, NoReturn
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
 import httpx
@@ -23,6 +24,7 @@ from imednet.core.http.monitor import RequestMonitor
 from imednet.core.operations.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerError,
+    CircuitState,
     ProbeLease,
     get_global_circuit_breaker,
 )
@@ -40,6 +42,15 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Tracer
 else:
     Tracer = Any
+
+
+@dataclass
+class _AttemptTracker:
+    """Mutable per-call tracking for executed wire attempts and their latest outcome."""
+
+    attempts: int = 0
+    last_response: httpx.Response | None = None
+    last_request_error: httpx.RequestError | None = None
 
 
 class BaseRequestExecutor(ABC):
@@ -116,7 +127,9 @@ class BaseRequestExecutor(ABC):
                 if retry_state.outcome and retry_state.outcome.failed
                 else None
             )
-            if exc is not None and not isinstance(exc, Exception):
+            if exc is not None and (
+                isinstance(exc, CircuitBreakerError) or not isinstance(exc, Exception)
+            ):
                 return False
             state = RetryState(
                 attempt_number=retry_state.attempt_number,
@@ -136,12 +149,12 @@ class BaseRequestExecutor(ABC):
     def _record_response_outcome(response: httpx.Response, lease: ProbeLease) -> None:
         """Record a single circuit-breaker outcome for an HTTP response before error mapping."""
         status = response.status_code
-        if status == 429:
-            lease.record_rate_limit()
-        elif status >= 500:
-            lease.record_failure()
-        else:
+        if 200 <= status < 300:
             lease.record_success()
+        elif status == 429:
+            lease.record_rate_limit()
+        elif status == 408 or 500 <= status < 600:
+            lease.record_failure()
 
     @staticmethod
     def _build_monitor_url(url: str, kwargs: Mapping[str, Any]) -> str:
@@ -153,19 +166,42 @@ class BaseRequestExecutor(ABC):
                 return redact_url_query(f"{url}?{query}")
         return url
 
+    def _record_attempt_response(
+        self,
+        response: httpx.Response,
+        lease: ProbeLease,
+        tracker: _AttemptTracker,
+    ) -> httpx.Response:
+        """Track the latest wire response and settle the per-attempt probe lease."""
+        tracker.last_request_error = None
+        tracker.last_response = response
+        self._record_response_outcome(response, lease)
+        return response
+
+    @staticmethod
+    def _record_attempt_exception(
+        error: BaseException,
+        lease: ProbeLease,
+        tracker: _AttemptTracker,
+    ) -> None:
+        """Track retriable transport failures and settle non-input exceptions on the attempt lease."""
+        if isinstance(error, httpx.RequestError):
+            tracker.last_response = None
+            tracker.last_request_error = error
+            lease.record_failure()
+        elif isinstance(error, Exception) and not isinstance(error, (ValueError, TypeError)):
+            lease.record_failure()
+
     def _finalize_response(
         self,
         response: httpx.Response | None,
-        lease: ProbeLease,
         monitor: RequestMonitor,
         *,
         attempt_count: int | None = None,
     ) -> httpx.Response:
-        """Classify breaker outcome once, record telemetry, and map HTTP error responses."""
+        """Record telemetry and map HTTP error responses after per-attempt lease settlement."""
         if response is None:
-            lease.record_failure()
             raise RuntimeError("Request failed without response or exception")
-        self._record_response_outcome(response, lease)
         monitor.on_response(response)
         return handle_response(
             response,
@@ -175,34 +211,34 @@ class BaseRequestExecutor(ABC):
             max_retry_after=self.retry_config.max_retry_after,
         )
 
+    @staticmethod
     def _extract_or_fail_retry_error(
-        self,
         error: RetryError,
-        lease: ProbeLease,
         monitor: RequestMonitor,
         *,
         attempt_count: int | None = None,
     ) -> httpx.Response:
-        """Extract response from exhausted retries or record one transport failure and escalate."""
+        """Extract response from exhausted retries or escalate transport failure."""
         if error.last_attempt and not error.last_attempt.failed:
             response: httpx.Response = error.last_attempt.result()
             return response
-        last_exc = error.last_attempt.exception() if error.last_attempt else None
-        if not isinstance(last_exc, (ValueError, TypeError)):
-            lease.record_failure()
         return monitor.on_retry_error(error, attempt_count=attempt_count)
 
     @staticmethod
-    def _handle_request_error(
-        error: httpx.RequestError,
-        lease: ProbeLease,
+    def _resolve_breaker_abort(
+        tracker: _AttemptTracker,
         monitor: RequestMonitor,
-        *,
-        attempt_count: int | None = None,
-    ) -> NoReturn:
-        """Record one breaker failure and wrap an unretried transport error in RequestError."""
-        lease.record_failure()
-        monitor.on_request_error(error, attempt_count=attempt_count)
+    ) -> httpx.Response:
+        """Re-raise pre-flight open-circuit errors or finalize the prior executed attempt."""
+        if tracker.attempts > 0:
+            if tracker.last_response is not None:
+                return tracker.last_response
+            if tracker.last_request_error is not None:
+                monitor.on_request_error(
+                    tracker.last_request_error,
+                    attempt_count=tracker.attempts,
+                )
+        raise
 
     @staticmethod
     def _parse_retry_after_seconds(
@@ -211,6 +247,22 @@ class BaseRequestExecutor(ABC):
     ) -> float | None:
         """Parse the 'Retry-After' header from an HTTP response."""
         return parse_retry_after_seconds(response, max_retry_after=max_retry_after)
+
+    def _compute_wait_seconds(
+        self,
+        retry_state: RetryCallState,
+        circuit_breaker: CircuitBreaker,
+    ) -> float:
+        """Compute retry wait seconds, skipping sleep immediately when the breaker is OPEN."""
+        if circuit_breaker.state is CircuitState.OPEN:
+            return 0.0
+        if retry_state.outcome and not retry_state.outcome.failed:
+            result = retry_state.outcome.result()
+            if isinstance(result, httpx.Response):
+                retry_after_seconds = self._parse_retry_after_seconds(result)
+                if retry_after_seconds is not None and math.isfinite(retry_after_seconds):
+                    return min(max(retry_after_seconds, 0.0), self.retry_config.max_retry_after)
+        return float(self._jitter_wait(retry_state))
 
     def _wait_strategy(self, retry_state: RetryCallState) -> float:
         """Calculate the wait time before the next retry attempt.
@@ -221,18 +273,16 @@ class BaseRequestExecutor(ABC):
         Returns:
             float: Number of seconds to wait.
         """
-        if retry_state.outcome and not retry_state.outcome.failed:
-            result = retry_state.outcome.result()
-            if isinstance(result, httpx.Response):
-                retry_after_seconds = self._parse_retry_after_seconds(result)
-                if retry_after_seconds is not None and math.isfinite(retry_after_seconds):
-                    return min(max(retry_after_seconds, 0.0), self.retry_config.max_retry_after)
-        return float(self._jitter_wait(retry_state))
+        return self._compute_wait_seconds(retry_state, self.circuit_breaker)
 
-    def _get_retryer_kwargs(self, method: str) -> dict[str, Any]:
+    def _get_retryer_kwargs(
+        self,
+        method: str,
+        circuit_breaker: CircuitBreaker,
+    ) -> dict[str, Any]:
         """Get common arguments for Retrying and AsyncRetrying."""
         return {
-            "wait_strategy": self._wait_strategy,
+            "wait_strategy": lambda rs: self._compute_wait_seconds(rs, circuit_breaker),
             "retry_predicate": self._get_retry_predicate(method),
         }
 
@@ -240,10 +290,13 @@ class BaseRequestExecutor(ABC):
         self,
         method: str | None = None,
         url: str | None = None,
+        *,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> ProbeLease:
-        """Admit a new request through the circuit breaker and return its lease."""
+        """Admit a single attempt through the circuit breaker and return its lease."""
+        active_breaker = circuit_breaker if circuit_breaker is not None else self.circuit_breaker
         try:
-            return self.circuit_breaker.acquire()
+            return active_breaker.acquire()
         except CircuitBreakerError as err:
             if method is not None or url is not None:
                 ctx = DiagnosticContext(
@@ -285,6 +338,51 @@ class SyncRequestExecutor(BaseRequestExecutor):
         """
         super().__init__(send, tracer, retry_config, circuit_breaker=circuit_breaker)
 
+    def execute_with_breaker(
+        self,
+        circuit_breaker: CircuitBreaker,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Execute a synchronous request using an explicit per-attempt circuit breaker."""
+        tracker = _AttemptTracker()
+        monitor_url = self._build_monitor_url(url, kwargs)
+        retryer = self.retry_config.create_retryer(
+            **self._get_retryer_kwargs(method, circuit_breaker)
+        )
+
+        def send_fn() -> httpx.Response:
+            """Acquire one ProbeLease for this attempt, dispatch, and settle outcome."""
+            with self._prepare_request(
+                method, monitor_url, circuit_breaker=circuit_breaker
+            ) as lease:
+                tracker.attempts += 1
+                try:
+                    with self._suppress_httpx_request_logging():
+                        raw_resp: httpx.Response | None = self.send(method, url, **kwargs)
+                    if raw_resp is None:
+                        raise RuntimeError("Request failed without response or exception")
+                except BaseException as err:
+                    self._record_attempt_exception(err, lease, tracker)
+                    raise
+                return self._record_attempt_response(raw_resp, lease, tracker)
+
+        with RequestMonitor(self.tracer, method, monitor_url) as monitor:
+            try:
+                response: httpx.Response | None = retryer(send_fn)
+            except RetryError as err:
+                response = self._extract_or_fail_retry_error(
+                    err, monitor, attempt_count=tracker.attempts or None
+                )
+            except CircuitBreakerError:
+                response = self._resolve_breaker_abort(tracker, monitor)
+            except httpx.RequestError as err:
+                monitor.on_request_error(err, attempt_count=tracker.attempts or None)
+            return self._finalize_response(
+                response, monitor, attempt_count=tracker.attempts or None
+            )
+
     def __call__(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Execute the request synchronously.
 
@@ -300,36 +398,7 @@ class SyncRequestExecutor(BaseRequestExecutor):
             CircuitBreakerError: If the circuit is open.
             RequestError: If an HTTP transport error occurs.
         """
-        attempts = 0
-
-        def send_fn() -> httpx.Response:
-            """Wrapper to send the request with suppressed logging."""
-            nonlocal attempts
-            attempts += 1
-            with self._suppress_httpx_request_logging():
-                return self.send(method, url, **kwargs)  # type: ignore[no-any-return]
-
-        retryer = self.retry_config.create_retryer(**self._get_retryer_kwargs(method))
-        monitor_url = self._build_monitor_url(url, kwargs)
-
-        with (
-            self._prepare_request(method, monitor_url) as lease,
-            RequestMonitor(self.tracer, method, monitor_url) as monitor,
-        ):
-            try:
-                response: httpx.Response | None = retryer(send_fn)
-            except RetryError as err:
-                response = self._extract_or_fail_retry_error(
-                    err, lease, monitor, attempt_count=attempts or None
-                )
-            except httpx.RequestError as err:
-                self._handle_request_error(err, lease, monitor, attempt_count=attempts or None)
-            except (ValueError, TypeError):
-                raise
-            except Exception:
-                lease.record_failure()
-                raise
-            return self._finalize_response(response, lease, monitor, attempt_count=attempts or None)
+        return self.execute_with_breaker(self.circuit_breaker, method, url, **kwargs)
 
 
 class AsyncRequestExecutor(BaseRequestExecutor):
@@ -352,6 +421,51 @@ class AsyncRequestExecutor(BaseRequestExecutor):
         """
         super().__init__(send, tracer, retry_config, circuit_breaker=circuit_breaker)
 
+    async def execute_with_breaker(
+        self,
+        circuit_breaker: CircuitBreaker,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Execute an asynchronous request using an explicit per-attempt circuit breaker."""
+        tracker = _AttemptTracker()
+        monitor_url = self._build_monitor_url(url, kwargs)
+        retryer = self.retry_config.create_async_retryer(
+            **self._get_retryer_kwargs(method, circuit_breaker)
+        )
+
+        async def send_fn() -> httpx.Response:
+            """Acquire one ProbeLease for this async attempt, dispatch, and settle outcome."""
+            async with self._prepare_request(
+                method, monitor_url, circuit_breaker=circuit_breaker
+            ) as lease:
+                tracker.attempts += 1
+                try:
+                    with self._suppress_httpx_request_logging():
+                        raw_resp: httpx.Response | None = await self.send(method, url, **kwargs)
+                    if raw_resp is None:
+                        raise RuntimeError("Request failed without response or exception")
+                except BaseException as err:
+                    self._record_attempt_exception(err, lease, tracker)
+                    raise
+                return self._record_attempt_response(raw_resp, lease, tracker)
+
+        async with RequestMonitor(self.tracer, method, monitor_url) as monitor:
+            try:
+                response: httpx.Response | None = await retryer(send_fn)
+            except RetryError as err:
+                response = self._extract_or_fail_retry_error(
+                    err, monitor, attempt_count=tracker.attempts or None
+                )
+            except CircuitBreakerError:
+                response = self._resolve_breaker_abort(tracker, monitor)
+            except httpx.RequestError as err:
+                monitor.on_request_error(err, attempt_count=tracker.attempts or None)
+            return self._finalize_response(
+                response, monitor, attempt_count=tracker.attempts or None
+            )
+
     async def __call__(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         """Execute the request asynchronously.
 
@@ -367,33 +481,4 @@ class AsyncRequestExecutor(BaseRequestExecutor):
             CircuitBreakerError: If the circuit is open.
             RequestError: If an HTTP transport error occurs.
         """
-        attempts = 0
-
-        async def send_fn() -> httpx.Response:
-            """Wrapper to send the request with suppressed logging."""
-            nonlocal attempts
-            attempts += 1
-            with self._suppress_httpx_request_logging():
-                return await self.send(method, url, **kwargs)  # type: ignore[no-any-return]
-
-        retryer = self.retry_config.create_async_retryer(**self._get_retryer_kwargs(method))
-        monitor_url = self._build_monitor_url(url, kwargs)
-
-        async with (
-            self._prepare_request(method, monitor_url) as lease,
-            RequestMonitor(self.tracer, method, monitor_url) as monitor,
-        ):
-            try:
-                response: httpx.Response | None = await retryer(send_fn)
-            except RetryError as err:
-                response = self._extract_or_fail_retry_error(
-                    err, lease, monitor, attempt_count=attempts or None
-                )
-            except httpx.RequestError as err:
-                self._handle_request_error(err, lease, monitor, attempt_count=attempts or None)
-            except (ValueError, TypeError):
-                raise
-            except Exception:
-                lease.record_failure()
-                raise
-            return self._finalize_response(response, lease, monitor, attempt_count=attempts or None)
+        return await self.execute_with_breaker(self.circuit_breaker, method, url, **kwargs)

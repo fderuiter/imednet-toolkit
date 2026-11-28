@@ -223,7 +223,7 @@ def test_sync_sdk_retries_kwarg_preserves_default_policy_on_200_and_500(
     with pytest.raises(errors.ServerError):
         sdk._client.get("/fail")
     assert err_route.call_count == 3
-    assert sdk._client._circuit_breaker.consecutive_failures == 1
+    assert sdk._client._circuit_breaker.consecutive_failures == 3
     assert get_global_circuit_breaker().consecutive_failures == 0
     sdk.close()
 
@@ -263,7 +263,7 @@ async def test_async_sdk_retries_kwarg_preserves_default_policy_on_200_and_500(
         with pytest.raises(errors.ServerError):
             await sdk._async_client.get("/fail")
         assert err_route.call_count == 3
-        assert sdk._async_client._circuit_breaker.consecutive_failures == 1
+        assert sdk._async_client._circuit_breaker.consecutive_failures == 3
         assert get_global_circuit_breaker().consecutive_failures == 0
 
 

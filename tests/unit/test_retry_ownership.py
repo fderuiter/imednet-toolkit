@@ -24,7 +24,7 @@ BASE_URL = "https://synthetic.example"
 @pytest.mark.parametrize("paginator_type", [Paginator, JsonListPaginator])
 @pytest.mark.parametrize(
     "status,attempts,expected_failures",
-    [(500, 3, 1), (429, 3, 0), (400, 1, 0), (0, 3, 1)],
+    [(500, 3, 3), (429, 3, 0), (400, 1, 0), (0, 3, 3)],
 )
 def test_sync_pagination_has_one_retry_owner(
     respx_mock, paginator_type, status, attempts, expected_failures
@@ -44,9 +44,8 @@ def test_sync_pagination_has_one_retry_owner(
         pytest.raises((ApiError, RequestError)),
     ):
         list(paginator_type(client, "/records"))
-    expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
-    # The outer paginator must not double-count exhausted requests, and 4xx/429 do not count as outages.
+    # Each retried outage attempt settles its own ProbeLease, while 4xx/429 do not count as outages.
     assert client._circuit_breaker.consecutive_failures == expected_failures
     assert get_global_circuit_breaker().consecutive_failures == 0
 
@@ -54,7 +53,7 @@ def test_sync_pagination_has_one_retry_owner(
 @pytest.mark.parametrize("paginator_type", [AsyncPaginator, AsyncJsonListPaginator])
 @pytest.mark.parametrize(
     "status,attempts,expected_failures",
-    [(500, 3, 1), (429, 3, 0), (400, 1, 0), (0, 3, 1)],
+    [(500, 3, 3), (429, 3, 0), (400, 1, 0), (0, 3, 3)],
 )
 async def test_async_pagination_has_one_retry_owner(
     respx_mock, paginator_type, status, attempts, expected_failures
@@ -72,7 +71,6 @@ async def test_async_pagination_has_one_retry_owner(
     ) as client:
         with pytest.raises((ApiError, RequestError)):
             _ = [item async for item in paginator_type(client, "/records")]
-    expected_failures = 0 if status in (400, 429) else 1
     assert route.call_count == attempts
     assert client._circuit_breaker.consecutive_failures == expected_failures
     assert get_global_circuit_breaker().consecutive_failures == 0

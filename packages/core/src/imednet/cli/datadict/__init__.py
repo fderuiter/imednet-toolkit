@@ -29,12 +29,14 @@ from ..utils import (
     UniqueStoreAction,
     add_simulation_arg,
     add_study_key_args,
+    flush_stdout,
     get_sdk,
     load_offline_schema,
     print_error,
     resolve_output_format,
     resolve_study_key,
     simulation_mode_context,
+    write_stdout,
 )
 
 __all__ = ["get_sdk", "setup_parser"]
@@ -58,18 +60,26 @@ def _handle_to_odm(args: argparse.Namespace) -> None:
         print_error(redact_cli_secrets(f"Error reading data dictionary from '{args.file}': {exc}"))
         sys.exit(1)
 
-    try:
-        if args.output:
+    if args.output:
+        try:
             to_odm_file(source_obj, args.output, file_oid=getattr(args, "file_oid", None))
             print(f"Successfully wrote CDISC ODM XML to '{args.output}'", file=sys.stderr)
-        else:
-            print(to_odm_xml(source_obj, file_oid=getattr(args, "file_oid", None)), end="")
-    except OSError as exc:
-        print_error(redact_cli_secrets(f"Error writing CDISC ODM XML to '{args.output}': {exc}"))
-        sys.exit(1)
-    except Exception as exc:
-        print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
-        sys.exit(1)
+        except OSError as exc:
+            print_error(
+                redact_cli_secrets(f"Error writing CDISC ODM XML to '{args.output}': {exc}")
+            )
+            sys.exit(1)
+        except Exception as exc:
+            print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
+            sys.exit(1)
+    else:
+        try:
+            odm_xml = to_odm_xml(source_obj, file_oid=getattr(args, "file_oid", None))
+        except Exception as exc:
+            print_error(redact_cli_secrets(f"Error exporting to CDISC ODM XML: {exc}"))
+            sys.exit(1)
+        if write_stdout(odm_xml, end=""):
+            flush_stdout()
 
 
 def _handle_from_csv(args: argparse.Namespace) -> None:
@@ -94,8 +104,8 @@ def _handle_from_csv(args: argparse.Namespace) -> None:
                 redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
             )
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 def _handle_from_odm(args: argparse.Namespace) -> None:
@@ -131,8 +141,8 @@ def _handle_from_odm(args: argparse.Namespace) -> None:
                     redact_cli_secrets(f"Error writing ODM archive to '{args.output}': {exc}")
                 )
                 sys.exit(1)
-        else:
-            print(archive_json, end="")
+        elif write_stdout(archive_json, end=""):
+            flush_stdout()
         return
 
     try:
@@ -155,8 +165,8 @@ def _handle_from_odm(args: argparse.Namespace) -> None:
                 redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
             )
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 def _handle_from_redcap(args: argparse.Namespace) -> None:
@@ -181,8 +191,8 @@ def _handle_from_redcap(args: argparse.Namespace) -> None:
                 redact_cli_secrets(f"Error writing data dictionary to '{args.output}': {exc}")
             )
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 @with_sdk
@@ -201,8 +211,8 @@ def _from_api(
         except OSError as exc:
             print_error(redact_cli_secrets(f"Error writing data dictionary to '{output}': {exc}"))
             sys.exit(1)
-    else:
-        print(to_json(dd), end="")
+    elif write_stdout(to_json(dd), end=""):
+        flush_stdout()
 
 
 def _handle_from_api(args: argparse.Namespace) -> None:
@@ -231,7 +241,8 @@ def _emit_validate_json(file_path: str, errors: list[str]) -> None:
         "error_count": len(errors),
         "errors": [redact_cli_secrets(err) for err in errors],
     }
-    print(json.dumps(payload, indent=2) + "\n", end="")
+    if write_stdout(json.dumps(payload, indent=2) + "\n", end=""):
+        flush_stdout()
 
 
 def _handle_validate(args: argparse.Namespace) -> None:
@@ -271,8 +282,10 @@ def _handle_validate(args: argparse.Namespace) -> None:
         for err in errors:
             print_error(redact_cli_secrets(f"  - {err}"))
         sys.exit(1)
-    else:
-        print(f"Validation passed: '{args.file}' conforms to the data dictionary specification.")
+    elif write_stdout(
+        f"Validation passed: '{args.file}' conforms to the data dictionary specification."
+    ):
+        flush_stdout()
 
 
 def _handle_diff(args: argparse.Namespace) -> None:
@@ -295,11 +308,13 @@ def _handle_diff(args: argparse.Namespace) -> None:
     output_format = resolve_output_format(args.format, default="text")
 
     if output_format == "json":
-        print(report.to_json(), end="")
+        rendered_diff = report.to_json()
     elif output_format == "md":
-        print(report.to_markdown(), end="")
+        rendered_diff = report.to_markdown()
     else:
-        print(report.to_text(), end="")
+        rendered_diff = report.to_text()
+    if write_stdout(rendered_diff, end=""):
+        flush_stdout()
 
 
 def _handle_schema(args: argparse.Namespace) -> None:
@@ -314,8 +329,8 @@ def _handle_schema(args: argparse.Namespace) -> None:
         except Exception as exc:
             print_error(redact_cli_secrets(f"Error writing schema to '{args.output}': {exc}"))
             sys.exit(1)
-    else:
-        print(json_text, end="")
+    elif write_stdout(json_text, end=""):
+        flush_stdout()
 
 
 def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
