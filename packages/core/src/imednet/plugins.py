@@ -178,6 +178,7 @@ class DataExtractionWorkflowProtocol(Protocol):
         on_progress: Callable[[str], None] | None = None,
         *,
         include_deleted: bool = False,
+        record_data_filter: str | None = None,
         **other_filters: Any,
     ) -> list[Record]:
         """Extract study records matching combined subject, visit, and record filters."""
@@ -222,6 +223,7 @@ class AsyncDataExtractionWorkflowProtocol(Protocol):
         on_progress: Callable[[str], None] | None = None,
         *,
         include_deleted: bool = False,
+        record_data_filter: str | None = None,
         **other_filters: Any,
     ) -> list[Record]:
         """Extract study records matching combined subject, visit, and record filters."""

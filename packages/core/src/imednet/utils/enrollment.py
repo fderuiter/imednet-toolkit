@@ -16,6 +16,7 @@ from imednet.models.sites import (
 )
 from imednet.models.subjects import Subject, SubjectStatus, normalize_subject_status
 from imednet.utils.tabular import (
+    _READ_ONLY_RECORD_COLUMNS,
     _is_dataframe_instance,
     _lookup_form_key_from_id,
     csv_to_records,
@@ -23,6 +24,19 @@ from imednet.utils.tabular import (
     ensure_no_masked_sentinel,
 )
 from imednet.utils.typing import JsonDict
+
+_READ_ONLY_REGISTRATION_DICT_KEYS: frozenset[str] = _READ_ONLY_RECORD_COLUMNS | frozenset(
+    {
+        "subject_status",
+        "subjectStatus",
+        "enrollment_start_date",
+        "enrollmentStartDate",
+        "site_enrollment_status",
+        "siteEnrollmentStatus",
+        "interval_name",
+        "intervalName",
+    }
+)
 
 if TYPE_CHECKING:
     from imednet.validation.cache import ValidationSchemaProtocol
@@ -143,7 +157,9 @@ def normalize_subject_registration_inputs(
         normalized_raw: RegisterSubjectRequest | dict[str, Any]
         if isinstance(raw_subj, RegisterSubjectRequest):
             model_subj = raw_subj
-            needs_form = bool(default_form_key and not model_subj.form_key)
+            needs_form = bool(
+                default_form_key and not model_subj.form_key and model_subj.form_id is None
+            )
             needs_site = bool(
                 (default_site_name or default_site_id is not None)
                 and not model_subj.site_name
@@ -162,6 +178,16 @@ def normalize_subject_registration_inputs(
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
             raw_dict = dict(raw_subj)
+            ensure_no_masked_sentinel([raw_dict])
+            for ro_key in _READ_ONLY_REGISTRATION_DICT_KEYS:
+                raw_dict.pop(ro_key, None)
+            if "data" not in raw_dict:
+                if isinstance(raw_dict.get("recordData"), Mapping):
+                    raw_dict["data"] = dict(raw_dict["recordData"])
+                elif isinstance(raw_dict.get("record_data"), Mapping):
+                    raw_dict["data"] = dict(raw_dict["record_data"])
+            raw_dict.pop("recordData", None)
+            raw_dict.pop("record_data", None)
             if not (raw_dict.get("formKey") or raw_dict.get("form_key")):
                 raw_fid = raw_dict.get("formId")
                 if raw_fid is None:
@@ -172,7 +198,12 @@ def normalize_subject_registration_inputs(
                     )
                     if resolved_fk:
                         raw_dict["formKey"] = resolved_fk
-            if default_form_key and not (raw_dict.get("formKey") or raw_dict.get("form_key")):
+            if default_form_key and not (
+                raw_dict.get("formKey")
+                or raw_dict.get("form_key")
+                or raw_dict.get("formId") is not None
+                or raw_dict.get("form_id") is not None
+            ):
                 raw_dict["formKey"] = default_form_key
             has_site_name = bool(raw_dict.get("siteName") or raw_dict.get("site_name"))
             has_site_id = raw_dict.get("siteId") is not None or raw_dict.get("site_id") is not None

@@ -10,6 +10,7 @@ try:
     import pandas as pd
 except ImportError:
     pd: Any = None  # type: ignore[no-redef]
+from ..core.context import get_study_context, sdk_governance_context
 from ..integrations.enrichment import resolve_enrichment_pipeline
 from ..models.base import ImednetBaseModel
 from ..models.forms import Form
@@ -24,10 +25,12 @@ from ..models.visits import Visit
 from .batch_coordinator import DEFAULT_BATCH_CHUNK_SIZE, BatchSubmissionSummary
 from .job_poller import JobProgressHandler
 from .security import (
+    SensitivityRegistry,
     _normalize_key,
+    build_study_sensitivity_registry,
     global_sensitivity_registry,
-    mask_clinical_phi,
     sanitize_csv_formula,
+    sanitize_diagnostic_payload,
 )
 from .tabular import MASKED_SENTINEL, csv_to_records, dataframe_rows_to_records
 from .typing import JsonDict
@@ -53,84 +56,177 @@ def check_pandas(feature_name: str | None = None) -> None:
         )
 
 
+def _resolve_study_registry(study_key: str | None) -> SensitivityRegistry:
+    """Resolve a study-aware SensitivityRegistry, failing closed to global defaults."""
+    pipeline = resolve_enrichment_pipeline(study_key)
+    if pipeline is not None and pipeline.phi_keys:
+        return build_study_sensitivity_registry(pipeline.phi_keys)
+    return global_sensitivity_registry
+
+
+def _rows_to_dataframe(
+    rows: list[dict[str, Any]],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
+    """Convert pre-serialized model row dicts to a DataFrame with optional PHI masking."""
+    if not rows or not mask_phi:
+        return pd.DataFrame(rows)
+
+    scalar_study_key = study_key if isinstance(study_key, str) and study_key else None
+    fallback_study_key = scalar_study_key or get_study_context()
+    registries: dict[str | None, SensitivityRegistry] = {}
+    sanitized_rows: list[dict[str, Any]] = []
+    for row in rows:
+        raw_row_sk = row.get("study_key")
+        row_sk = (
+            scalar_study_key
+            or (raw_row_sk if isinstance(raw_row_sk, str) and raw_row_sk else None)
+            or fallback_study_key
+        )
+        reg = registries.get(row_sk)
+        if reg is None:
+            reg = _resolve_study_registry(row_sk)
+            registries[row_sk] = reg
+        sanitized_rows.append(sanitize_diagnostic_payload(row, registry=reg))
+    return pd.DataFrame(sanitized_rows)
+
+
 def _models_to_dataframe(
     models: Iterable[ImednetBaseModel],
     feature_name: str | None = None,
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
 ) -> pd.DataFrame:
     """Convert an iterable of :class:`~imednet.models.base.ImednetBaseModel` to a DataFrame.
 
     Each model is serialized using :meth:`pydantic.BaseModel.model_dump` with
-    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
+    ``by_alias=False`` and returned as a :class:`pandas.DataFrame`. When
+    ``mask_phi`` is ``True`` (default), sensitive PHI keys, inline text PHI,
+    and committed ``StudyConfiguration`` PHI rules are redacted with
+    ``***MASKED***``.
     """
     check_pandas(feature_name)
     rows = [model.model_dump(by_alias=False) for model in models]
-    return pd.DataFrame(rows)
+    return _rows_to_dataframe(rows, mask_phi=mask_phi, study_key=study_key)
 
 
-def queries_to_dataframe(queries: list[Query]) -> pd.DataFrame:
+def queries_to_dataframe(
+    queries: list[Query],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.queries.Query` to a DataFrame.
 
     Each query model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(queries, "queries_to_dataframe")
+    return _models_to_dataframe(
+        queries, "queries_to_dataframe", mask_phi=mask_phi, study_key=study_key
+    )
 
 
-def variables_to_dataframe(variables: list[Variable]) -> pd.DataFrame:
+def variables_to_dataframe(
+    variables: list[Variable],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.variables.Variable` to a DataFrame.
 
     Each variable model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(variables, "variables_to_dataframe")
+    return _models_to_dataframe(
+        variables, "variables_to_dataframe", mask_phi=mask_phi, study_key=study_key
+    )
 
 
-def subjects_to_dataframe(subjects: list[Subject]) -> pd.DataFrame:
+def subjects_to_dataframe(
+    subjects: list[Subject],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.subjects.Subject` to a DataFrame.
 
     Each subject model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(subjects, "subjects_to_dataframe")
+    return _models_to_dataframe(
+        subjects, "subjects_to_dataframe", mask_phi=mask_phi, study_key=study_key
+    )
 
 
-def forms_to_dataframe(forms: list[Form]) -> pd.DataFrame:
+def forms_to_dataframe(
+    forms: list[Form],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.forms.Form` to a DataFrame.
 
     Each form model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(forms, "forms_to_dataframe")
+    return _models_to_dataframe(forms, "forms_to_dataframe", mask_phi=mask_phi, study_key=study_key)
 
 
-def visits_to_dataframe(visits: list[Visit]) -> pd.DataFrame:
+def visits_to_dataframe(
+    visits: list[Visit],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.visits.Visit` to a DataFrame.
 
     Each visit model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(visits, "visits_to_dataframe")
+    return _models_to_dataframe(
+        visits, "visits_to_dataframe", mask_phi=mask_phi, study_key=study_key
+    )
 
 
-def intervals_to_dataframe(intervals: list[Interval]) -> pd.DataFrame:
+def intervals_to_dataframe(
+    intervals: list[Interval],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.intervals.Interval` to a DataFrame.
 
     Each interval model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(intervals, "intervals_to_dataframe")
+    return _models_to_dataframe(
+        intervals, "intervals_to_dataframe", mask_phi=mask_phi, study_key=study_key
+    )
 
 
-def sites_to_dataframe(sites: list[Site]) -> pd.DataFrame:
+def sites_to_dataframe(
+    sites: list[Site],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.sites.Site` to a DataFrame.
 
     Each site model is serialized using :meth:`pydantic.BaseModel.model_dump` with
     ``by_alias=False`` and returned as a :class:`pandas.DataFrame`.
     """
-    return _models_to_dataframe(sites, "sites_to_dataframe")
+    return _models_to_dataframe(sites, "sites_to_dataframe", mask_phi=mask_phi, study_key=study_key)
 
 
-def users_to_dataframe(users: list[User]) -> pd.DataFrame:
+def users_to_dataframe(
+    users: list[User],
+    *,
+    mask_phi: bool = True,
+    study_key: str | None = None,
+) -> pd.DataFrame:
     """Convert a list of :class:`~imednet.models.users.User` to a DataFrame.
 
     Each user model is serialized using :meth:`pydantic.BaseModel.model_dump` with
@@ -138,9 +234,8 @@ def users_to_dataframe(users: list[User]) -> pd.DataFrame:
     :class:`pandas.DataFrame`.
     """
     check_pandas("users_to_dataframe")
-
     user_dicts = [{**u.model_dump(by_alias=False), "name": u.name} for u in users]
-    return pd.DataFrame(user_dicts)
+    return _rows_to_dataframe(user_dicts, mask_phi=mask_phi, study_key=study_key)
 
 
 def _is_custom_phi_column(col: str, phi_keys: set[str]) -> bool:
@@ -183,32 +278,36 @@ def records_to_dataframe(
     PHI fields and mapped variable labels inside ``record_data`` are replaced
     with ``***MASKED***``.
     """
-    df = _models_to_dataframe(records, "records_to_dataframe")
-    if df.empty:
-        return df
-
-    resolved_study_key = study_key
+    resolved_study_key = study_key if isinstance(study_key, str) and study_key else None
     if not resolved_study_key:
         for rec in records:
             cand = getattr(rec, "study_key", None)
             if isinstance(cand, str) and cand:
                 resolved_study_key = cand
                 break
+    if not resolved_study_key:
+        resolved_study_key = get_study_context()
+
+    df = _models_to_dataframe(
+        records,
+        "records_to_dataframe",
+        mask_phi=mask_phi,
+        study_key=resolved_study_key,
+    )
+    if df.empty:
+        return df
 
     pipeline = resolve_enrichment_pipeline(resolved_study_key)
     phi_keys: set[str] = set(pipeline.phi_keys) if pipeline is not None else set()
 
-    if "record_data" in df.columns:
-        if mask_phi:
-            df["record_data"] = df["record_data"].apply(mask_clinical_phi)
-        if pipeline is not None:
-            df["record_data"] = df["record_data"].apply(
-                lambda val: (
-                    pipeline.process(val, mask_phi=mask_phi, _skip_default_phi=mask_phi)
-                    if isinstance(val, dict)
-                    else val
-                )
+    if "record_data" in df.columns and pipeline is not None:
+        df["record_data"] = df["record_data"].apply(
+            lambda val: (
+                pipeline.process(val, mask_phi=mask_phi, _skip_default_phi=mask_phi)
+                if isinstance(val, dict)
+                else val
             )
+        )
 
     if flatten:
         base_df = df.drop(columns=["record_data"])
@@ -327,7 +426,7 @@ def import_records_csv(
 def export_records_csv(
     sdk: ImednetSDK,
     study_key: str,
-    file_path: str,
+    file_path: str | os.PathLike[str],
     *,
     flatten: bool = True,
     mask_phi: bool = True,
@@ -341,27 +440,28 @@ def export_records_csv(
     """
     check_pandas("export_records_csv")
 
-    records = list(sdk.records.list(study_key=study_key))
-    rename_map: dict[str, str] | None = None
-    if use_labels_as_columns and flatten and records:
-        variables_ep = getattr(sdk, "variables", None)
-        if variables_ep is not None and callable(getattr(variables_ep, "list", None)):
-            variables = list(variables_ep.list(study_key=study_key))
-            rename_map = {
-                v.variable_name: v.label
-                for v in variables
-                if getattr(v, "variable_name", None)
-                and getattr(v, "label", None)
-                and str(v.label).strip()
-            } or None
+    with sdk_governance_context(sdk):
+        records = list(sdk.records.list(study_key=study_key))
+        rename_map: dict[str, str] | None = None
+        if use_labels_as_columns and flatten and records:
+            variables_ep = getattr(sdk, "variables", None)
+            if variables_ep is not None and callable(getattr(variables_ep, "list", None)):
+                variables = list(variables_ep.list(study_key=study_key))
+                rename_map = {
+                    v.variable_name: v.label
+                    for v in variables
+                    if getattr(v, "variable_name", None)
+                    and getattr(v, "label", None)
+                    and str(v.label).strip()
+                } or None
 
-    df = records_to_dataframe(
-        records,
-        flatten=flatten,
-        mask_phi=mask_phi,
-        study_key=study_key,
-        label_map=rename_map,
-    )
+        df = records_to_dataframe(
+            records,
+            flatten=flatten,
+            mask_phi=mask_phi,
+            study_key=study_key,
+            label_map=rename_map,
+        )
 
     # Sanitize data to prevent CSV injection
     df = df.map(sanitize_csv_formula)

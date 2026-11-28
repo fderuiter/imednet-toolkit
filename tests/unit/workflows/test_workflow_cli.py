@@ -520,8 +520,9 @@ def test_subject_data_json_format_flag_and_env(
     assert payload["status"] == "complete"
     assert payload["count"] == 1
     item = payload["items"][0]
-    assert item["subject_details"]["subjectKey"] == "SUBJ-1"
-    assert item["subject_details"]["siteName"] == "Site Alpha"
+    assert "subject_details" not in item
+    assert item["subjectDetails"]["subjectKey"] == "SUBJ-1"
+    assert item["subjectDetails"]["siteName"] == "Site Alpha"
     assert item["records"][0]["recordId"] == 101
     assert item["visits"][0]["intervalName"] == "Screening"
     assert item["queries"][0]["description"] == "Confirm birth year"

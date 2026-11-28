@@ -268,11 +268,11 @@ double-quoted strings (including empty ``""``), and non-ASCII text (such as
 and boolean attributes reject invalid values on ``stderr`` with exit code ``1``. Commands that take a positional
 ``study_key`` reject redundant ``study_key`` / ``studyKey`` attributes in
 ``--filter`` before issuing requests, whereas ``imednet studies list`` accepts them.
-``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
-regular-expression matching in addition to the six standard operators, plus the
-literal ``none`` bypass) to filter Form Variable values on the server. All twelve
-``list`` commands—including ``users list``—accept ``--sort``, ``--limit``, and
-``--all``.
+``records list`` and ``workflows extract-records`` additionally expose
+``--record-data-filter`` (supporting ``=~`` regular-expression matching in addition to the
+six standard operators, plus the literal ``none`` bypass) to filter Form Variable values on
+the server. All twelve ``list`` commands—including ``users list``—accept ``--sort``,
+``--limit``, ``--all``, and ``--mask-phi`` / ``--no-mask-phi`` (enabled by default).
 
 .. code-block:: bash
 

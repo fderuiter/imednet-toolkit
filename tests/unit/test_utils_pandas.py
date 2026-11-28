@@ -227,7 +227,7 @@ def test_sites_to_dataframe_raises_importerror_when_pandas_missing(monkeypatch):
 
 
 def test_users_to_dataframe_success() -> None:
-    """Test converting users to a pandas DataFrame."""
+    """Test converting users to a pandas DataFrame masks email by default."""
     user = _sample_user()
     df = users_to_dataframe([user])
     assert not df.empty
@@ -236,9 +236,12 @@ def test_users_to_dataframe_success() -> None:
     assert df.loc[0, "login"] == "jdoe"
     assert df.loc[0, "first_name"] == "John"
     assert df.loc[0, "last_name"] == "Doe"
-    assert df.loc[0, "email"] == "jdoe@example.com"
+    assert df.loc[0, "email"] == "***MASKED***"
     assert bool(df.loc[0, "user_active_in_study"]) is True
     assert df.loc[0, "name"] == "John Doe"
+
+    raw_df = users_to_dataframe([user], mask_phi=False)
+    assert raw_df.loc[0, "email"] == "jdoe@example.com"
 
 
 def test_users_to_dataframe_empty() -> None:
