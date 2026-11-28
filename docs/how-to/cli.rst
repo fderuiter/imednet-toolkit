@@ -102,7 +102,7 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet codings list STUDY -f dictionaryName=MedDRA --format json
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
-   imednet jobs wait STUDY JOB-1002 --timeout 60 --format json
+   imednet jobs wait STUDY JOB-1002 --resolve-results --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
    imednet workflows state show --study-key STUDY --format json
    imednet workflows uat run STUDY --dry-run --simulation --format json
@@ -145,6 +145,13 @@ connections):
        -d V_AGE=51 --reason-for-change "Chart correction" --wait --format json
    cat batch.csv | imednet records import STUDY - --schema api --wait --format json
    imednet subjects register STUDY --file subjects.csv --skip-existing --wait
+   imednet subjects register STUDY --form-id 10 --site-id 1 \
+       --record-status "Record Complete" --reason-for-change "Enrollment" --wait --format json
+
+When ``--wait`` is supplied on write commands, terminal ``resultUrl`` payloads are resolved
+automatically (opt out with ``--no-resolve-results``) and JSON batch summaries include
+``createdRecordIds``, ``enrolledSubjectKeys``, and sanitized ``recordErrors``; ``imednet jobs wait``
+keeps read-only polling by default unless ``--resolve-results`` is passed.
 
 ``records create`` and ``records update`` accept all 14 iMednet ``POST /records`` write
 attributes via inline flags (``--form-key`` / ``--form-id``, ``--site-name`` / ``--site-id``,

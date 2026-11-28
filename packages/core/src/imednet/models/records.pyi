@@ -239,10 +239,10 @@ class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
     Typically supplies ``formKey`` (or ``formId``) and a site identifier
-    (``siteName`` or ``siteId``). Optional ``subjectKey`` and ``subjectOid``
-    attributes are omitted when ``None`` or blank so server-assigned subject
-    keys continue working by default; when explicitly supplied, they are
-    preserved for enrollment and deduplication.
+    (``siteName`` or ``siteId``). Optional ``subjectKey``, ``subjectId``, and
+    ``subjectOid`` attributes are omitted when ``None`` or blank so
+    server-assigned subject keys continue working by default; when explicitly
+    supplied, they are preserved for enrollment and deduplication.
     """
 
     def __init__(
@@ -325,8 +325,8 @@ class CreateNewRecordRequest(BaseRecordRequest):
     """Payload for creating a new unscheduled record.
 
     Targets a form and subject via ``formKey``/``formId`` and
-    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, status,
-    and audit reason attributes.
+    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, interval,
+    status, and audit reason attributes.
     """
 
     def __init__(

@@ -102,6 +102,7 @@ def run_cli_batch_write(
                     "on_progress": on_progress,
                     "dry_run": args.dry_run,
                     "collect_errors": True,
+                    "resolve_results": bool(getattr(args, "resolve_results", True)),
                 }
                 if submit_in_progress is not None:
                     raw_summary, total_records = submit_in_progress(resolved_schema, batch_kwargs)

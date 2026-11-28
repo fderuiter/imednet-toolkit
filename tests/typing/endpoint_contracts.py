@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, assert_type
+from typing import Any, Literal, assert_type
 
 import pandas as pd
 
@@ -149,6 +149,15 @@ def sync_contract(sdk: ImednetSDK) -> None:
     assert_type(sdk.records.create_batch('S', list(req_seq)), BatchSubmissionSummary)
     assert_type(sdk.records.create_batch('S', 'records.csv'), BatchSubmissionSummary)
     assert_type(sdk.records.create_batch('S', df_records), BatchSubmissionSummary)
+    batch_summary = sdk.records.create_batch(
+        'S',
+        [RegisterSubjectRequest(form_id=10, site_id=1)],
+        resolve_results=True,
+    )
+    assert_type(batch_summary.created_record_ids, list[int])
+    assert_type(batch_summary.enrolled_subject_keys, list[str])
+    assert_type(batch_summary.successful_records, list[dict[str, Any]])
+    assert_type(batch_summary.record_errors, list[dict[str, Any]])
     # Invalid scalar RecordsInput values must be rejected under mypy --strict
     sdk.records.create('S', 123)  # type: ignore[arg-type]
     sdk.records.create('S', None)  # type: ignore[arg-type]
@@ -336,6 +345,17 @@ def sync_contract(sdk: ImednetSDK) -> None:
         Job,
     )
     assert_type(sdk.workflows.record_update.create_new_record('S', 'F_VS', 'SUBJ', {}), Job)
+    assert_type(
+        sdk.workflows.record_update.update_record(
+            'S',
+            {},
+            record_id=10,
+            record_status='Record Complete',
+            reason_for_change='Audit',
+            resolve_results=True,
+        ),
+        Job,
+    )
     assert_type(sdk.workflows.register_subjects, SyncRegisterSubjectsWorkflowProtocol)
     assert_type(sdk.workflows.register_subjects.register_subjects('S', []), Job)
     assert_type(
@@ -550,6 +570,21 @@ async def async_contract(sdk: AsyncImednetSDK) -> None:
     )
     assert_type(
         await sdk.workflows.record_update.async_create_new_record('S', 'F_VS', 'SUBJ', {}),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.update_record(
+            'S',
+            {},
+            record_id=10,
+            record_status='Record Complete',
+            reason_for_change='Audit',
+            resolve_results=True,
+        ),
+        Job,
+    )
+    assert_type(
+        await sdk.workflows.record_update.async_update_record('S', {}, record_id=10),
         Job,
     )
     assert_type(sdk.workflows.register_subjects, AsyncRegisterSubjectsWorkflowProtocol)

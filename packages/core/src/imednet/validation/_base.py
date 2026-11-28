@@ -10,18 +10,22 @@ if TYPE_CHECKING:
 
 
 def _extract_form_ref(
-    record: BaseRecordRequest | Mapping[str, Any],
+    record: BaseRecordRequest | Mapping[str, Any] | Any,
 ) -> tuple[str | None, Any]:
-    """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
-    if not isinstance(record, Mapping):
-        raw_fk = getattr(record, "form_key", None)
+    """Extract (form_key, form_id) from a record payload or BaseRecordRequest without coalescing None to 0."""
+    if isinstance(record, Mapping):
+        raw_fk = record.get("formKey") or record.get("form_key")
         fk = str(raw_fk) if raw_fk else None
-        raw_fid = getattr(record, "form_id", None)
+        raw_fid = (
+            record.get("formId") if record.get("formId") is not None else record.get("form_id")
+        )
         fid = None if raw_fid == "" else raw_fid
         return fk, fid
-    raw_fk = record.get("formKey") or record.get("form_key")
+    raw_fk = getattr(record, "form_key", None) or getattr(record, "formKey", None)
     fk = str(raw_fk) if raw_fk else None
-    raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
+    raw_fid = getattr(record, "form_id", None)
+    if raw_fid is None:
+        raw_fid = getattr(record, "formId", None)
     fid = None if raw_fid == "" else raw_fid
     return fk, fid
 
@@ -39,7 +43,7 @@ class _ValidatorMixin:
         """Resolve the form key from a record payload.
 
         Args:
-            record: The record data dictionary.
+            record: The record data dictionary or request model.
             study_key: Optional study key used for study-partitioned form ID lookup.
 
         Returns:

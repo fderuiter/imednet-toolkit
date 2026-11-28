@@ -158,27 +158,56 @@ class _ResultPayloadError(ClientError, ValueError):
     """Raised when a terminal job resultUrl payload is non-JSON or malformed."""
 
 
+def _append_sanitized_error_collection(
+    extracted: list[dict[str, Any]],
+    collection: Any,
+) -> None:
+    """Append sanitized error entries from a list, dict, or scalar error value."""
+    if isinstance(collection, list):
+        for err_item in collection:
+            if isinstance(err_item, dict):
+                extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(err_item)))
+            elif err_item is not None:
+                extracted.append({"error": sanitize_diagnostic_text(str(err_item))})
+    elif isinstance(collection, dict):
+        for var_name, err_val in collection.items():
+            extracted.append(
+                cast(
+                    dict[str, Any],
+                    sanitize_diagnostic_payload({"variable": str(var_name), "error": err_val}),
+                )
+            )
+    elif collection:
+        extracted.append({"error": sanitize_diagnostic_text(str(collection))})
+
+
 def _extract_record_errors(status: JobStatus | Any) -> list[dict[str, Any]]:
-    """Extract sanitized per-record error entries from a JobStatus results payload."""
+    """Extract sanitized per-record and variable-level error entries from a JobStatus results payload."""
     results = getattr(status, "results", None)
     extracted: list[dict[str, Any]] = []
     if isinstance(results, list):
         for item in results:
-            if not isinstance(item, dict):
-                continue
-            item_status = str(item.get("status") or "").upper()
-            has_err_key = bool(item.get("error") or item.get("errors"))
-            if item_status in {"FAIL", "FAILED", "ERROR"} or (not item_status and has_err_key):
+            if isinstance(item, dict) and JobStatus._item_has_error(item):
                 extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(item)))
     elif isinstance(results, dict):
-        nested_errors = results.get("errors")
-        if isinstance(nested_errors, list):
-            for err_item in nested_errors:
-                if isinstance(err_item, dict):
-                    extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(err_item)))
-                elif err_item is not None:
-                    extracted.append({"error": sanitize_diagnostic_text(str(err_item))})
-        elif results.get("error"):
+        for list_key in ("records", "data", "items"):
+            nested_records = results.get(list_key)
+            if isinstance(nested_records, list):
+                for item in nested_records:
+                    if isinstance(item, dict) and JobStatus._item_has_error(item):
+                        extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(item)))
+        for err_key in (
+            "errors",
+            "variableErrors",
+            "variable_errors",
+            "fieldErrors",
+            "field_errors",
+            "validationErrors",
+            "validation_errors",
+        ):
+            if results.get(err_key):
+                _append_sanitized_error_collection(extracted, results.get(err_key))
+        if not extracted and (results.get("error") or JobStatus._item_has_error(results)):
             extracted.append(cast(dict[str, Any], sanitize_diagnostic_payload(results)))
     return extracted
 
@@ -213,6 +242,10 @@ def _format_job_failure_details(
                 entry.get("error")
                 or entry.get("message")
                 or entry.get("description")
+                or entry.get("variableErrors")
+                or entry.get("variable_errors")
+                or entry.get("fieldErrors")
+                or entry.get("validationErrors")
                 or entry.get("errors")
                 or entry
             )
@@ -396,6 +429,8 @@ def fetch_terminal_job_result(
 ) -> JobStatus | Any:
     """Fetch and attach ``resultUrl`` output for a terminal ``Job`` status when available."""
     if not getattr(status, "is_terminal", False) or not callable(fetch_result):
+        return status
+    if getattr(status, "results", None) is not None:
         return status
     result_url = getattr(status, "result_url", None)
     if not _is_fetchable_result_url(result_url):
@@ -836,6 +871,8 @@ class AsyncJobPoller(BaseJobPoller):
 
     async def _fetch_terminal_result(self, batch_id: str, status: JobStatus) -> JobStatus:
         """Fetch and attach ``resultUrl`` output for a terminal job status when available."""
+        if getattr(status, "results", None) is not None:
+            return status
         result_url = getattr(status, "result_url", None)
         if not self._fetch_result or not _is_fetchable_result_url(result_url):
             return status

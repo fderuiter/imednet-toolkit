@@ -51,7 +51,9 @@ def test_register_subjects_with_polling() -> None:
     )
 
     sdk.create_record.assert_called_once()
-    sdk.poll_job.assert_called_once_with("STUDY", "BATCH", timeout=10, interval=1)
+    sdk.poll_job.assert_called_once_with(
+        "STUDY", "BATCH", timeout=10, interval=1, resolve_results=True
+    )
     assert result == completed_job
 
 

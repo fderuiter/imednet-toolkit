@@ -517,6 +517,7 @@ class SyncToAsyncFacadeAdapter:
             on_progress: JobProgressHandler | None = None,
             dry_run: bool = False,
             collect_errors: bool = False,
+            resolve_results: bool = True,
         ) -> BatchSubmissionSummary:
             """Delegate ``create_records_batch`` to the wrapped synchronous facade."""
             ...

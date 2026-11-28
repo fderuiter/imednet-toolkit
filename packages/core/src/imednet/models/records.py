@@ -249,6 +249,8 @@ class BaseRecordRequest(ImednetBaseModel):
         handler: ValidatorFunctionWrapHandler,
     ) -> RecordStatus | str | None:
         """Normalize blank strings to None and coerce matching RecordStatus values."""
+        if value is None:
+            return None
         if isinstance(value, str) and not value.strip():
             return None
         return coerce_field_status(RecordStatus, value, handler)
@@ -291,10 +293,10 @@ class RegisterSubjectRequest(BaseRecordRequest):
     """Payload for registering (enrolling) a new subject.
 
     Typically supplies ``formKey`` (or ``formId``) and a site identifier
-    (``siteName`` or ``siteId``). Optional ``subjectKey`` and ``subjectOid``
-    attributes are omitted when ``None`` or blank so server-assigned subject
-    keys continue working by default; when explicitly supplied, they are
-    preserved for enrollment and deduplication.
+    (``siteName`` or ``siteId``). Optional ``subjectKey``, ``subjectId``, and
+    ``subjectOid`` attributes are omitted when ``None`` or blank so
+    server-assigned subject keys continue working by default; when explicitly
+    supplied, they are preserved for enrollment and deduplication.
     """
 
 
@@ -311,8 +313,8 @@ class CreateNewRecordRequest(BaseRecordRequest):
     """Payload for creating a new unscheduled record.
 
     Targets a form and subject via ``formKey``/``formId`` and
-    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, status,
-    and audit reason attributes.
+    ``subjectKey``/``subjectId``/``subjectOid``, with optional site, interval,
+    status, and audit reason attributes.
     """
 
 

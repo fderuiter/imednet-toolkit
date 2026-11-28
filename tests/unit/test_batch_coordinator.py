@@ -1088,6 +1088,7 @@ async def test_sdk_convenience_batch_preserves_nested_spans_and_partial_mocks(
             timeout=15.0,
             on_progress=None,
             fail_fast=False,
+            resolve_results=True,
         )
         assert span_events == [
             ("create_records_batch", ("create_records_batch",)),
@@ -1132,6 +1133,7 @@ async def test_sdk_convenience_batch_preserves_nested_spans_and_partial_mocks(
             timeout=20.0,
             on_progress=None,
             fail_fast=False,
+            resolve_results=True,
         )
         assert span_events == [
             ("async_create_records_batch", ("async_create_records_batch",)),

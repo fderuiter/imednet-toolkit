@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     from .models.jobs import Job
     from .models.queries import Query
     from .models.record_revisions import RecordRevision
-    from .models.records import Record, RegisterSubjectRequest
+    from .models.records import Record, RecordStatus, RegisterSubjectRequest
     from .models.sites import Site
     from .models.subjects import Subject
     from .models.triage import TriageItem, TriageStatus
@@ -840,6 +840,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
         ...
@@ -857,6 +858,7 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Submit records for creation or update and return the resulting Job."""
         ...
@@ -873,8 +875,13 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Register a new subject by submitting a single enrollment record."""
         ...
@@ -893,8 +900,11 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Update an existing scheduled record for a subject."""
         ...
@@ -911,10 +921,41 @@ class SyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Create a new unscheduled record for an existing subject."""
+        ...
+
+    def update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Update an existing record by recordId, recordOid, visitId, or interval."""
         ...
 
 
@@ -935,6 +976,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
         ...
@@ -952,6 +994,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Submit records for creation or update and return the resulting Job."""
         ...
@@ -968,8 +1011,13 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Register a new subject by submitting a single enrollment record."""
         ...
@@ -988,8 +1036,11 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Update an existing scheduled record for a subject."""
         ...
@@ -1006,10 +1057,41 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Create a new unscheduled record for an existing subject."""
+        ...
+
+    async def update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Asynchronously update an existing record by recordId, recordOid, visitId, or interval."""
         ...
 
     @deprecated(
@@ -1030,6 +1112,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
         ...
@@ -1050,6 +1133,7 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously submit records for creation or update and return the Job."""
         ...
@@ -1067,8 +1151,13 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously register a new subject via the Records API."""
         ...
@@ -1090,8 +1179,11 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously update an existing scheduled record for a subject."""
         ...
@@ -1111,10 +1203,42 @@ class AsyncRecordUpdateWorkflowProtocol(Protocol):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously create a new unscheduled record for an existing subject."""
+        ...
+
+    @deprecated("async_update_record() is deprecated; use await update_record(...) instead.")
+    async def async_update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Asynchronously update an existing record by recordId, recordOid, visitId, or interval."""
         ...
 
 
@@ -1138,6 +1262,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Validate sites and submit subject registrations in bounded chunks."""
         ...
@@ -1158,6 +1283,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Register one or more subjects in a study."""
         ...
@@ -1179,6 +1305,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Asynchronously register subjects in bounded chunks."""
         ...
@@ -1199,6 +1326,7 @@ class SyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously register one or more subjects in a study."""
         ...
@@ -1227,6 +1355,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate sites and submit subject registrations in bounded chunks."""
         ...
@@ -1247,6 +1376,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously register one or more subjects in a study."""
         ...
@@ -1272,6 +1402,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> BatchSubmissionSummary:
         """Deprecated alias for :meth:`register_subjects_batch`."""
         ...
@@ -1295,6 +1426,7 @@ class AsyncRegisterSubjectsWorkflowProtocol(Protocol):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated alias for :meth:`register_subjects`."""
         ...

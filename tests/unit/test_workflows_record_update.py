@@ -58,7 +58,7 @@ def test_create_or_update_records_wait_for_completion(monkeypatch) -> None:
     )
 
     sdk.create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
-    sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
+    sdk.poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0, resolve_results=True)
     assert result.state == "COMPLETED"
 
 
@@ -378,7 +378,7 @@ async def test_async_create_or_update_records_wait_for_completion(monkeypatch) -
     )
 
     sdk.async_create_record.assert_called_once_with("STUDY", [{"a": 1}], schema=wf._schema)
-    sdk.async_poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0)
+    sdk.async_poll_job.assert_called_with("STUDY", "1", timeout=5, interval=0, resolve_results=True)
     assert result.state == "COMPLETED"
 
 
@@ -1030,6 +1030,119 @@ async def test_record_update_workflow_email_notify_across_all_ten_methods() -> N
         "false",
         "async-alerts@example.com",
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_record_and_async_workflow_helpers_cover_expanded_attributes() -> None:
+    """Exercise sync/async update_record, AsyncRecordUpdateWorkflow helpers, and BaseRecordRequest validation."""
+    from imednet.models.records import RecordStatus, UpdateRecordRequest
+    from imednet_workflows.record_update import AsyncRecordUpdateWorkflow
+
+    sync_sdk = MagicMock()
+    del sync_sdk.async_create_record
+    sync_sdk.variables.list.return_value = [
+        Variable(
+            studyKey="STUDY",
+            formId=20,
+            formKey="VS",
+            formName="Vitals",
+            variableId=1,
+            variableName="SYSBP",
+            variableType="integer",
+        )
+    ]
+    sync_sdk.create_record.return_value = Job(jobId="1", batchId="B-UPD", state="COMPLETED")
+    wf = RecordUpdateWorkflow(sync_sdk)
+
+    # Validate BaseRecordRequest tuple directly through workflow
+    wf.create_or_update_records(
+        "STUDY",
+        (UpdateRecordRequest(formId=20, recordId=99, data={"SYSBP": 120}),),
+    )
+
+    with pytest.raises(ValueError, match="requires at least one target identifier"):
+        wf.update_record("STUDY", {"SYSBP": 120})
+
+    wf.update_record(
+        "STUDY",
+        {"SYSBP": 118},
+        record_id=99,
+        record_oid="OID-99",
+        visit_id=7,
+        form_identifier=20,
+        form_identifier_type="id",
+        subject_identifier="OID-SUB-1",
+        subject_identifier_type="oid",
+        site_identifier=2,
+        site_identifier_type="id",
+        interval_identifier=4,
+        interval_identifier_type="id",
+        record_status=RecordStatus.RECORD_COMPLETE,
+        reason_for_change="Chart fix",
+        resolve_results=False,
+    )
+    await wf.async_update_record(
+        "STUDY",
+        {"SYSBP": 119},
+        record_id=100,
+        form_identifier="VS",
+        record_status="Record Complete",
+        reason_for_change="Legacy async alias",
+    )
+
+    async_sdk = MagicMock()
+    awf = AsyncRecordUpdateWorkflow(async_sdk)
+    awf.create_or_update_records = AsyncMock(  # type: ignore[method-assign]
+        return_value=Job(jobId="2", batchId="AB-UPD", state="COMPLETED")
+    )
+    await awf.register_subject(
+        "STUDY",
+        10,
+        1,
+        {"A": 1},
+        form_identifier_type="id",
+        site_identifier_type="id",
+        subject_key="SUBJ-1",
+        subject_oid="OID-1",
+        record_status="Record Complete",
+        reason_for_change="Enroll",
+    )
+    await awf.update_scheduled_record(
+        "STUDY",
+        20,
+        50,
+        3,
+        {"SYSBP": 120},
+        form_identifier_type="id",
+        subject_identifier_type="id",
+        interval_identifier_type="id",
+        record_status="Record Complete",
+        reason_for_change="Scheduled",
+    )
+    await awf.create_new_record(
+        "STUDY",
+        "VS",
+        "OID-1",
+        {"SYSBP": 121},
+        subject_identifier_type="oid",
+        record_status="Record Complete",
+        reason_for_change="Unscheduled",
+    )
+    await awf.update_record(
+        "STUDY",
+        {"SYSBP": 122},
+        record_oid="REC-OID-1",
+        record_status="Record Complete",
+        reason_for_change="Async update",
+    )
+    await awf.async_update_record(
+        "STUDY",
+        {"SYSBP": 123},
+        visit_id=15,
+        record_status="Record Complete",
+        reason_for_change="Deprecated async update",
+    )
+    assert awf.create_or_update_records.await_count == 5
 
 
 @pytest.mark.asyncio

@@ -2006,14 +2006,14 @@ def calculate_readiness_score(
     return score, reasons
 
 
-def _has_existing_record_target(record: Mapping[str, Any]) -> bool:
+def _has_existing_record_target(record: Mapping[str, Any] | BaseRecordRequest | Any) -> bool:
     """Return True when *record* specifies an existing record or visit target."""
     for int_key in ("recordId", "record_id", "visitId", "visit_id"):
-        val = record.get(int_key)
+        val = record.get(int_key) if isinstance(record, Mapping) else getattr(record, int_key, None)
         if val is not None and not isinstance(val, bool) and str(val).strip() != "":
             return True
     for str_key in ("recordOid", "record_oid"):
-        val = record.get(str_key)
+        val = record.get(str_key) if isinstance(record, Mapping) else getattr(record, str_key, None)
         if val is not None and str(val).strip() != "":
             return True
     return False
@@ -2291,7 +2291,7 @@ class BaseSchemaValidator(_ValidatorMixin, Generic[_TClient]):
 
     def _needs_refresh(
         self,
-        record: dict[str, Any],
+        record: Mapping[str, Any] | BaseRecordRequest,
         study_key: str | None = None,
     ) -> tuple[str | None, bool]:
         """Determine if the schema cache needs refreshing for the given record.

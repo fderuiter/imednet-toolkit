@@ -74,17 +74,29 @@ def _apply_registration_defaults(
     records: list[JsonDict],
     *,
     default_form_key: str | None = None,
+    default_form_id: int | None = None,
     default_site_name: str | None = None,
     default_site_id: int | None = None,
 ) -> list[JsonDict]:
-    """Fill missing ``formKey`` / ``siteName`` / ``siteId`` from optional defaults."""
-    if not default_form_key and not default_site_name and default_site_id is None:
+    """Fill missing ``formKey`` / ``formId`` / ``siteName`` / ``siteId`` from optional defaults."""
+    if (
+        not default_form_key
+        and default_form_id is None
+        and not default_site_name
+        and default_site_id is None
+    ):
         return records
     resolved: list[JsonDict] = []
     for item in records:
         copied = dict(item)
-        if default_form_key and not (copied.get("formKey") or copied.get("form_key")):
-            copied["formKey"] = default_form_key
+        has_form = bool(copied.get("formKey") or copied.get("form_key")) or (
+            copied.get("formId") is not None or copied.get("form_id") is not None
+        )
+        if not has_form:
+            if default_form_key:
+                copied["formKey"] = default_form_key
+            elif default_form_id is not None:
+                copied["formId"] = default_form_id
         has_site_name = bool(copied.get("siteName") or copied.get("site_name"))
         has_site_id = copied.get("siteId") is not None or copied.get("site_id") is not None
         if default_site_name and not has_site_name and not has_site_id:
@@ -99,6 +111,7 @@ def normalize_subject_registration_inputs(
     subjects: Sequence[RegisterSubjectRequest | dict[str, Any]] | Any,
     *,
     default_form_key: str | None = None,
+    default_form_id: int | None = None,
     default_site_name: str | None = None,
     default_site_id: int | None = None,
     schema: ValidationSchemaProtocol | None = None,
@@ -128,10 +141,12 @@ def normalize_subject_registration_inputs(
                 schema=schema,
                 study_key=study_key,
                 default_form_key=default_form_key,
+                default_form_id=default_form_id,
             )
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
+            default_form_id=default_form_id,
             default_site_name=default_site_name,
             default_site_id=default_site_id,
         )
@@ -141,10 +156,12 @@ def normalize_subject_registration_inputs(
             schema=schema,
             study_key=study_key,
             default_form_key=default_form_key,
+            default_form_id=default_form_id,
         )
         raw_items = _apply_registration_defaults(
             records,
             default_form_key=default_form_key,
+            default_form_id=default_form_id,
             default_site_name=default_site_name,
             default_site_id=default_site_id,
         )
@@ -158,17 +175,35 @@ def normalize_subject_registration_inputs(
         if isinstance(raw_subj, RegisterSubjectRequest):
             model_subj = raw_subj
             needs_form = bool(
-                default_form_key and not model_subj.form_key and model_subj.form_id is None
+                (default_form_key or default_form_id is not None)
+                and not model_subj.form_key
+                and model_subj.form_id is None
             )
             needs_site = bool(
                 (default_site_name or default_site_id is not None)
                 and not model_subj.site_name
                 and model_subj.site_id is None
             )
-            if needs_form or needs_site:
+            needs_schema_fk = bool(
+                not model_subj.form_key and model_subj.form_id is not None and schema is not None
+            )
+            if needs_form or needs_site or needs_schema_fk:
                 patched = model_subj.model_dump(by_alias=True, exclude_none=True)
-                if needs_form and default_form_key:
-                    patched["formKey"] = default_form_key
+                if needs_form:
+                    if default_form_key:
+                        patched["formKey"] = default_form_key
+                    elif default_form_id is not None:
+                        patched["formId"] = default_form_id
+                if (
+                    not patched.get("formKey")
+                    and patched.get("formId") is not None
+                    and schema is not None
+                ):
+                    resolved_fk = _lookup_form_key_from_id(
+                        schema, int(patched["formId"]), study_key=study_key
+                    )
+                    if resolved_fk:
+                        patched["formKey"] = resolved_fk
                 if needs_site:
                     if default_site_name:
                         patched["siteName"] = default_site_name
@@ -188,23 +223,21 @@ def normalize_subject_registration_inputs(
                     raw_dict["data"] = dict(raw_dict["record_data"])
             raw_dict.pop("recordData", None)
             raw_dict.pop("record_data", None)
-            if not (raw_dict.get("formKey") or raw_dict.get("form_key")):
-                raw_fid = raw_dict.get("formId")
-                if raw_fid is None:
-                    raw_fid = raw_dict.get("form_id")
-                if raw_fid is not None and schema is not None:
-                    resolved_fk = _lookup_form_key_from_id(
-                        schema, int(raw_fid), study_key=study_key
-                    )
-                    if resolved_fk:
-                        raw_dict["formKey"] = resolved_fk
-            if default_form_key and not (
-                raw_dict.get("formKey")
-                or raw_dict.get("form_key")
-                or raw_dict.get("formId") is not None
-                or raw_dict.get("form_id") is not None
-            ):
-                raw_dict["formKey"] = default_form_key
+            has_fk = bool(raw_dict.get("formKey") or raw_dict.get("form_key"))
+            raw_fid = raw_dict.get("formId")
+            if raw_fid is None:
+                raw_fid = raw_dict.get("form_id")
+            if not has_fk and raw_fid is None:
+                if default_form_key:
+                    raw_dict["formKey"] = default_form_key
+                    has_fk = True
+                elif default_form_id is not None:
+                    raw_dict["formId"] = default_form_id
+                    raw_fid = default_form_id
+            if not has_fk and raw_fid is not None and schema is not None:
+                resolved_fk = _lookup_form_key_from_id(schema, int(raw_fid), study_key=study_key)
+                if resolved_fk:
+                    raw_dict["formKey"] = resolved_fk
             has_site_name = bool(raw_dict.get("siteName") or raw_dict.get("site_name"))
             has_site_id = raw_dict.get("siteId") is not None or raw_dict.get("site_id") is not None
             if default_site_name and not has_site_name and not has_site_id:

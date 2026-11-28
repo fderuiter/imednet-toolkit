@@ -329,27 +329,114 @@ class JobStatus(Job):
             raise ValueError(str(exc)) from exc
 
     @staticmethod
-    def _count_dict_record_failures(results: dict[str, Any]) -> int:
-        """Count failed record entries inside a dict ``results`` payload."""
+    def _item_has_error(item: dict[str, Any]) -> bool:
+        """Return True when a result record entry reports record-level or variable-level errors."""
+        status_upper = str(item.get("status") or "").strip().upper()
+        if status_upper in {"FAIL", "FAILED", "ERROR", "INVALID", "REJECTED"}:
+            return True
+        if item.get("success") is False:
+            return True
+        for err_key in (
+            "error",
+            "errors",
+            "variableErrors",
+            "variable_errors",
+            "fieldErrors",
+            "field_errors",
+            "validationErrors",
+            "validation_errors",
+        ):
+            if item.get(err_key):
+                return True
+        return False
+
+    @classmethod
+    def _item_is_successful(cls, item: dict[str, Any], *, job_failed: bool = False) -> bool:
+        """Return True when a result record entry succeeded without errors."""
+        if cls._item_has_error(item):
+            return False
+        if item.get("success") is True:
+            return True
+        status_upper = str(item.get("status") or "").strip().upper()
+        if status_upper in {
+            "PASS",
+            "SUCCESS",
+            "COMPLETED",
+            "COMPLETE",
+            "CREATED",
+            "UPDATED",
+            "OK",
+            "RECORD COMPLETE",
+            "RECORD INCOMPLETE",
+            "DATA COMPLETE",
+            "INCOMPLETE",
+            "PARTIAL",
+            "LOCKED",
+            "FROZEN",
+            "SIGNED",
+            "VERIFIED",
+            "APPROVED",
+        }:
+            return True
+        if status_upper in {
+            "CANCELLED",
+            "CANCELED",
+            "ABORTED",
+            "SKIPPED",
+            "DELETED",
+            "PENDING",
+            "OPEN",
+            "PROCESSING",
+            "QUEUED",
+        }:
+            return False
+        if job_failed:
+            return False
+        return any(
+            item.get(id_key) not in (None, "")
+            for id_key in (
+                "recordId",
+                "record_id",
+                "recordOid",
+                "record_oid",
+                "subjectKey",
+                "subject_key",
+                "subjectId",
+                "subject_id",
+                "subjectOid",
+                "subject_oid",
+            )
+        )
+
+    @classmethod
+    def _count_dict_record_failures(cls, results: dict[str, Any]) -> int:
+        """Count failed record or variable entries inside a dict ``results`` payload."""
         err_count = 0
-        errors_val = results.get("errors")
-        if isinstance(errors_val, list):
-            err_count = len(errors_val)
-        elif errors_val or results.get("error"):
+        for top_err_key in (
+            "errors",
+            "variableErrors",
+            "variable_errors",
+            "fieldErrors",
+            "field_errors",
+            "validationErrors",
+            "validation_errors",
+        ):
+            errors_val = results.get(top_err_key)
+            if isinstance(errors_val, (list, dict)):
+                err_count = max(err_count, len(errors_val))
+            elif errors_val:
+                err_count = max(err_count, 1)
+
+        if err_count == 0 and results.get("error"):
             err_count = 1
 
-        records_val = results.get("records")
-        if isinstance(records_val, list):
-            rec_failures = sum(
-                1
-                for r in records_val
-                if isinstance(r, dict)
-                and (
-                    (r.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}
-                    or (not r.get("status") and bool(r.get("error") or r.get("errors")))
+        for list_key in ("records", "data", "items"):
+            records_val = results.get(list_key)
+            if isinstance(records_val, list):
+                rec_failures = sum(
+                    1 for r in records_val if isinstance(r, dict) and cls._item_has_error(r)
                 )
-            )
-            err_count = max(err_count, rec_failures)
+                err_count = max(err_count, rec_failures)
         return err_count
 
     @property
@@ -369,9 +456,10 @@ class JobStatus(Job):
             if "total" in self.results and self.results.get("total") is not None:
                 return int(self.results["total"])
             err_count = self._count_dict_record_failures(self.results)
-            records_val = self.results.get("records")
-            if isinstance(records_val, list) and len(records_val) > 0:
-                return max(len(records_val), int(self.record_total_count or 0), err_count)
+            for list_key in ("records", "data", "items"):
+                records_val = self.results.get(list_key)
+                if isinstance(records_val, list) and len(records_val) > 0:
+                    return max(len(records_val), int(self.record_total_count or 0), err_count)
             if self.record_total_count is not None:
                 return max(int(self.record_total_count), err_count)
             if (
@@ -388,6 +476,7 @@ class JobStatus(Job):
     @property
     def successful_records(self) -> int | None:
         """Return the total number of successful records processed, or None when unknown."""
+        job_failed = super().is_failed
         if isinstance(self.results, list):
             if len(self.results) == 0:
                 return (
@@ -396,20 +485,20 @@ class JobStatus(Job):
             return sum(
                 1
                 for r in self.results
-                if isinstance(r, dict)
-                and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
+                if isinstance(r, dict) and self._item_is_successful(r, job_failed=job_failed)
             )
         if isinstance(self.results, dict):
             if "success" in self.results and self.results.get("success") is not None:
                 return int(self.results["success"])
-            records_val = self.results.get("records")
-            if isinstance(records_val, list) and len(records_val) > 0:
-                return sum(
-                    1
-                    for r in records_val
-                    if isinstance(r, dict)
-                    and (r.get("status") or "").upper() in {"PASS", "SUCCESS", "COMPLETED"}
-                )
+            for list_key in ("records", "data", "items"):
+                records_val = self.results.get(list_key)
+                if isinstance(records_val, list) and len(records_val) > 0:
+                    return sum(
+                        1
+                        for r in records_val
+                        if isinstance(r, dict)
+                        and self._item_is_successful(r, job_failed=job_failed)
+                    )
             if self.record_success_count is not None:
                 return int(self.record_success_count)
             return None
@@ -428,13 +517,7 @@ class JobStatus(Job):
                     int(self.record_failure_count) if self.record_failure_count is not None else 0
                 )
             counted = sum(
-                1
-                for r in self.results
-                if isinstance(r, dict)
-                and (
-                    (r.get("status") or "").upper() in {"FAIL", "FAILED", "ERROR"}
-                    or (not r.get("status") and bool(r.get("error") or r.get("errors")))
-                )
+                1 for r in self.results if isinstance(r, dict) and self._item_has_error(r)
             )
             if self.record_failure_count is not None:
                 return max(counted, int(self.record_failure_count))
