@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from imednet.core.context import get_study_context
+from imednet.core.context import get_study_context, sdk_governance_context
 from imednet.core.endpoint.base import (
     AsyncGetEndpoint,
     AsyncListEndpoint,
@@ -81,12 +81,15 @@ class EdcSyncListEndpoint(_EdcEndpointBase, SyncListEndpoint[T]):
     def to_dataframe(
         self,
         study_key: str | None = None,
+        *,
+        mask_phi: bool = True,
         **filters: Any,
     ) -> pd.DataFrame:
         """Export queried resources directly to a pandas DataFrame.
 
         Args:
             study_key: Optional study key override.
+            mask_phi: Whether to mask sensitive PHI fields by default.
             **filters: Resource filters passed to :meth:`list`.
 
         Returns:
@@ -99,8 +102,19 @@ class EdcSyncListEndpoint(_EdcEndpointBase, SyncListEndpoint[T]):
 
         feature_name = _dataframe_feature_name(self.PATH)
         check_pandas(feature_name)
-        items = list(self.list(study_key=study_key, **filters))
-        return _models_to_dataframe(items, feature_name)
+        with sdk_governance_context(self):
+            resolved_study_key = (
+                study_key
+                if isinstance(study_key, str) and study_key
+                else (get_study_context() if getattr(self, "requires_study_key", True) else None)
+            )
+            items = list(self.list(study_key=study_key, **filters))
+            return _models_to_dataframe(
+                items,
+                feature_name,
+                mask_phi=mask_phi,
+                study_key=resolved_study_key,
+            )
 
 
 class EdcAsyncListEndpoint(_EdcEndpointBase, AsyncListEndpoint[T]):
@@ -111,12 +125,15 @@ class EdcAsyncListEndpoint(_EdcEndpointBase, AsyncListEndpoint[T]):
     async def to_dataframe(
         self,
         study_key: str | None = None,
+        *,
+        mask_phi: bool = True,
         **filters: Any,
     ) -> pd.DataFrame:
         """Export queried resources asynchronously directly to a pandas DataFrame.
 
         Args:
             study_key: Optional study key override.
+            mask_phi: Whether to mask sensitive PHI fields by default.
             **filters: Resource filters passed to :meth:`list`.
 
         Returns:
@@ -129,8 +146,19 @@ class EdcAsyncListEndpoint(_EdcEndpointBase, AsyncListEndpoint[T]):
 
         feature_name = _dataframe_feature_name(self.PATH)
         check_pandas(feature_name)
-        items = [item async for item in self.list(study_key=study_key, **filters)]
-        return _models_to_dataframe(items, feature_name)
+        with sdk_governance_context(self):
+            resolved_study_key = (
+                study_key
+                if isinstance(study_key, str) and study_key
+                else (get_study_context() if getattr(self, "requires_study_key", True) else None)
+            )
+            items = [item async for item in self.list(study_key=study_key, **filters)]
+            return _models_to_dataframe(
+                items,
+                feature_name,
+                mask_phi=mask_phi,
+                study_key=resolved_study_key,
+            )
 
 
 class EdcSyncGetEndpoint(_EdcEndpointBase, SyncGetEndpoint[T]):

@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from imednet.models.records import BaseRecordRequest
 
 
-def _extract_form_ref(record: Mapping[str, Any]) -> tuple[str | None, Any]:
+def _extract_form_ref(
+    record: BaseRecordRequest | Mapping[str, Any],
+) -> tuple[str | None, Any]:
     """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
+    if not isinstance(record, Mapping):
+        raw_fk = getattr(record, "form_key", None)
+        fk = str(raw_fk) if raw_fk else None
+        raw_fid = getattr(record, "form_id", None)
+        fid = None if raw_fid == "" else raw_fid
+        return fk, fid
     raw_fk = record.get("formKey") or record.get("form_key")
     fk = str(raw_fk) if raw_fk else None
     raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
@@ -22,7 +33,7 @@ class _ValidatorMixin:
 
     def _resolve_form_key(
         self,
-        record: dict[str, Any],
+        record: BaseRecordRequest | Mapping[str, Any],
         study_key: str | None = None,
     ) -> str | None:
         """Resolve the form key from a record payload.

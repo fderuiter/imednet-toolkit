@@ -11,8 +11,11 @@ import math
 import os
 import re
 from collections.abc import Mapping, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel
 
 from imednet.errors import ValidationError
 from imednet.utils.typing import JsonDict, RecordsInput
@@ -69,6 +72,18 @@ _IDENTIFIER_COLUMNS: frozenset[str] = frozenset(
     {
         *_SNAKE_TO_CAMEL_IDENTIFIERS.keys(),
         *_SNAKE_TO_CAMEL_IDENTIFIERS.values(),
+    }
+)
+
+_SNAKE_READ_ONLY_RECORD_KEYS: frozenset[str] = frozenset(
+    {
+        "study_key",
+        "record_type",
+        "date_created",
+        "date_modified",
+        "last_updated",
+        "parent_record_id",
+        "subject_status",
     }
 )
 
@@ -160,39 +175,13 @@ def _contains_masked_sentinel(value: Any) -> bool:
     return False
 
 
-def normalize_record_payload_item(item: BaseRecordRequest | Mapping[str, Any]) -> JsonDict:
-    """Normalize a :class:`BaseRecordRequest` or mapping into a camelCase ``JsonDict``."""
-    from imednet.models.records import BaseRecordRequest
-
-    if isinstance(item, BaseRecordRequest):
-        return item.model_dump(by_alias=True, exclude_none=True)
-    if isinstance(item, Mapping):
-        if isinstance(item, dict) and not any(k in _SNAKE_TO_CAMEL_IDENTIFIERS for k in item):
-            return item
-        out: JsonDict = {}
-        for key, value in item.items():
-            camel_key = _SNAKE_TO_CAMEL_IDENTIFIERS.get(key)
-            if camel_key is not None:
-                if camel_key not in item or item[camel_key] is None:
-                    out[camel_key] = value
-            else:
-                out[key] = value
-        return out
-    raise TypeError(
-        "All items in records_data sequence must be BaseRecordRequest or Mapping; "
-        f"got {type(item).__name__}."
-    )
-
-
 def ensure_no_masked_sentinel(
-    records: Sequence[BaseRecordRequest | Mapping[str, Any]],
+    records: Sequence[BaseModel | Mapping[str, Any]],
 ) -> None:
-    """Raise :class:`ValidationError` if any record contains ``***MASKED***``."""
-    from imednet.models.records import BaseRecordRequest
-
+    """Raise :class:`ValidationError` if any record model or mapping contains ``***MASKED***``."""
     for row_idx, rec in enumerate(records):
         rec_map: Mapping[str, Any]
-        if isinstance(rec, BaseRecordRequest):
+        if isinstance(rec, BaseModel):
             rec_map = rec.model_dump(by_alias=True, exclude_none=True)
         elif isinstance(rec, Mapping):
             rec_map = rec
@@ -697,6 +686,160 @@ def dataframe_rows_to_records(
     return records
 
 
+def _needs_mapping_normalization(
+    item: Mapping[str, Any],
+    *,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+    convert_record_data_alias: bool = False,
+) -> bool:
+    """Return True if *item* requires copying or key normalization for canonical wire JSON."""
+    if type(item) is not dict:
+        return True
+    for key, val in item.items():
+        if (
+            key in _SNAKE_TO_CAMEL_IDENTIFIERS
+            or key in _SNAKE_READ_ONLY_RECORD_KEYS
+            or key == "record_data"
+            or (convert_record_data_alias and key == "recordData" and "data" not in item)
+            or isinstance(val, (Enum, BaseModel))
+        ):
+            return True
+    return bool(
+        (default_form_key or default_form_id is not None)
+        and not (
+            item.get("formKey")
+            or item.get("formId") is not None
+            or item.get("recordId") is not None
+            or item.get("recordOid")
+        )
+    )
+
+
+def normalize_record_mapping(
+    item: BaseModel | Mapping[str, Any],
+    *,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+    convert_record_data_alias: bool = False,
+) -> JsonDict:
+    """Normalize a single record request model or mapping into a canonical ``camelCase`` dict."""
+    if isinstance(item, BaseModel):
+        dumped = item.model_dump(by_alias=True, exclude_none=True)
+        # Convert read-model Record dumps cleanly if passed
+        if "recordData" in dumped and "data" not in dumped:
+            rec_payload = dumped.pop("recordData")
+            for ro_key in _READ_ONLY_RECORD_COLUMNS:
+                dumped.pop(ro_key, None)
+            if isinstance(rec_payload, Mapping):
+                dumped["data"] = dict(rec_payload)
+        for key, val in list(dumped.items()):
+            if isinstance(val, Enum):
+                dumped[key] = str(val.value)
+        if not (
+            dumped.get("formKey")
+            or dumped.get("formId") is not None
+            or dumped.get("recordId") is not None
+            or dumped.get("recordOid")
+        ):
+            if default_form_key:
+                dumped["formKey"] = default_form_key
+            elif default_form_id is not None:
+                dumped["formId"] = default_form_id
+        return dumped
+
+    if not isinstance(item, Mapping):
+        raise TypeError(
+            "All items in records_data sequence must be BaseRecordRequest or Mapping; "
+            f"got {type(item).__name__}."
+        )
+
+    if not _needs_mapping_normalization(
+        item,
+        default_form_key=default_form_key,
+        default_form_id=default_form_id,
+        convert_record_data_alias=convert_record_data_alias,
+    ):
+        return item  # type: ignore[return-value]
+
+    out: JsonDict = {}
+    for key, val in item.items():
+        if key in _SNAKE_READ_ONLY_RECORD_KEYS:
+            continue
+        if key == "record_data" or (convert_record_data_alias and key == "recordData"):
+            continue
+        target_key = _SNAKE_TO_CAMEL_IDENTIFIERS.get(key, key)
+        if (
+            key in _SNAKE_TO_CAMEL_IDENTIFIERS
+            and target_key in item
+            and item[target_key] is not None
+        ):
+            continue
+        if isinstance(val, BaseModel):
+            dumped_val = val.model_dump(by_alias=True, exclude_none=True)
+            out[target_key] = dumped_val
+        elif isinstance(val, Enum):
+            out[target_key] = str(val.value)
+        else:
+            out[target_key] = val
+
+    if "data" not in out:
+        if (
+            convert_record_data_alias
+            and "recordData" in item
+            and isinstance(item["recordData"], Mapping)
+        ):
+            out["data"] = dict(item["recordData"])
+        elif "record_data" in item and isinstance(item["record_data"], Mapping):
+            out["data"] = dict(item["record_data"])
+
+    if not (
+        out.get("formKey")
+        or out.get("formId") is not None
+        or out.get("recordId") is not None
+        or out.get("recordOid")
+    ):
+        if default_form_key:
+            out["formKey"] = default_form_key
+        elif default_form_id is not None:
+            out["formId"] = default_form_id
+
+    return out
+
+
+def normalize_record_payload_item(item: BaseRecordRequest | Mapping[str, Any]) -> JsonDict:
+    """Normalize a :class:`BaseRecordRequest` or mapping into a camelCase ``JsonDict``."""
+    return normalize_record_mapping(item)
+
+
+def normalize_record_sequence(
+    records: Sequence[Any],
+    *,
+    default_form_key: str | None = None,
+    default_form_id: int | None = None,
+    convert_record_data_alias: bool = False,
+) -> list[JsonDict]:
+    """Validate sentinels and normalize a sequence of record models or mappings to ``camelCase``."""
+    for item in records:
+        if not isinstance(item, (BaseModel, Mapping)):
+            raise TypeError(
+                "All items in records_data sequence must be BaseRecordRequest or Mapping; "
+                f"got {type(item).__name__}."
+            )
+    ensure_no_masked_sentinel(records)
+    materialized = [
+        normalize_record_mapping(
+            item,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+            convert_record_data_alias=convert_record_data_alias,
+        )
+        for item in records
+    ]
+    ensure_no_masked_sentinel(materialized)
+    return materialized
+
+
 def normalize_records_input(
     records_data: RecordsInput,
     *,
@@ -723,13 +866,14 @@ def normalize_records_input(
             default_form_id=default_form_id,
         )
     if isinstance(records_data, Sequence) and not isinstance(records_data, (str, bytes, bytearray)):
-        ensure_no_masked_sentinel(records_data)
-        materialized = [normalize_record_payload_item(item) for item in records_data]
-        ensure_no_masked_sentinel(materialized)
-        return materialized
+        return normalize_record_sequence(
+            records_data,
+            default_form_key=default_form_key,
+            default_form_id=default_form_id,
+        )
     raise TypeError(
-        "records_data must be a list of dicts, pandas.DataFrame, or CSV path; "
-        f"got {type(records_data).__name__}."
+        "records_data must be a sequence of BaseRecordRequest or dicts, pandas.DataFrame, "
+        f"or CSV path; got {type(records_data).__name__}."
     )
 
 
@@ -739,6 +883,9 @@ __all__ = [
     "csv_to_records",
     "dataframe_rows_to_records",
     "ensure_no_masked_sentinel",
+    "normalize_record_mapping",
+    "normalize_record_payload_item",
+    "normalize_record_sequence",
     "normalize_records_input",
     "normalize_tabular_row",
 ]

@@ -16,6 +16,7 @@ from imednet.simulation.state import SimulationState, get_default_simulation_sta
 from imednet.utils.filters import ORDERED_FILTER_OPERATORS, _snake_to_camel, validate_filter_key
 
 _ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|\b|$)")
+_SNAKE_CASE_RECORD_WIRE_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
 _TWO_CHAR_OPS = frozenset(op for op in ORDERED_FILTER_OPERATORS if len(op) == 2)
 _ONE_CHAR_OPS = frozenset({*(op for op in ORDERED_FILTER_OPERATORS if len(op) == 1), "="})
 
@@ -576,6 +577,20 @@ class SimulationTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
                                 records_data = [parsed]
                         except Exception:
                             records_data = []
+                    for rec_item in records_data:
+                        if isinstance(rec_item, dict):
+                            for raw_key, raw_val in rec_item.items():
+                                if isinstance(
+                                    raw_key, str
+                                ) and _SNAKE_CASE_RECORD_WIRE_KEY_RE.match(raw_key):
+                                    return self._error_response(
+                                        request,
+                                        400,
+                                        "BAD_REQUEST",
+                                        f"Invalid snake_case attribute '{raw_key}' in POST "
+                                        "records payload; expected camelCase.",
+                                        field={"attribute": raw_key, "value": str(raw_val)},
+                                    )
                     job_res = self.state.create_records(study_key, records_data)
                     return httpx.Response(
                         202,

@@ -22,50 +22,29 @@ _RECORD_ENVELOPE_KEYS = frozenset(
         "data",
         "dateCreated",
         "dateModified",
-        "date_created",
-        "date_modified",
         "deleted",
         "formId",
         "formKey",
-        "form_id",
-        "form_key",
         "intervalId",
         "intervalName",
-        "interval_id",
-        "interval_name",
         "keywords",
         "lastUpdated",
-        "last_updated",
         "reasonForChange",
-        "reason_for_change",
         "recordData",
         "recordId",
         "recordOid",
         "recordStatus",
         "recordType",
-        "record_data",
-        "record_id",
-        "record_oid",
-        "record_status",
-        "record_type",
         "role",
         "siteId",
         "siteName",
-        "site_id",
-        "site_name",
         "studyKey",
-        "study_key",
         "subjectId",
         "subjectKey",
         "subjectOid",
         "subjectStatus",
-        "subject_id",
-        "subject_key",
-        "subject_oid",
-        "subject_status",
         "user",
         "visitId",
-        "visit_id",
     }
 )
 
@@ -1069,8 +1048,8 @@ class SimulationState:
 
     def _resolve_form_identifiers(self, study_key: str, item: dict[str, Any]) -> tuple[int, str]:
         """Resolve ``(formId, formKey)`` from study forms with deterministic fallbacks."""
-        raw_form_key = str(item.get("formKey") or item.get("form_key") or "").strip()
-        raw_form_id = item.get("formId") if item.get("formId") is not None else item.get("form_id")
+        raw_form_key = str(item.get("formKey") or "").strip()
+        raw_form_id = item.get("formId")
         study_forms = [f for f in self.forms if f.get("studyKey") == study_key]
         candidates = study_forms + [f for f in self.forms if f.get("studyKey") != study_key]
 
@@ -1112,8 +1091,8 @@ class SimulationState:
             study_sites[0] if study_sites else {"siteId": 101, "siteName": "SITE"}
         )
 
-        requested_name = str(item.get("siteName") or item.get("site_name") or "").strip()
-        requested_id = item.get("siteId") if item.get("siteId") is not None else item.get("site_id")
+        requested_name = str(item.get("siteName") or "").strip()
+        requested_id = item.get("siteId")
 
         if requested_name:
             matched = next((s for s in all_sites if s.get("siteName") == requested_name), None)
@@ -1157,15 +1136,9 @@ class SimulationState:
         item: dict[str, Any],
     ) -> tuple[int | None, int | None]:
         """Resolve ``(intervalId, visitId)`` from ``self.intervals`` and ``self.visits``."""
-        raw_interval_id = (
-            item.get("intervalId")
-            if item.get("intervalId") is not None
-            else item.get("interval_id")
-        )
-        raw_interval_name = str(item.get("intervalName") or item.get("interval_name") or "").strip()
-        raw_visit_id = (
-            item.get("visitId") if item.get("visitId") is not None else item.get("visit_id")
-        )
+        raw_interval_id = item.get("intervalId")
+        raw_interval_name = str(item.get("intervalName") or "").strip()
+        raw_visit_id = item.get("visitId")
 
         resolved_interval_id: int | None = None
         if raw_interval_id is not None:
@@ -1231,7 +1204,7 @@ class SimulationState:
     @staticmethod
     def _extract_record_data(item: dict[str, Any]) -> dict[str, Any]:
         """Extract record variable dictionary from a request payload."""
-        for key in ("data", "recordData", "record_data"):
+        for key in ("data", "recordData"):
             if key in item:
                 candidate = item[key]
                 if hasattr(candidate, "model_dump"):
@@ -1303,28 +1276,44 @@ class SimulationState:
                 rec_data = self._extract_record_data(item)
                 has_explicit_form = any(
                     item.get(k) is not None and str(item.get(k)).strip() != ""
-                    for k in ("formKey", "form_key", "formId", "form_id")
+                    for k in ("formKey", "formId")
                 )
                 is_registration_item = any(
                     item.get(k) is not None and str(item.get(k)).strip() != ""
-                    for k in ("siteName", "site_name", "siteId", "site_id")
+                    for k in ("siteName", "siteId")
                 )
                 form_id, form_key = self._resolve_form_identifiers(study_key, item)
-                raw_subj_key = str(item.get("subjectKey") or item.get("subject_key") or "").strip()
-                requested_rec_id = (
-                    item.get("recordId")
-                    if item.get("recordId") is not None
-                    else item.get("record_id")
+                raw_subj_key = str(item.get("subjectKey") or "").strip()
+                raw_subj_id = item.get("subjectId")
+                raw_subject_oid = item.get("subjectOid")
+                subject_oid = (
+                    str(raw_subject_oid).strip()
+                    if raw_subject_oid is not None and str(raw_subject_oid).strip()
+                    else None
                 )
-                raw_record_oid = item.get("recordOid") or item.get("record_oid")
+                if not raw_subj_key and (raw_subj_id is not None or subject_oid is not None):
+                    matched_by_id_or_oid = next(
+                        (
+                            s
+                            for s in self.subjects
+                            if s.get("studyKey") == study_key
+                            and (
+                                (raw_subj_id is not None and s.get("subjectId") == int(raw_subj_id))
+                                or (subject_oid is not None and s.get("subjectOid") == subject_oid)
+                            )
+                        ),
+                        None,
+                    )
+                    if matched_by_id_or_oid is not None and not is_registration_item:
+                        raw_subj_key = str(matched_by_id_or_oid.get("subjectKey") or "").strip()
+                requested_rec_id = item.get("recordId")
+                raw_record_oid = item.get("recordOid")
                 record_oid = (
                     str(raw_record_oid).strip()
                     if raw_record_oid is not None and str(raw_record_oid).strip()
                     else None
                 )
-                raw_visit_id = (
-                    item.get("visitId") if item.get("visitId") is not None else item.get("visit_id")
-                )
+                raw_visit_id = item.get("visitId")
                 resolved_interval_id, resolved_visit_id = self._resolve_interval_and_visit(
                     study_key, raw_subj_key, item
                 )
@@ -1419,18 +1408,10 @@ class SimulationState:
                     ):
                         existing_record = _select_candidate_record(interval_candidates, rec_data)
 
-                modified_ts = str(
-                    item.get("dateModified") or item.get("date_modified") or "2026-11-15T00:00:00Z"
-                )
-                updated_ts = str(item.get("lastUpdated") or item.get("last_updated") or modified_ts)
+                modified_ts = str(item.get("dateModified") or "2026-11-15T00:00:00Z")
+                updated_ts = str(item.get("lastUpdated") or modified_ts)
                 user_str = str(item.get("user") or "sim_user")
                 role_str = str(item.get("role") or "Investigator")
-                raw_subject_oid = item.get("subjectOid") or item.get("subject_oid")
-                subject_oid = (
-                    str(raw_subject_oid).strip()
-                    if raw_subject_oid is not None and str(raw_subject_oid).strip()
-                    else None
-                )
 
                 if existing_record is not None:
                     rec_id = int(existing_record["recordId"])
@@ -1445,12 +1426,8 @@ class SimulationState:
                     merged_data.update(rec_data)
                     status_changed = False
 
-                    if "recordStatus" in item or "record_status" in item:
-                        target_status = (
-                            item["recordStatus"]
-                            if "recordStatus" in item
-                            else item["record_status"]
-                        )
+                    if "recordStatus" in item:
+                        target_status = item["recordStatus"]
                         if target_status is not None:
                             old_status = existing_record.get("recordStatus")
                             old_deleted = bool(existing_record.get("deleted", False))
@@ -1477,9 +1454,6 @@ class SimulationState:
                         existing_record["recordOid"] = record_oid
                     else:
                         existing_record.setdefault("recordOid", f"REC-{rec_id}")
-                    existing_record["dateModified"] = modified_ts
-                    existing_record["lastUpdated"] = updated_ts
-
                     matched_subj = next(
                         (
                             s
@@ -1491,6 +1465,18 @@ class SimulationState:
                     if matched_subj is not None:
                         matched_subj["dateModified"] = modified_ts
                         matched_subj["lastUpdated"] = updated_ts
+                    existing_record.setdefault("studyKey", study_key)
+                    existing_record.setdefault("subjectId", subj_id)
+                    existing_record.setdefault("subjectKey", subj_key)
+                    existing_record.setdefault(
+                        "siteId",
+                        self._resolve_site_identifiers(study_key, item, matched_subj)[0],
+                    )
+                    existing_record.setdefault("intervalId", resolved_interval_id)
+                    existing_record.setdefault("recordStatus", "Record Incomplete")
+                    existing_record.setdefault("dateCreated", modified_ts)
+                    existing_record["dateModified"] = modified_ts
+                    existing_record["lastUpdated"] = updated_ts
 
                     job_results.append(
                         {
@@ -1507,11 +1493,7 @@ class SimulationState:
                         data_changed=data_changed or (not status_changed and bool(rec_data)),
                         user=user_str,
                         role=role_str,
-                        reason=str(
-                            item.get("reasonForChange")
-                            or item.get("reason_for_change")
-                            or "Record updated"
-                        ),
+                        reason=str(item.get("reasonForChange") or "Record updated"),
                         record_oid=record_oid,
                         subject_oid=subject_oid,
                         date_created=updated_ts,
@@ -1533,18 +1515,13 @@ class SimulationState:
                 site_id, site_name = self._resolve_site_identifiers(
                     study_key, item, existing_subject
                 )
-                created_ts = str(item.get("dateCreated") or item.get("date_created") or modified_ts)
+                created_ts = str(item.get("dateCreated") or modified_ts)
 
                 if existing_subject is not None:
                     subj_id = int(existing_subject.get("subjectId", 201))
                     existing_subject["dateModified"] = modified_ts
                     existing_subject["lastUpdated"] = updated_ts
                 else:
-                    raw_subj_id = (
-                        item.get("subjectId")
-                        if item.get("subjectId") is not None
-                        else item.get("subject_id")
-                    )
                     if raw_subj_id is not None:
                         subj_id = int(raw_subj_id)
                         self._next_subject_id = max(self._next_subject_id, subj_id)
@@ -1565,9 +1542,7 @@ class SimulationState:
                         "studyKey": study_key,
                         "siteId": site_id,
                         "siteName": site_name,
-                        "subjectStatus": str(
-                            item.get("subjectStatus") or item.get("subject_status") or "Enrolled"
-                        ),
+                        "subjectStatus": str(item.get("subjectStatus") or "Enrolled"),
                         "deleted": False,
                         "keywords": copy.deepcopy(item.get("keywords", [])),
                         "dateCreated": created_ts,
@@ -1583,11 +1558,7 @@ class SimulationState:
                         study_key, subj_key, {"intervalId": resolved_interval_id}
                     )
 
-                raw_status = (
-                    item.get("recordStatus")
-                    if item.get("recordStatus") is not None
-                    else item.get("record_status")
-                )
+                raw_status = item.get("recordStatus")
                 norm_status = normalize_record_status(
                     raw_status if raw_status is not None else "Complete"
                 )
@@ -1604,9 +1575,7 @@ class SimulationState:
                     "visitId": resolved_visit_id,
                     "intervalId": resolved_interval_id,
                     "siteId": site_id,
-                    "recordType": str(
-                        item.get("recordType") or item.get("record_type") or "Standard"
-                    ),
+                    "recordType": str(item.get("recordType") or "Standard"),
                     "recordStatus": record_status_str,
                     "recordData": rec_data,
                     "deleted": record_status_str == "DELETED",
@@ -1630,11 +1599,7 @@ class SimulationState:
                     data_changed=True,
                     user=user_str,
                     role=role_str,
-                    reason=str(
-                        item.get("reasonForChange")
-                        or item.get("reason_for_change")
-                        or "Record created"
-                    ),
+                    reason=str(item.get("reasonForChange") or "Record created"),
                     record_oid=record_oid,
                     subject_oid=subject_oid,
                     date_created=created_ts,
