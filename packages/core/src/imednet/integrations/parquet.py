@@ -437,9 +437,17 @@ def export_to_hive_parquet(
                     ctx.sdtm_domain or config.sdtm_domain or ctx.form_key,
                     fallback="AE",
                 )
-                dom_wm = domain_counters.setdefault(target_domain, {})
-                for subj_key, wm_val in dom_wm.items():
-                    ctx.seq_counters[subj_key] = max(ctx.seq_counters.get(subj_key, 0), wm_val)
+                session_id = id(domain_counters)
+                if ctx._synced_sdtm_session_id != session_id:
+                    dom_wm = domain_counters.setdefault(target_domain, {})
+                    if target_domain != "DM":
+                        for subj_key, wm_val in dom_wm.items():
+                            ctx.seq_counters[subj_key] = max(
+                                ctx.seq_counters.get(subj_key, 0),
+                                wm_val,
+                            )
+                        domain_counters[target_domain] = ctx.seq_counters
+                    ctx._synced_sdtm_session_id = session_id
                 lineage_out: dict[str, dict[str, Any]] = {}
                 df = transform_records_to_sdtm(
                     batch_records,
@@ -455,8 +463,6 @@ def export_to_hive_parquet(
                     seq_overrides=seq_overrides,
                     lineage_out=lineage_out,
                 )
-                for subj_key, wm_val in ctx.seq_counters.items():
-                    dom_wm[subj_key] = max(dom_wm.get(subj_key, 0), wm_val)
                 if df.empty:
                     return 0
                 has_rec_id_col = _find_df_record_id_col(df) is not None

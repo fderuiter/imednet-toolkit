@@ -872,6 +872,8 @@ class ExportSink(ABC):
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
         self._sdtm_lineage: dict[str, dict[str, Any]] = {}
         self._sdtm_seq_watermarks: dict[str, int] = {}
+        self._sdtm_lineage_session: dict[tuple[str, str, int], SdtmLineageSession] = {}
+        self._active_tx: dict[str, Any] | None = None
 
     reconciles_deleted_on_full_sync: bool = False
 
@@ -1049,6 +1051,8 @@ class ExportSink(ABC):
         try:
             return executor.execute(execute_batch)
         except Exception as exec_err:
+            if getattr(self, "_active_tx", None) is None:
+                _reset_standalone_sink_sdtm_cache(self)
             root_exc = last_raw_exc if last_raw_exc is not None else exec_err
             sanitized_cause = _sanitize_batch_cause(root_exc)
             raise ExportBatchError(
@@ -1120,6 +1124,8 @@ class AsyncExportSink(ABC):
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
         self._sdtm_lineage: dict[str, dict[str, Any]] = {}
         self._sdtm_seq_watermarks: dict[str, int] = {}
+        self._sdtm_lineage_session: dict[tuple[str, str, int], SdtmLineageSession] = {}
+        self._active_tx: dict[str, Any] | None = None
 
     def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
         """Bind mutable checkpoint metadata for the active streaming run."""
@@ -1227,6 +1233,8 @@ class AsyncExportSink(ABC):
         try:
             return await executor.execute_async(execute_batch)
         except Exception as exec_err:
+            if getattr(self, "_active_tx", None) is None:
+                _reset_standalone_sink_sdtm_cache(self)
             root_exc = last_raw_exc if last_raw_exc is not None else exec_err
             sanitized_cause = _sanitize_batch_cause(root_exc)
             raise ExportBatchError(
@@ -3115,19 +3123,36 @@ def deduplicate_sdtm_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]
     return [r for r in ordered_rows if r is not None]
 
 
+def _reset_standalone_sink_sdtm_cache(sink_target: Any) -> None:
+    """Evict uncommitted standalone SDTM session and sequence caches after a failed batch."""
+    for dict_attr in ("_sdtm_lineage_session", "_seq_counters", "_record_seqs"):
+        transient_map = getattr(sink_target, dict_attr, None)
+        if isinstance(transient_map, dict):
+            transient_map.clear()
+    if hasattr(sink_target, "_synced_sdtm_session_id"):
+        with contextlib.suppress(Exception):
+            sink_target._synced_sdtm_session_id = None
+
+
+def _is_sink_like(sink_or_config: Any) -> bool:
+    """Return True when *sink_or_config* behaves as a sink or streaming context object."""
+    return (
+        isinstance(sink_or_config, (ExportSink, AsyncExportSink))
+        or hasattr(sink_or_config, "write_batch")
+        or hasattr(sink_or_config, "_active_tx")
+        or hasattr(sink_or_config, "_sdtm_lineage")
+        or hasattr(sink_or_config, "_sdtm_lineage_session")
+    )
+
+
 def _resolve_lineage_target(
     sink_or_config: Any,
     *,
     study_key: str | None = None,
     stream_name: str | None = None,
-) -> tuple[Any, SinkConfig | Any, str, str, dict[str, Any] | None]:
-    """Resolve ``(provider, cfg, resolved_study, resolved_stream, active_tx)`` for SDTM lineage."""
-    is_sink = (
-        isinstance(sink_or_config, (ExportSink, AsyncExportSink))
-        or hasattr(sink_or_config, "write_batch")
-        or hasattr(sink_or_config, "_active_tx")
-        or hasattr(sink_or_config, "_sdtm_lineage")
-    )
+) -> tuple[Any, Any, str, str, dict[str, Any] | None]:
+    """Resolve ``(provider, config, study_key, stream_name, active_tx)`` for SDTM lineage."""
+    is_sink = _is_sink_like(sink_or_config)
     cfg = getattr(sink_or_config, "config", sink_or_config) if is_sink else sink_or_config
     resolved_study = (
         study_key
@@ -3157,9 +3182,36 @@ def _resolve_lineage_target(
             getattr(cfg, "incremental", False) is True
             and getattr(cfg, "ledger_path", None) is not None
         ):
-            with contextlib.suppress(Exception):
-                provider = get_state_provider(ledger_path=cfg.ledger_path)
+            ledger_key = str(cfg.ledger_path)
+            cached_pair = (
+                getattr(sink_or_config, "_cached_ledger_provider", None) if is_sink else None
+            )
+            if (
+                isinstance(cached_pair, tuple)
+                and len(cached_pair) == 2
+                and cached_pair[0] == ledger_key
+            ):
+                provider = cached_pair[1]
+            else:
+                with contextlib.suppress(Exception):
+                    provider = get_state_provider(ledger_path=cfg.ledger_path)
+                if is_sink and provider is not None:
+                    with contextlib.suppress(Exception):
+                        sink_or_config._cached_ledger_provider = (ledger_key, provider)
     return provider, cfg, str(resolved_study), str(resolved_stream), active_tx
+
+
+def _is_callable_provider_method(provider: Any, fn: Any) -> bool:
+    """Return True when *fn* is a real method or an explicitly configured/wrapped mock spy."""
+    if not callable(fn):
+        return False
+    if not isinstance(fn, NonCallableMock):
+        return True
+    return (
+        not isinstance(provider, NonCallableMock)
+        or getattr(fn, "_mock_wraps", None) is not None
+        or getattr(fn, "side_effect", None) is not None
+    )
 
 
 def _read_provider_lineage_payload(
@@ -3175,7 +3227,7 @@ def _read_provider_lineage_payload(
 
     raw_payload: Any = None
     get_fn = getattr(provider, "get_sdtm_lineage", None)
-    if callable(get_fn) and not isinstance(get_fn, NonCallableMock):
+    if callable(get_fn) and _is_callable_provider_method(provider, get_fn):
         with contextlib.suppress(Exception):
             raw_payload = get_fn(study_key, stream_name)
     if not isinstance(raw_payload, Mapping):
@@ -3215,16 +3267,37 @@ class _ScopedSeqOverrides(dict[str, int]):
     def __init__(self) -> None:
         super().__init__()
         self._by_record_id: dict[str, int | None] = {}
+        self._record_scoped: dict[str, dict[str, int]] = {}
 
     def set_scoped(self, domain: str, usubjid: str, record_id: str, seq_val: int) -> None:
         from imednet.models.sdtm import format_scoped_seq_override_key
 
         scoped_key = format_scoped_seq_override_key(domain, usubjid, record_id)
         super().__setitem__(scoped_key, seq_val)
-        if record_id not in self._by_record_id:
+        bucket = self._record_scoped.setdefault(record_id, {})
+        bucket[scoped_key] = seq_val
+        if len(bucket) == 1:
             self._by_record_id[record_id] = seq_val
-        elif self._by_record_id[record_id] != seq_val:
-            self._by_record_id[record_id] = None
+        else:
+            vals = set(bucket.values())
+            self._by_record_id[record_id] = seq_val if len(vals) == 1 else None
+
+    def remove_scoped(self, domain: str, usubjid: str, record_id: str) -> None:
+        from imednet.models.sdtm import format_scoped_seq_override_key
+
+        scoped_key = format_scoped_seq_override_key(domain, usubjid, record_id)
+        super().pop(scoped_key, None)
+        bucket = self._record_scoped.get(record_id)
+        if bucket is not None:
+            bucket.pop(scoped_key, None)
+            if not bucket:
+                del self._record_scoped[record_id]
+                self._by_record_id.pop(record_id, None)
+            elif len(bucket) == 1:
+                self._by_record_id[record_id] = next(iter(bucket.values()))
+            else:
+                vals = set(bucket.values())
+                self._by_record_id[record_id] = next(iter(vals)) if len(vals) == 1 else None
 
     def _resolve_lookup_key(self, key: Any) -> str | None:
         if isinstance(key, tuple) and len(key) == 3:
@@ -3260,68 +3333,285 @@ class _ScopedSeqOverrides(dict[str, int]):
             return default
 
 
+@dataclass
+class SdtmLineageSession:
+    """Stream-scoped in-memory cache of SDTM record lineage, watermarks, and sequence maps."""
+
+    study_key: str
+    stream_name: str
+    full_lineage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    watermarks: dict[str, int] = field(default_factory=dict)
+    domain_seq_counters: dict[str, dict[str, int]] = field(default_factory=dict)
+    seq_overrides: dict[str, int] = field(default_factory=_ScopedSeqOverrides)
+
+    @classmethod
+    def from_payload(
+        cls,
+        study_key: str,
+        stream_name: str,
+        *,
+        lineage: Mapping[str, Any] | None = None,
+        watermarks: Mapping[str, Any] | None = None,
+    ) -> SdtmLineageSession:
+        """Construct a hydrated :class:`SdtmLineageSession` from lineage and watermark mappings."""
+        clean_lineage: dict[str, dict[str, Any]] = {}
+        if isinstance(lineage, Mapping):
+            for rk, rv in lineage.items():
+                if isinstance(rv, Mapping):
+                    clean_lineage[str(rk)] = dict(rv)
+
+        clean_watermarks: dict[str, int] = {}
+        if isinstance(watermarks, Mapping):
+            for wk, wv in watermarks.items():
+                if isinstance(wv, int) and not isinstance(wv, bool):
+                    wk_str = str(wk)
+                    clean_watermarks[wk_str] = max(clean_watermarks.get(wk_str, 0), wv)
+
+        domain_seq_counters: dict[str, dict[str, int]] = {}
+        seq_overrides = _ScopedSeqOverrides()
+
+        for wk, wv in clean_watermarks.items():
+            dom_part, sep, subj_part = wk.partition(":")
+            if sep and dom_part:
+                dom_map = domain_seq_counters.setdefault(dom_part, {})
+                dom_map[subj_part] = max(dom_map.get(subj_part, 0), wv)
+
+        for rec_id_str, entry in clean_lineage.items():
+            dom = str(entry.get("domain") or "").strip().upper()
+            usubjid = str(entry.get("usubjid") or "")
+            seq_val = entry.get("seq_val")
+            if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
+                seq_overrides.set_scoped(dom, usubjid, rec_id_str, seq_val)
+                wm_key = f"{dom}:{usubjid}"
+                clean_watermarks[wm_key] = max(clean_watermarks.get(wm_key, 0), seq_val)
+                dom_map = domain_seq_counters.setdefault(dom, {})
+                dom_map[usubjid] = max(dom_map.get(usubjid, 0), seq_val)
+
+        return cls(
+            study_key=study_key,
+            stream_name=stream_name,
+            full_lineage=clean_lineage,
+            watermarks=clean_watermarks,
+            domain_seq_counters=domain_seq_counters,
+            seq_overrides=seq_overrides,
+        )
+
+    def apply_updates(
+        self,
+        lineage_updates: Mapping[str, Any],
+        watermark_updates: Mapping[str, int] | None = None,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+        """Incrementally merge *lineage_updates* in ``O(len(lineage_updates))``."""
+        clean_updates: dict[str, dict[str, Any]] = {}
+        wm_updates: dict[str, int] = {}
+        if watermark_updates:
+            for wk, wv in watermark_updates.items():
+                if isinstance(wv, int) and not isinstance(wv, bool):
+                    wk_str = str(wk)
+                    wm_updates[wk_str] = max(wm_updates.get(wk_str, 0), wv)
+
+        overrides = self.seq_overrides
+        scoped_overrides = overrides if isinstance(overrides, _ScopedSeqOverrides) else None
+
+        for rec_id_key, entry in lineage_updates.items():
+            if not isinstance(entry, Mapping):
+                continue
+            rec_id_str = str(rec_id_key)
+            copied_entry = dict(entry)
+            prior_entry = self.full_lineage.get(rec_id_str)
+            if isinstance(prior_entry, Mapping):
+                old_dom = str(prior_entry.get("domain") or "").strip().upper()
+                old_usubjid = str(prior_entry.get("usubjid") or "")
+                new_dom_cand = str(copied_entry.get("domain") or "").strip().upper()
+                new_usubjid_cand = str(copied_entry.get("usubjid") or "")
+                if (
+                    old_dom
+                    and old_dom != "DM"
+                    and (old_dom != new_dom_cand or old_usubjid != new_usubjid_cand)
+                ):
+                    if scoped_overrides is not None:
+                        scoped_overrides.remove_scoped(old_dom, old_usubjid, rec_id_str)
+                    else:
+                        from imednet.models.sdtm import format_scoped_seq_override_key
+
+                        overrides.pop(
+                            format_scoped_seq_override_key(old_dom, old_usubjid, rec_id_str),
+                            None,
+                        )
+            self.full_lineage[rec_id_str] = copied_entry
+            clean_updates[rec_id_str] = copied_entry
+
+            dom = str(copied_entry.get("domain") or "").strip().upper()
+            usubjid = str(copied_entry.get("usubjid") or "")
+            seq_val = copied_entry.get("seq_val")
+            if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
+                wm_key = f"{dom}:{usubjid}"
+                wm_updates[wm_key] = max(wm_updates.get(wm_key, 0), seq_val)
+                if scoped_overrides is not None:
+                    scoped_overrides.set_scoped(dom, usubjid, rec_id_str, seq_val)
+                else:
+                    from imednet.models.sdtm import format_scoped_seq_override_key
+
+                    overrides[format_scoped_seq_override_key(dom, usubjid, rec_id_str)] = seq_val
+                dom_map = self.domain_seq_counters.setdefault(dom, {})
+                dom_map[usubjid] = max(dom_map.get(usubjid, 0), seq_val)
+
+        for wk, wv in wm_updates.items():
+            self.watermarks[wk] = max(self.watermarks.get(wk, 0), wv)
+            dom_part, sep, subj_part = wk.partition(":")
+            if sep and dom_part:
+                dom_map = self.domain_seq_counters.setdefault(dom_part, {})
+                dom_map[subj_part] = max(dom_map.get(subj_part, 0), wv)
+
+        return clean_updates, wm_updates
+
+
+def _merge_lineage_mapping(
+    target_lineage: dict[str, dict[str, Any]],
+    target_watermarks: dict[str, int],
+    raw_lineage: Any,
+    raw_watermarks: Any,
+) -> None:
+    """Merge raw lineage and watermark mappings into *target_lineage* and *target_watermarks*."""
+    if isinstance(raw_lineage, Mapping):
+        for rk, rv in raw_lineage.items():
+            if isinstance(rv, Mapping):
+                target_lineage[str(rk)] = dict(rv)
+    if isinstance(raw_watermarks, Mapping):
+        for wk, wv in raw_watermarks.items():
+            if isinstance(wv, int) and not isinstance(wv, bool):
+                wk_str = str(wk)
+                target_watermarks[wk_str] = max(target_watermarks.get(wk_str, 0), wv)
+
+
+def _get_or_create_sdtm_lineage_session(
+    sink_or_config: Any,
+    *,
+    study_key: str | None = None,
+    stream_name: str | None = None,
+) -> tuple[SdtmLineageSession, Any, str, str, dict[str, Any] | None, bool]:
+    """Return ``(session, provider, study_key, stream_name, active_tx, is_sink)``."""
+    is_sink = _is_sink_like(sink_or_config)
+    provider, _cfg, resolved_study, resolved_stream, active_tx = _resolve_lineage_target(
+        sink_or_config,
+        study_key=study_key,
+        stream_name=stream_name,
+    )
+
+    if active_tx is not None:
+        tx_key = (resolved_study, resolved_stream)
+        raw_tx_sessions = active_tx.get("_sdtm_lineage_session")
+        if isinstance(raw_tx_sessions, SdtmLineageSession):
+            if (raw_tx_sessions.study_key, raw_tx_sessions.stream_name) == tx_key:
+                active_tx["_sdtm_lineage_session"] = {tx_key: raw_tx_sessions}
+                return (
+                    raw_tx_sessions,
+                    provider,
+                    resolved_study,
+                    resolved_stream,
+                    active_tx,
+                    is_sink,
+                )
+            tx_sessions: dict[tuple[str, str], SdtmLineageSession] = {
+                (raw_tx_sessions.study_key, raw_tx_sessions.stream_name): raw_tx_sessions
+            }
+            active_tx["_sdtm_lineage_session"] = tx_sessions
+        elif isinstance(raw_tx_sessions, dict):
+            tx_sessions = raw_tx_sessions
+        else:
+            tx_sessions = {}
+            active_tx["_sdtm_lineage_session"] = tx_sessions
+
+        cached_tx_session = tx_sessions.get(tx_key)
+        if isinstance(cached_tx_session, SdtmLineageSession):
+            return cached_tx_session, provider, resolved_study, resolved_stream, active_tx, is_sink
+
+        if active_tx.get("_lineage_hydrated") is True:
+            init_lineage: dict[str, dict[str, Any]] = {}
+            init_watermarks: dict[str, int] = {}
+        else:
+            init_lineage, init_watermarks = _read_provider_lineage_payload(
+                provider,
+                resolved_study,
+                resolved_stream,
+            )
+
+        tx_meta = active_tx.get("metadata")
+        if isinstance(tx_meta, Mapping):
+            _merge_lineage_mapping(
+                init_lineage,
+                init_watermarks,
+                tx_meta.get("sdtm_lineage"),
+                tx_meta.get("sdtm_seq_watermarks"),
+            )
+        if is_sink:
+            _merge_lineage_mapping(
+                init_lineage,
+                init_watermarks,
+                getattr(sink_or_config, "_sdtm_lineage", None),
+                getattr(sink_or_config, "_sdtm_seq_watermarks", None),
+            )
+
+        session = SdtmLineageSession.from_payload(
+            resolved_study,
+            resolved_stream,
+            lineage=init_lineage,
+            watermarks=init_watermarks,
+        )
+        tx_sessions[tx_key] = session
+        return session, provider, resolved_study, resolved_stream, active_tx, is_sink
+
+    prov_id = id(provider) if provider is not None else 0
+    sink_key = (resolved_study, resolved_stream, prov_id)
+    sink_sessions: dict[tuple[str, str, int], SdtmLineageSession] | None = None
+    if is_sink:
+        raw_sink_sessions = getattr(sink_or_config, "_sdtm_lineage_session", None)
+        if isinstance(raw_sink_sessions, dict):
+            sink_sessions = raw_sink_sessions
+        else:
+            sink_sessions = {}
+            with contextlib.suppress(Exception):
+                sink_or_config._sdtm_lineage_session = sink_sessions
+        cached_sink_session = sink_sessions.get(sink_key)
+        if isinstance(cached_sink_session, SdtmLineageSession):
+            return cached_sink_session, provider, resolved_study, resolved_stream, None, True
+
+    init_lineage, init_watermarks = _read_provider_lineage_payload(
+        provider,
+        resolved_study,
+        resolved_stream,
+    )
+    if is_sink:
+        _merge_lineage_mapping(
+            init_lineage,
+            init_watermarks,
+            getattr(sink_or_config, "_sdtm_lineage", None),
+            getattr(sink_or_config, "_sdtm_seq_watermarks", None),
+        )
+    session = SdtmLineageSession.from_payload(
+        resolved_study,
+        resolved_stream,
+        lineage=init_lineage,
+        watermarks=init_watermarks,
+    )
+    if sink_sessions is not None:
+        sink_sessions[sink_key] = session
+    return session, provider, resolved_study, resolved_stream, None, is_sink
+
+
 def rehydrate_sdtm_lineage(
     sink_or_config: Any,
     *,
     study_key: str | None = None,
     stream_name: str | None = None,
 ) -> tuple[dict[str, dict[str, int]], dict[str, int], dict[str, dict[str, Any]]]:
-    """Rehydrate ``(domain_seq_counters, seq_overrides, full_lineage)`` from ledger & sink memory."""
-    provider, _cfg, resolved_study, resolved_stream, active_tx = _resolve_lineage_target(
+    """Rehydrate ``(domain_seq_counters, seq_overrides, full_lineage)`` from session or ledger."""
+    session, *_ = _get_or_create_sdtm_lineage_session(
         sink_or_config,
         study_key=study_key,
         stream_name=stream_name,
     )
-    full_lineage, watermarks = _read_provider_lineage_payload(
-        provider,
-        resolved_study,
-        resolved_stream,
-    )
-
-    if active_tx is not None:
-        tx_meta = active_tx.get("metadata")
-        if isinstance(tx_meta, Mapping):
-            tx_lin = tx_meta.get("sdtm_lineage")
-            if isinstance(tx_lin, Mapping):
-                for rk, rv in tx_lin.items():
-                    if isinstance(rv, Mapping):
-                        full_lineage[str(rk)] = dict(rv)
-            tx_wm = tx_meta.get("sdtm_seq_watermarks")
-            if isinstance(tx_wm, Mapping):
-                for wk, wv in tx_wm.items():
-                    if isinstance(wv, int) and not isinstance(wv, bool):
-                        watermarks[str(wk)] = max(watermarks.get(str(wk), 0), wv)
-
-    mem_lin = getattr(sink_or_config, "_sdtm_lineage", None)
-    if isinstance(mem_lin, Mapping):
-        for rk, rv in mem_lin.items():
-            if isinstance(rv, Mapping):
-                full_lineage[str(rk)] = dict(rv)
-    mem_wm = getattr(sink_or_config, "_sdtm_seq_watermarks", None)
-    if isinstance(mem_wm, Mapping):
-        for wk, wv in mem_wm.items():
-            if isinstance(wv, int) and not isinstance(wv, bool):
-                watermarks[str(wk)] = max(watermarks.get(str(wk), 0), wv)
-
-    domain_seq_counters: dict[str, dict[str, int]] = {}
-    seq_overrides = _ScopedSeqOverrides()
-
-    for wk, wv in watermarks.items():
-        dom_part, sep, subj_part = wk.partition(":")
-        if sep and dom_part:
-            dom_map = domain_seq_counters.setdefault(dom_part, {})
-            dom_map[subj_part] = max(dom_map.get(subj_part, 0), wv)
-
-    for rec_id_str, entry in full_lineage.items():
-        dom = str(entry.get("domain") or "").strip().upper()
-        usubjid = str(entry.get("usubjid") or "")
-        seq_val = entry.get("seq_val")
-        if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
-            seq_overrides.set_scoped(dom, usubjid, rec_id_str, seq_val)
-            dom_map = domain_seq_counters.setdefault(dom, {})
-            dom_map[usubjid] = max(dom_map.get(usubjid, 0), seq_val)
-
-    return domain_seq_counters, seq_overrides, full_lineage
+    return session.domain_seq_counters, session.seq_overrides, session.full_lineage
 
 
 def commit_sdtm_lineage(
@@ -3335,32 +3625,26 @@ def commit_sdtm_lineage(
     if not lineage_updates:
         return
 
-    provider, _cfg, resolved_study, resolved_stream, active_tx = _resolve_lineage_target(
-        sink_or_config,
-        study_key=study_key,
-        stream_name=stream_name,
+    session, provider, resolved_study, resolved_stream, active_tx, is_sink = (
+        _get_or_create_sdtm_lineage_session(
+            sink_or_config,
+            study_key=study_key,
+            stream_name=stream_name,
+        )
     )
+    clean_updates, wm_updates = session.apply_updates(lineage_updates)
+    if not clean_updates:
+        return
 
-    wm_updates: dict[str, int] = {}
-    clean_updates: dict[str, dict[str, Any]] = {}
-    for rec_id_key, entry in lineage_updates.items():
-        if not isinstance(entry, Mapping):
-            continue
-        copied_entry = dict(entry)
-        clean_updates[str(rec_id_key)] = copied_entry
-        dom = str(copied_entry.get("domain") or "").strip().upper()
-        usubjid = str(copied_entry.get("usubjid") or "")
-        seq_val = copied_entry.get("seq_val")
-        if dom and dom != "DM" and isinstance(seq_val, int) and not isinstance(seq_val, bool):
-            wm_key = f"{dom}:{usubjid}"
-            wm_updates[wm_key] = max(wm_updates.get(wm_key, 0), seq_val)
+    if active_tx is not None:
+        tx_meta = active_tx.setdefault("metadata", {})
+        if not isinstance(tx_meta, dict):
+            tx_meta = {}
+            active_tx["metadata"] = tx_meta
+        tx_meta["sdtm_lineage"] = session.full_lineage
+        tx_meta["sdtm_seq_watermarks"] = session.watermarks
+        return
 
-    is_sink = (
-        isinstance(sink_or_config, (ExportSink, AsyncExportSink))
-        or hasattr(sink_or_config, "write_batch")
-        or hasattr(sink_or_config, "_active_tx")
-        or hasattr(sink_or_config, "_sdtm_lineage")
-    )
     if is_sink:
         mem_lin = getattr(sink_or_config, "_sdtm_lineage", None)
         if not isinstance(mem_lin, dict):
@@ -3377,35 +3661,9 @@ def commit_sdtm_lineage(
         for wk, wv in wm_updates.items():
             mem_wm[wk] = max(mem_wm.get(wk, 0), wv)
 
-    if active_tx is not None:
-        existing_lin, existing_wm = _read_provider_lineage_payload(
-            provider,
-            resolved_study,
-            resolved_stream,
-        )
-        tx_meta = active_tx.setdefault("metadata", {})
-        if not isinstance(tx_meta, dict):
-            tx_meta = {}
-            active_tx["metadata"] = tx_meta
-        merged_lin = dict(existing_lin)
-        if isinstance(tx_meta.get("sdtm_lineage"), Mapping):
-            merged_lin.update(tx_meta["sdtm_lineage"])
-        merged_lin.update(clean_updates)
-        tx_meta["sdtm_lineage"] = merged_lin
-
-        merged_wm = dict(existing_wm)
-        if isinstance(tx_meta.get("sdtm_seq_watermarks"), Mapping):
-            for wk, wv in tx_meta["sdtm_seq_watermarks"].items():
-                if isinstance(wv, int) and not isinstance(wv, bool):
-                    merged_wm[str(wk)] = max(merged_wm.get(str(wk), 0), wv)
-        for wk, wv in wm_updates.items():
-            merged_wm[wk] = max(merged_wm.get(wk, 0), wv)
-        tx_meta["sdtm_seq_watermarks"] = merged_wm
-        return
-
     if provider is not None:
         record_fn = getattr(provider, "record_sdtm_lineage", None)
-        if callable(record_fn) and not isinstance(record_fn, NonCallableMock):
+        if callable(record_fn) and _is_callable_provider_method(provider, record_fn):
             with contextlib.suppress(Exception):
                 record_fn(
                     resolved_study,
@@ -3425,16 +3683,17 @@ def resolve_voided_sdtm_keys(
     form_domain_map: Mapping[Any, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve voided records to composite SDTM keys ``(study_id, domain, usubjid, seq_col, seq_val)``."""
-    _dom_counters, _overrides, full_lineage = rehydrate_sdtm_lineage(
-        sink_or_config,
-        study_key=study_key,
-        stream_name=stream_name,
+    if not records:
+        return []
+
+    session, _provider, resolved_study, _resolved_stream, _tx, _is_sink = (
+        _get_or_create_sdtm_lineage_session(
+            sink_or_config,
+            study_key=study_key,
+            stream_name=stream_name,
+        )
     )
-    _provider, _cfg, resolved_study, _resolved_stream, _tx = _resolve_lineage_target(
-        sink_or_config,
-        study_key=study_key,
-        stream_name=stream_name,
-    )
+    full_lineage = session.full_lineage
     active_form_map = form_domain_map or getattr(sink_or_config, "_active_form_domain_map", None)
 
     resolved_keys: list[dict[str, Any]] = []
@@ -3518,6 +3777,9 @@ class _SyncExportSinkAdapter(AsyncExportSink):
     def __init__(self, sync_sink: ExportSink) -> None:
         object.__setattr__(self, "_sync_sink", sync_sink)
         super().__init__(cast(SinkConfig, getattr(sync_sink, "config", None)))
+        existing_sessions = getattr(sync_sink, "_sdtm_lineage_session", None)
+        if isinstance(existing_sessions, dict):
+            object.__setattr__(self, "_sdtm_lineage_session", existing_sessions)
 
     @property
     def reconciles_deleted_on_full_sync(self) -> bool:  # type: ignore[override]
@@ -3529,7 +3791,10 @@ class _SyncExportSinkAdapter(AsyncExportSink):
             bind_fn(metadata)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_active_"):
+        if name.startswith("_active_") or name in (
+            "_sdtm_lineage_session",
+            "_cached_ledger_provider",
+        ):
             with contextlib.suppress(Exception):
                 setattr(self._sync_sink, name, value)
         object.__setattr__(self, name, value)
@@ -3567,6 +3832,35 @@ class _SyncExportSinkAdapter(AsyncExportSink):
                 self._sync_sink.flush()
         finally:
             self._sync_sink.close()
+
+
+def _clear_sink_active_context(sink_target: Any, *, failed: bool = False) -> None:
+    """Clear active streaming transaction attributes and, on failure, transient sequence maps."""
+    if sink_target is None:
+        return
+    targets: list[Any] = [sink_target]
+    sync_inner = getattr(sink_target, "_sync_sink", None)
+    if sync_inner is not None and sync_inner not in targets:
+        targets.append(sync_inner)
+    for base_t in list(targets):
+        tabular_inner = getattr(base_t, "_inner", None)
+        if tabular_inner is not None and tabular_inner not in targets:
+            targets.append(tabular_inner)
+    for target in targets:
+        for attr_name in (
+            "_active_tx",
+            "_active_state_provider",
+            "_active_stream_name",
+            "_active_study_key",
+            "_active_form_domain_map",
+        ):
+            with contextlib.suppress(Exception):
+                setattr(target, attr_name, None)
+        if failed:
+            for dict_attr in ("_seq_counters", "_record_seqs"):
+                transient_map = getattr(target, dict_attr, None)
+                if isinstance(transient_map, dict):
+                    transient_map.clear()
 
 
 async def _ensure_async_stream(source: Any) -> AsyncIterator[Any]:
@@ -3646,99 +3940,130 @@ async def async_run_streaming_export(
         else None
     )
 
-    async with contextlib.AsyncExitStack() as stack:
-        stack.enter_context(sdk_governance_context(gov_sdk))
-        tx: dict[str, Any] | None = None
-        if provider is not None:
-            tx = stack.enter_context(
-                provider.transaction(
-                    study_key,
-                    resolved_stream,
-                    fallback_timestamp=opts["modified_since"],
+    bound_sink_obj: AsyncExportSink | None = None
+    stream_failed = False
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            stack.enter_context(sdk_governance_context(gov_sdk))
+            tx: dict[str, Any] | None = None
+            if provider is not None:
+                tx = stack.enter_context(
+                    provider.transaction(
+                        study_key,
+                        resolved_stream,
+                        fallback_timestamp=opts["modified_since"],
+                    )
+                )
+                watermark = (
+                    normalize_watermark_datetime(tx.get("last_timestamp")) or opts["modified_since"]
+                )
+            else:
+                watermark = opts["modified_since"]
+
+            if isinstance(sink, AsyncExportSink) or hasattr(sink, "write_batch"):
+                sink_obj = cast(AsyncExportSink, sink)
+            else:
+                sink_obj = sink()
+            bound_sink_obj = sink_obj
+            await stack.enter_async_context(sink_obj)
+
+            with contextlib.suppress(Exception):
+                sink_obj._active_state_provider = provider  # type: ignore[attr-defined]
+                sink_obj._active_stream_name = resolved_stream  # type: ignore[attr-defined]
+                sink_obj._active_study_key = study_key  # type: ignore[attr-defined]
+                sink_obj._active_tx = tx  # type: ignore[attr-defined]
+            if tx is not None:
+                tx_meta = tx.setdefault("metadata", {})
+                bind_fn = getattr(sink_obj, "bind_stream_metadata", None)
+                if callable(bind_fn) and isinstance(tx_meta, dict):
+                    bind_fn(tx_meta)
+
+            reconcile_voided = (
+                (not opts["include_deleted"])
+                and opts["idempotent"]
+                and (
+                    use_checkpoint
+                    or watermark is not None
+                    or bool(getattr(sink_obj, "reconciles_deleted_on_full_sync", False))
                 )
             )
-            watermark = (
-                normalize_watermark_datetime(tx.get("last_timestamp")) or opts["modified_since"]
+            exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
+
+            check_standards = (
+                opts["standards_profile"] is not None or opts["min_standards_score"] is not None
             )
-        else:
-            watermark = opts["modified_since"]
-
-        if isinstance(sink, AsyncExportSink) or hasattr(sink, "write_batch"):
-            sink_obj = cast(AsyncExportSink, sink)
-        else:
-            sink_obj = sink()
-        await stack.enter_async_context(sink_obj)
-
-        with contextlib.suppress(Exception):
-            sink_obj._active_state_provider = provider  # type: ignore[attr-defined]
-            sink_obj._active_stream_name = resolved_stream  # type: ignore[attr-defined]
-            sink_obj._active_study_key = study_key  # type: ignore[attr-defined]
-            sink_obj._active_tx = tx  # type: ignore[attr-defined]
-        if tx is not None:
-            tx_meta = tx.setdefault("metadata", {})
-            bind_fn = getattr(sink_obj, "bind_stream_metadata", None)
-            if callable(bind_fn) and isinstance(tx_meta, dict):
-                bind_fn(tx_meta)
-
-        reconcile_voided = (
-            (not opts["include_deleted"])
-            and opts["idempotent"]
-            and (
-                use_checkpoint
-                or watermark is not None
-                or bool(getattr(sink_obj, "reconciles_deleted_on_full_sync", False))
+            need_form_map = bool(
+                opts["as_sdtm"] or opts["sdtm_domain"] is not None or check_standards
             )
-        )
-        exclude_deleted_upstream = (not opts["include_deleted"]) and (not reconcile_voided)
-
-        check_standards = (
-            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
-        )
-        need_form_map = bool(opts["as_sdtm"] or opts["sdtm_domain"] is not None or check_standards)
-        study_forms = await _async_try_fetch_study_forms(sdk, study_key) if need_form_map else []
-        active_form_map: dict[Any, str] = (
-            build_form_sdtm_domain_map(
-                study_forms,
-                study_config=study_cfg_override,
-                study_key=study_key,
+            study_forms = (
+                await _async_try_fetch_study_forms(sdk, study_key) if need_form_map else []
             )
-            if need_form_map
-            else {}
-        )
-        if active_form_map:
-            with contextlib.suppress(Exception):
-                sink_obj._active_form_domain_map = active_form_map  # type: ignore[attr-defined]
-
-        sdtm_sort = _SDTM_RECORDS_SORT if opts["as_sdtm"] else None
-        source_is_ordered = False
-
-        if records_source is not None:
-            raw_records: AsyncIterable[Any] = _ensure_async_stream(
-                records_source(watermark, exclude_deleted_upstream)
+            active_form_map: dict[Any, str] = (
+                build_form_sdtm_domain_map(
+                    study_forms,
+                    study_config=study_cfg_override,
+                    study_key=study_key,
+                )
+                if need_form_map
+                else {}
             )
-            source_is_ordered = bool(getattr(records_source, "_sdtm_source_is_ordered", False))
-        else:
-            source_is_ordered = bool(opts["as_sdtm"] and _is_bound_real_async_records_endpoint(sdk))
-            if opts["sdtm_domain"] is not None:
-                if study_forms:
-                    matched_forms = filter_forms_by_sdtm_domain(
-                        study_forms,
-                        opts["sdtm_domain"],
-                        study_config=study_cfg_override,
-                        study_key=study_key,
-                    )
-                    if not matched_forms:
-                        raw_records = _ensure_async_stream(())
-                    else:
-                        upstream_filter = merge_form_ids_into_record_filter(
-                            opts["record_filter"],
-                            matched_forms,
+            if active_form_map:
+                with contextlib.suppress(Exception):
+                    sink_obj._active_form_domain_map = active_form_map  # type: ignore[attr-defined]
+
+            sdtm_sort = _SDTM_RECORDS_SORT if opts["as_sdtm"] else None
+            source_is_ordered = False
+
+            if records_source is not None:
+                raw_records: AsyncIterable[Any] = _ensure_async_stream(
+                    records_source(watermark, exclude_deleted_upstream)
+                )
+                source_is_ordered = bool(getattr(records_source, "_sdtm_source_is_ordered", False))
+            else:
+                source_is_ordered = bool(
+                    opts["as_sdtm"] and _is_bound_real_async_records_endpoint(sdk)
+                )
+                if opts["sdtm_domain"] is not None:
+                    if study_forms:
+                        matched_forms = filter_forms_by_sdtm_domain(
+                            study_forms,
+                            opts["sdtm_domain"],
+                            study_config=study_cfg_override,
+                            study_key=study_key,
                         )
+                        if not matched_forms:
+                            raw_records = _ensure_async_stream(())
+                        else:
+                            upstream_filter = merge_form_ids_into_record_filter(
+                                opts["record_filter"],
+                                matched_forms,
+                            )
+                            base_aiter = async_iter_filtered_sdk_records(
+                                sdk,
+                                study_key,
+                                watermark=watermark,
+                                record_filter=upstream_filter,
+                                record_data_filter=opts["record_data_filter"],
+                                exclude_deleted_upstream=exclude_deleted_upstream,
+                                sort=sdtm_sort,
+                            )
+                            raw_records = (
+                                item
+                                async for item in base_aiter
+                                if record_matches_sdtm_domain(
+                                    item,
+                                    opts["sdtm_domain"],
+                                    form_domain_map=active_form_map,
+                                    study_config=study_cfg_override,
+                                    study_key=study_key,
+                                )
+                            )
+                    else:
                         base_aiter = async_iter_filtered_sdk_records(
                             sdk,
                             study_key,
                             watermark=watermark,
-                            record_filter=upstream_filter,
+                            record_filter=opts["record_filter"],
                             record_data_filter=opts["record_data_filter"],
                             exclude_deleted_upstream=exclude_deleted_upstream,
                             sort=sdtm_sort,
@@ -3755,7 +4080,7 @@ async def async_run_streaming_export(
                             )
                         )
                 else:
-                    base_aiter = async_iter_filtered_sdk_records(
+                    raw_records = async_iter_filtered_sdk_records(
                         sdk,
                         study_key,
                         watermark=watermark,
@@ -3764,161 +4089,149 @@ async def async_run_streaming_export(
                         exclude_deleted_upstream=exclude_deleted_upstream,
                         sort=sdtm_sort,
                     )
-                    raw_records = (
-                        item
-                        async for item in base_aiter
-                        if record_matches_sdtm_domain(
-                            item,
-                            opts["sdtm_domain"],
-                            form_domain_map=active_form_map,
-                            study_config=study_cfg_override,
-                            study_key=study_key,
-                        )
-                    )
-            else:
-                raw_records = async_iter_filtered_sdk_records(
+
+            pending_voided: list[Any] = []
+            voided_batch_idx = 0
+            pending_gate: dict[int, list[tuple[Any, datetime | None]]] = {}
+            exported_timestamps: list[datetime] = []
+
+            async def _observe_and_route() -> AsyncIterator[Any]:
+                nonlocal total_reconciled, voided_batch_idx
+                async for rec in raw_records:
+                    rec_ts = extract_record_timestamp(rec)
+
+                    if not opts["include_deleted"] and is_record_deleted(rec):
+                        if reconcile_voided:
+                            if rec_ts is not None:
+                                exported_timestamps.append(rec_ts)
+                            pending_voided.append(rec)
+                            if len(pending_voided) >= opts["batch_size"]:
+                                total_reconciled += await sink_obj.reconcile_deleted(
+                                    list(pending_voided),
+                                    batch_id=f"{prefix}/voided/{voided_batch_idx}",
+                                )
+                                pending_voided.clear()
+                                voided_batch_idx += 1
+                        continue
+
+                    pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
+                    yield rec
+
+            def _pop_accepted_candidate(rec: Any) -> None:
+                bucket = pending_gate.get(id(rec))
+                if bucket:
+                    bucket.pop(0)
+                    if not bucket:
+                        del pending_gate[id(rec)]
+                    return
+                rec_id = extract_record_id(rec)
+                if rec_id is None:
+                    return
+                for obj_id, candidate_bucket in list(pending_gate.items()):
+                    for idx, (cand_rec, _) in enumerate(candidate_bucket):
+                        if extract_record_id(cand_rec) == rec_id:
+                            candidate_bucket.pop(idx)
+                            if not candidate_bucket:
+                                del pending_gate[obj_id]
+                            return
+
+            async def _track_accepted(records_aiter: AsyncIterable[Any]) -> AsyncIterator[Any]:
+                async for rec in records_aiter:
+                    _pop_accepted_candidate(rec)
+                    rec_ts = extract_record_timestamp(rec)
+                    if rec_ts is not None:
+                        exported_timestamps.append(rec_ts)
+                    yield rec
+
+            if gate_fn in (async_apply_quality_gate, apply_quality_gate):
+                gated_stream: AsyncIterable[Any] = async_apply_quality_gate(
                     sdk,
                     study_key,
-                    watermark=watermark,
-                    record_filter=opts["record_filter"],
-                    record_data_filter=opts["record_data_filter"],
-                    exclude_deleted_upstream=exclude_deleted_upstream,
-                    sort=sdtm_sort,
+                    _observe_and_route(),
+                    config,
+                    forms=study_forms or None,
+                )
+            elif inspect.isasyncgenfunction(gate_fn):
+                gated_stream = gate_fn(gov_sdk, study_key, _observe_and_route(), config)
+            else:
+                observed_list = [item async for item in _observe_and_route()]
+                gated_stream = _ensure_async_stream(
+                    gate_fn(gov_sdk, study_key, observed_list, config)
                 )
 
-        pending_voided: list[Any] = []
-        voided_batch_idx = 0
-        pending_gate: dict[int, list[tuple[Any, datetime | None]]] = {}
-        exported_timestamps: list[datetime] = []
-
-        async def _observe_and_route() -> AsyncIterator[Any]:
-            nonlocal total_reconciled, voided_batch_idx
-            async for rec in raw_records:
-                rec_ts = extract_record_timestamp(rec)
-
-                if not opts["include_deleted"] and is_record_deleted(rec):
-                    if reconcile_voided:
-                        if rec_ts is not None:
-                            exported_timestamps.append(rec_ts)
-                        pending_voided.append(rec)
-                        if len(pending_voided) >= opts["batch_size"]:
-                            total_reconciled += await sink_obj.reconcile_deleted(
-                                list(pending_voided),
-                                batch_id=f"{prefix}/voided/{voided_batch_idx}",
-                            )
-                            pending_voided.clear()
-                            voided_batch_idx += 1
-                    continue
-
-                pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
-                yield rec
-
-        def _pop_accepted_candidate(rec: Any) -> None:
-            bucket = pending_gate.get(id(rec))
-            if bucket:
-                bucket.pop(0)
-                if not bucket:
-                    del pending_gate[id(rec)]
-                return
-            rec_id = extract_record_id(rec)
-            if rec_id is None:
-                return
-            for obj_id, candidate_bucket in list(pending_gate.items()):
-                for idx, (cand_rec, _) in enumerate(candidate_bucket):
-                    if extract_record_id(cand_rec) == rec_id:
-                        candidate_bucket.pop(idx)
-                        if not candidate_bucket:
-                            del pending_gate[obj_id]
-                        return
-
-        async def _track_accepted(records_aiter: AsyncIterable[Any]) -> AsyncIterator[Any]:
-            async for rec in records_aiter:
-                _pop_accepted_candidate(rec)
-                rec_ts = extract_record_timestamp(rec)
-                if rec_ts is not None:
-                    exported_timestamps.append(rec_ts)
-                yield rec
-
-        if gate_fn in (async_apply_quality_gate, apply_quality_gate):
-            gated_stream: AsyncIterable[Any] = async_apply_quality_gate(
-                sdk,
-                study_key,
-                _observe_and_route(),
-                config,
-                forms=study_forms or None,
-            )
-        elif inspect.isasyncgenfunction(gate_fn):
-            gated_stream = gate_fn(gov_sdk, study_key, _observe_and_route(), config)
-        else:
-            observed_list = [item async for item in _observe_and_route()]
-            gated_stream = _ensure_async_stream(gate_fn(gov_sdk, study_key, observed_list, config))
-
-        filtered_records: AsyncIterable[Any] = _track_accepted(gated_stream)
-        if opts["as_sdtm"]:
-            filtered_records = async_iter_subject_ordered_sdtm_records(
-                filtered_records,
-                study_key=study_key,
-                sdtm_domain=opts["sdtm_domain"],
-                form_domain_map=active_form_map or None,
-                study_config=study_cfg_override,
-                mask_phi=getattr(config, "mask_phi", True) is not False,
-                source_is_ordered=source_is_ordered,
-            )
-
-        if batches_fn in (async_iter_batches, iter_batches):
-            batch_stream: AsyncIterable[Sequence[Any]] = async_iter_batches(
-                filtered_records,
-                opts["batch_size"],
-            )
-        elif inspect.isasyncgenfunction(batches_fn):
-            batch_stream = batches_fn(filtered_records, opts["batch_size"])
-        else:
-            materialized_filtered = [item async for item in filtered_records]
-            batch_stream = _ensure_async_stream(
-                batches_fn(materialized_filtered, opts["batch_size"])
-            )
-
-        index = 0
-        async for batch in batch_stream:
-            batch_id = f"{prefix}/{index}"
-            index += 1
-            if check_standards and batch:
-                _enforce_batch_standards_readiness(
-                    batch,
-                    batch_id=batch_id,
+            filtered_records: AsyncIterable[Any] = _track_accepted(gated_stream)
+            if opts["as_sdtm"]:
+                filtered_records = async_iter_subject_ordered_sdtm_records(
+                    filtered_records,
                     study_key=study_key,
-                    config=config,
-                    standards_profile=opts["standards_profile"],
-                    min_standards_score=opts["min_standards_score"],
                     sdtm_domain=opts["sdtm_domain"],
                     form_domain_map=active_form_map or None,
+                    study_config=study_cfg_override,
+                    mask_phi=getattr(config, "mask_phi", True) is not False,
+                    source_is_ordered=source_is_ordered,
                 )
-            total_written += await sink_obj.write_batch(batch, batch_id=batch_id)
 
-        if pending_voided:
-            total_reconciled += await sink_obj.reconcile_deleted(
-                list(pending_voided),
-                batch_id=f"{prefix}/voided/{voided_batch_idx}",
-            )
-            pending_voided.clear()
-
-        rejected_timestamps = [rec_ts for bucket in pending_gate.values() for _, rec_ts in bucket]
-        pending_gate.clear()
-
-        if rejected_timestamps:
-            if any(rec_ts is None for rec_ts in rejected_timestamps):
-                max_ts = None
+            if batches_fn in (async_iter_batches, iter_batches):
+                batch_stream: AsyncIterable[Sequence[Any]] = async_iter_batches(
+                    filtered_records,
+                    opts["batch_size"],
+                )
+            elif inspect.isasyncgenfunction(batches_fn):
+                batch_stream = batches_fn(filtered_records, opts["batch_size"])
             else:
-                min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
-                eligible_ts = [ts for ts in exported_timestamps if ts <= min_rejected_ts]
-                max_ts = max(eligible_ts) if eligible_ts else None
-        elif exported_timestamps:
-            max_ts = max(exported_timestamps)
+                materialized_filtered = [item async for item in filtered_records]
+                batch_stream = _ensure_async_stream(
+                    batches_fn(materialized_filtered, opts["batch_size"])
+                )
 
-        if tx is not None:
-            tx["records_processed"] = total_written + total_reconciled
-            if max_ts is not None:
-                tx["new_timestamp"] = max_ts
+            index = 0
+            async for batch in batch_stream:
+                batch_id = f"{prefix}/{index}"
+                index += 1
+                if check_standards and batch:
+                    _enforce_batch_standards_readiness(
+                        batch,
+                        batch_id=batch_id,
+                        study_key=study_key,
+                        config=config,
+                        standards_profile=opts["standards_profile"],
+                        min_standards_score=opts["min_standards_score"],
+                        sdtm_domain=opts["sdtm_domain"],
+                        form_domain_map=active_form_map or None,
+                    )
+                total_written += await sink_obj.write_batch(batch, batch_id=batch_id)
+
+            if pending_voided:
+                total_reconciled += await sink_obj.reconcile_deleted(
+                    list(pending_voided),
+                    batch_id=f"{prefix}/voided/{voided_batch_idx}",
+                )
+                pending_voided.clear()
+
+            rejected_timestamps = [
+                rec_ts for bucket in pending_gate.values() for _, rec_ts in bucket
+            ]
+            pending_gate.clear()
+
+            if rejected_timestamps:
+                if any(rec_ts is None for rec_ts in rejected_timestamps):
+                    max_ts = None
+                else:
+                    min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
+                    eligible_ts = [ts for ts in exported_timestamps if ts <= min_rejected_ts]
+                    max_ts = max(eligible_ts) if eligible_ts else None
+            elif exported_timestamps:
+                max_ts = max(exported_timestamps)
+
+            if tx is not None:
+                tx["records_processed"] = total_written + total_reconciled
+                if max_ts is not None:
+                    tx["new_timestamp"] = max_ts
+    except BaseException:
+        stream_failed = True
+        raise
+    finally:
+        _clear_sink_active_context(bound_sink_obj, failed=stream_failed)
 
     return total_written
 
@@ -4035,6 +4348,7 @@ __all__ = [
     "AsyncExportSink",
     "BoundedFormBufferRouter",
     "ExportSink",
+    "SdtmLineageSession",
     "SinkConfig",
     "StateProviderProtocol",
     "TabularBatchStamp",

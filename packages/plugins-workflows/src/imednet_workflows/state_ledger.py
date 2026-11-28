@@ -914,6 +914,7 @@ class FileStateProvider(BaseStateProvider):
             "new_timestamp": None,
             "records_processed": 0,
             "metadata": copy.deepcopy(prior_metadata),
+            "_lineage_hydrated": True,
         }
         try:
             yield tx_data
@@ -1009,6 +1010,7 @@ class FileStateProvider(BaseStateProvider):
                     "new_timestamp": None,
                     "records_processed": 0,
                     "metadata": copy.deepcopy(prior_meta),
+                    "_lineage_hydrated": True,
                 }
 
             ttl = self.lease_ttl_seconds if lease_ttl_seconds is None else lease_ttl_seconds

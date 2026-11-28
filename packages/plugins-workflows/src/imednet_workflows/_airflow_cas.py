@@ -460,6 +460,7 @@ def transact_airflow_streams(
                 "new_timestamp": None,
                 "records_processed": 0,
                 "metadata": copy.deepcopy(prior_meta),
+                "_lineage_hydrated": True,
             }
 
         lease_exp = now + timedelta(seconds=ttl)

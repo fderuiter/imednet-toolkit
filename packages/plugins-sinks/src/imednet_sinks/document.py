@@ -323,6 +323,7 @@ class _MongoDbSinkCoreMixin:
     _lineage_out_ref: dict[str, dict[str, Any]]
     _mapper: CentralizedMapper | None
     _mapper_key: tuple[Any, ...] | None
+    _synced_sdtm_session_id: int | None
 
     def _init_mongo_state(self, config: MongoDbSinkConfig) -> None:
         """Initialize shared MongoDB mapping and SDTM lineage state."""
@@ -339,6 +340,7 @@ class _MongoDbSinkCoreMixin:
         self._lineage_out_ref = {}
         self._mapper = None
         self._mapper_key = None
+        self._synced_sdtm_session_id = None
 
     def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
         """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
@@ -348,7 +350,8 @@ class _MongoDbSinkCoreMixin:
     def _get_mapper(
         self,
         post_proc: Any,
-        seq_overrides: Mapping[str, int] | None,
+        seq_overrides: dict[str, int] | None,
+        domain_seq_counters: dict[str, dict[str, int]] | None = None,
     ) -> CentralizedMapper:
         """Return a reusable sink-scoped mapper synchronized for the active MongoDB batch."""
         doc_cfg = self.config
@@ -356,10 +359,16 @@ class _MongoDbSinkCoreMixin:
         active_map = getattr(self, "_active_form_domain_map", None)
         if isinstance(active_map, Mapping):
             self._form_domain_map_ref.update(active_map)
-        self._seq_overrides_ref.clear()
-        if seq_overrides:
-            self._seq_overrides_ref.update(seq_overrides)
+        if seq_overrides is not None and self._seq_overrides_ref is not seq_overrides:
+            self._seq_overrides_ref = seq_overrides
         self._lineage_out_ref.clear()
+
+        live_domain_counters = (
+            domain_seq_counters if domain_seq_counters is not None else self._domain_seq_counters
+        )
+        live_seq_counters = (
+            self._seq_counters if (not doc_cfg.as_sdtm or doc_cfg.sdtm_domain is not None) else None
+        )
 
         extra = doc_cfg.extra if isinstance(doc_cfg.extra, dict) else {}
         key = (
@@ -376,34 +385,41 @@ class _MongoDbSinkCoreMixin:
                 doc_cfg,
                 mode="document",
                 post_processor=post_proc,
-                seq_counters=(
-                    self._seq_counters
-                    if (not doc_cfg.as_sdtm or doc_cfg.sdtm_domain is not None)
-                    else None
-                ),
-                domain_seq_counters=self._domain_seq_counters if doc_cfg.as_sdtm else None,
+                seq_counters=live_seq_counters,
+                domain_seq_counters=live_domain_counters if doc_cfg.as_sdtm else None,
                 form_domain_map=self._form_domain_map_ref,
-                seq_overrides=self._seq_overrides_ref if doc_cfg.as_sdtm else None,
+                seq_overrides=seq_overrides if doc_cfg.as_sdtm else None,
                 lineage_out=self._lineage_out_ref if doc_cfg.as_sdtm else None,
                 record_seqs=self._record_seqs,
             )
             self._mapper_key = key
         else:
             self._mapper.post_processor = post_proc
+            if doc_cfg.as_sdtm:
+                self._mapper.bind_sdtm_lineage(
+                    domain_seq_counters=live_domain_counters,
+                    seq_overrides=seq_overrides,
+                    seq_counters=live_seq_counters,
+                )
         return self._mapper
 
     def _prepare_batch_mapper(self) -> tuple[CentralizedMapper, dict[str, dict[str, Any]], bool]:
         """Rehydrate SDTM lineage and return ``(mapper, lineage_out, is_incremental)``."""
+        domain_seq_counters: dict[str, dict[str, int]] | None = None
         seq_overrides: dict[str, int] | None = None
         if self.config.as_sdtm:
-            rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
-            for dom_code, subj_map in rehydrated_counters.items():
-                local_map = self._domain_seq_counters.setdefault(dom_code, {})
-                for subj_key, wm_val in subj_map.items():
-                    local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
+            domain_seq_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
+            session_id = id(domain_seq_counters)
+            if self._synced_sdtm_session_id != session_id:
+                if self._domain_seq_counters:
+                    for dom_code, subj_map in self._domain_seq_counters.items():
+                        live_map = domain_seq_counters.setdefault(dom_code, {})
+                        for subj_key, wm_val in subj_map.items():
+                            live_map[subj_key] = max(live_map.get(subj_key, 0), wm_val)
+                self._synced_sdtm_session_id = session_id
 
         post_proc = None if self.config.as_sdtm else _post_process_document
-        mapper = self._get_mapper(post_proc, seq_overrides)
+        mapper = self._get_mapper(post_proc, seq_overrides, domain_seq_counters)
         is_incremental = bool(
             self.config.incremental
             or self.config.modified_since is not None
