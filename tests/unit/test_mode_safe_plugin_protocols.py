@@ -670,7 +670,11 @@ async def test_async_workflows_and_async_export_support_cdisc_odm_and_dataset_js
 
         cdash_env = await async_sdk.workflows.record_mapper.to_dataset_json("STUDY")
         assert cdash_env.dataset_json_version == "1.1.0"
-        assert cdash_env.clinical_data is not None
+        assert cdash_env.item_group_oid.startswith("IG.")
+
+        cdash_bundle = await async_sdk.workflows.record_mapper.to_dataset_json_bundle("STUDY")
+        assert cdash_bundle.study_oid == "STUDY"
+        assert len(cdash_bundle.datasets) >= 1
 
         sdtm_env = await async_sdk.workflows.record_mapper.sdtm_dataset_json("STUDY", "DM")
         assert sdtm_env.dataset_json_version == "1.1.0"

@@ -13,10 +13,9 @@ import pytest
 
 from imednet.cli import app
 from imednet.datadict import (
-    DatasetJsonClinicalData,
+    DatasetJsonColumn,
     DatasetJsonEnvelope,
     DatasetJsonItem,
-    DatasetJsonItemGroup,
     OdmItemData,
     OdmItemGroupData,
     OdmReferenceData,
@@ -24,6 +23,7 @@ from imednet.datadict import (
     load_dataset_json,
     load_odm_archive,
     to_dataset_json_file,
+    to_odm_file,
     validate_dataset_json,
     validate_odm_xml,
 )
@@ -413,10 +413,12 @@ def test_export_registry_odm_and_dataset_json_deterministic_incremental_and_phi_
     )
     assert validate_dataset_json(vs_path) == []
     vs_env = load_dataset_json(vs_path)
-    vs_group = vs_env.clinical_data.item_group_data["IG.VS"]
-    assert vs_group.records == 1
-    sysbp_idx = [it.name for it in vs_group.items].index("SYSBP")
-    assert vs_group.item_data[0][sysbp_idx] == 131
+    assert vs_env.item_group_oid == "IG.VS"
+    assert vs_env.records == 1
+    sysbp_idx = [col.name for col in vs_env.columns].index("SYSBP")
+    assert vs_env.rows[0][sysbp_idx] == 131
+    dm_env_after = load_dataset_json(dm_path)
+    assert dm_env_after.records == 0
 
     # Confirm zero write calls to upstream EDC endpoints
     sdk.records.create.assert_not_called()
@@ -476,7 +478,8 @@ def test_single_file_dataset_json_sdtm_incremental_merge_and_sink_config_overrid
     )
     assert validate_dataset_json(single_dj) == []
     env1 = load_dataset_json(single_dj)
-    assert env1.clinical_data.item_group_data["IG.DM"].records == 2
+    assert env1.item_group_oid == "IG.DM"
+    assert env1.records == 2
 
     # Void SUBJ-100 DM record and update SUBJ-101 DM record with a new column + widened type
     records[10] = records[10].model_copy(
@@ -500,10 +503,10 @@ def test_single_file_dataset_json_sdtm_incremental_merge_and_sink_config_overrid
     )
     assert validate_dataset_json(single_dj) == []
     env2 = load_dataset_json(single_dj)
-    dm_grp = env2.clinical_data.item_group_data["IG.DM"]
-    assert dm_grp.records == 1
-    col_names = [it.name for it in dm_grp.items]
-    assert dm_grp.item_data[0][col_names.index("USUBJID")].endswith("SUBJ-101")
+    assert env2.item_group_oid == "IG.DM"
+    assert env2.records == 1
+    col_names = [col.name for col in env2.columns]
+    assert env2.rows[0][col_names.index("USUBJID")].endswith("SUBJ-101")
 
 
 def test_whitelists_default_paths_and_safe_sdk_hydration(
@@ -621,29 +624,24 @@ def test_whitelists_default_paths_and_safe_sdk_hydration(
     )
     assert validate_dataset_json(corrupt_dj) == []
 
-    # Manual DatasetJsonItemGroup validation via dict
+    # Manual flat DatasetJsonEnvelope v1.1 validation via dict
     manual_env = DatasetJsonEnvelope(
-        creationDateTime="2026-01-01T00:00:00Z",
-        clinicalData=DatasetJsonClinicalData(
-            studyOID="S1",
-            metaDataVersionOID="MDV.1",
-            itemGroupData={
-                "IG.TEST": DatasetJsonItemGroup(
-                    records=1,
-                    name="TEST",
-                    label="Test",
-                    items=(
-                        DatasetJsonItem(
-                            OID="ITEMGROUPDATASEQ",
-                            name="ITEMGROUPDATASEQ",
-                            label="Seq",
-                            type="integer",
-                        ),
-                    ),
-                    itemData=((1,),),
-                )
-            },
+        datasetJSONCreationDateTime="2026-01-01T00:00:00Z",
+        studyOID="S1",
+        metaDataVersionOID="MDV.1",
+        itemGroupOID="IG.TEST",
+        records=1,
+        name="TEST",
+        label="Test",
+        columns=(
+            DatasetJsonItem(
+                itemOID="IT.TEST.SUBJID",
+                name="SUBJID",
+                label="Subject ID",
+                dataType="string",
+            ),
         ),
+        rows=(("001",),),
     )
     assert validate_dataset_json(manual_env.to_json_dict()) == []
 
@@ -728,7 +726,7 @@ def test_cli_export_odm_and_dataset_json_and_datadict_archive(
     assert dj_cli_out.is_file()
     assert validate_dataset_json(dj_cli_out) == []
     sdtm_vs = load_dataset_json(dj_cli_out)
-    assert "IG.VS" in sdtm_vs.clinical_data.item_group_data
+    assert sdtm_vs.item_group_oid == "IG.VS"
 
     # datadict from-odm --strict fails on ClinicalData
     with pytest.raises(SystemExit) as exc_info:
@@ -751,7 +749,7 @@ def test_cdisc_sink_config_manifests_corrupt_recovery_and_schema_widening(tmp_pa
     from imednet.integrations.cdisc_export import (
         _build_cdisc_sink_config,
         _DatasetJsonSink,
-        _merge_dataset_json_item_groups,
+        _merge_dataset_json_envelopes,
         _OdmArchiveSink,
     )
 
@@ -867,45 +865,271 @@ def test_cdisc_sink_config_manifests_corrupt_recovery_and_schema_widening(tmp_pa
     noop_dj_sink = _DatasetJsonSink(sdk, "CDISC_STUDY", dj_dir / "vs.json", inc_cfg)
     noop_dj_sink.flush()
 
-    # Verify _merge_dataset_json_item_groups widens mismatched column types to string and appends new columns
-    prior_grp = DatasetJsonItemGroup(
+    # Verify _merge_dataset_json_envelopes widens mismatched column types to string and appends new columns
+    prior_env = DatasetJsonEnvelope(
+        datasetJSONCreationDateTime="2026-02-01T00:00:00Z",
+        studyOID="CDISC_STUDY",
+        metaDataVersionOID="MDV.001",
+        itemGroupOID="IG.VS",
         records=1,
         name="VS",
         label="Vital Signs",
-        items=(
-            DatasetJsonItem(
-                OID="ITEMGROUPDATASEQ", name="ITEMGROUPDATASEQ", label="Seq", type="integer"
+        columns=(
+            DatasetJsonColumn(
+                itemOID="IT.VS.recordId",
+                name="recordId",
+                label="ID",
+                dataType="integer",
+                keySequence=1,
             ),
-            DatasetJsonItem(
-                OID="IT.VS.recordId", name="recordId", label="ID", type="integer", keySequence=1
-            ),
-            DatasetJsonItem(OID="IT.VS.VAL", name="VAL", label="Val", type="integer"),
+            DatasetJsonColumn(itemOID="IT.VS.VAL", name="VAL", label="Val", dataType="integer"),
         ),
-        itemData=((1, 10, 120),),
+        rows=((10, 120),),
     )
-    delta_grp = DatasetJsonItemGroup(
+    delta_env = DatasetJsonEnvelope(
+        datasetJSONCreationDateTime="2026-02-02T00:00:00Z",
+        studyOID="CDISC_STUDY",
+        metaDataVersionOID="MDV.001",
+        itemGroupOID="IG.VS",
         records=1,
         name="VS",
         label="Vital Signs",
-        items=(
-            DatasetJsonItem(
-                OID="ITEMGROUPDATASEQ", name="ITEMGROUPDATASEQ", label="Seq", type="integer"
+        columns=(
+            DatasetJsonColumn(
+                itemOID="IT.VS.recordId",
+                name="recordId",
+                label="ID",
+                dataType="integer",
+                keySequence=1,
             ),
-            DatasetJsonItem(
-                OID="IT.VS.recordId", name="recordId", label="ID", type="integer", keySequence=1
+            DatasetJsonColumn(itemOID="IT.VS.VAL", name="VAL", label="Val", dataType="string"),
+            DatasetJsonColumn(
+                itemOID="IT.VS.NEW_COL", name="NEW_COL", label="New", dataType="string"
             ),
-            DatasetJsonItem(OID="IT.VS.VAL", name="VAL", label="Val", type="string"),
-            DatasetJsonItem(OID="IT.VS.NEW_COL", name="NEW_COL", label="New", type="string"),
         ),
-        itemData=((1, 11, "125+", "added"),),
+        rows=((11, "125+", "added"),),
     )
-    merged_grp = _merge_dataset_json_item_groups(
-        prior_grp,
-        delta_grp,
+    merged_env = _merge_dataset_json_envelopes(
+        prior_env,
+        delta_env,
         voided_record_ids=set(),
         voided_sdtm_keys=set(),
     )
-    merged_types = {it.name: it.type for it in merged_grp.items}
+    merged_types = {col.name: col.data_type for col in merged_env.columns}
     assert merged_types["VAL"] == "string"
     assert "NEW_COL" in merged_types
-    assert merged_grp.records == 2
+    assert "ITEMGROUPDATASEQ" not in merged_types
+    assert merged_env.records == 2
+
+
+def test_two_step_incremental_sdtm_dataset_json_monotonic_seq_and_void_pruning_without_record_id(
+    tmp_path: Path,
+) -> None:
+    """Two-step incremental export_to_dataset_json(..., as_sdtm=True, preserve_record_id=False) retains prior Subject Records, advances <DOM>SEQ monotonically, and prunes voided Records."""
+    records: dict[int, Record] = {
+        101: Record(
+            record_id=101,
+            study_key="CDISC_STUDY",
+            subject_id=500,
+            subject_key="SUBJ-100",
+            site_id=1,
+            form_id=102,
+            form_key="VS",
+            visit_id=600,
+            date_modified="2026-03-01T10:00:00Z",
+            record_data={"VSTESTCD": "SYSBP", "VSORRES": "118"},
+        ),
+        102: Record(
+            record_id=102,
+            study_key="CDISC_STUDY",
+            subject_id=500,
+            subject_key="SUBJ-100",
+            site_id=1,
+            form_id=102,
+            form_key="VS",
+            visit_id=600,
+            date_modified="2026-03-01T10:01:00Z",
+            record_data={"VSTESTCD": "DIABP", "VSORRES": "78"},
+        ),
+        103: Record(
+            record_id=103,
+            study_key="CDISC_STUDY",
+            subject_id=501,
+            subject_key="SUBJ-200",
+            site_id=1,
+            form_id=102,
+            form_key="VS",
+            visit_id=600,
+            date_modified="2026-03-01T10:02:00Z",
+            record_data={"VSTESTCD": "HR", "VSORRES": "70"},
+        ),
+    }
+    sdk = _build_stateful_cdisc_sdk(records)
+    out_file = tmp_path / "vs_sdtm.json"
+    ledger_path = tmp_path / "vs_sdtm_ledger.json"
+
+    # Step 1: Initial incremental sync with preserve_record_id=False
+    export_to_dataset_json(
+        sdk,
+        "CDISC_STUDY",
+        out_file,
+        as_sdtm=True,
+        sdtm_domain="VS",
+        preserve_record_id=False,
+        incremental=True,
+        ledger_path=ledger_path,
+        stream_name="vs_sdtm_inc",
+    )
+    assert validate_dataset_json(out_file) == []
+    step1_env = load_dataset_json(out_file)
+    step1_cols = [c.name for c in step1_env.columns]
+    assert "RECORD_ID" not in step1_cols
+    assert "recordId" not in step1_cols
+    assert "ITEMGROUPDATASEQ" not in step1_cols
+    assert step1_env.records == 3
+
+    # Step 2: Modify record 101, void record 102 (deleted=True), and insert new record 104 for SUBJ-100
+    records[101] = records[101].model_copy(
+        update={
+            "date_modified": "2026-03-02T11:00:00Z",
+            "record_data": {"VSTESTCD": "SYSBP", "VSORRES": "124"},
+        }
+    )
+    records[102] = records[102].model_copy(
+        update={
+            "deleted": True,
+            "date_modified": "2026-03-02T11:01:00Z",
+        }
+    )
+    records[104] = Record(
+        record_id=104,
+        study_key="CDISC_STUDY",
+        subject_id=500,
+        subject_key="SUBJ-100",
+        site_id=1,
+        form_id=102,
+        form_key="VS",
+        visit_id=600,
+        date_modified="2026-03-02T11:02:00Z",
+        record_data={"VSTESTCD": "PULSE", "VSORRES": "66"},
+    )
+
+    export_to_dataset_json(
+        sdk,
+        "CDISC_STUDY",
+        out_file,
+        as_sdtm=True,
+        sdtm_domain="VS",
+        preserve_record_id=False,
+        incremental=True,
+        ledger_path=ledger_path,
+        stream_name="vs_sdtm_inc",
+    )
+    assert validate_dataset_json(out_file) == []
+    step2_env = load_dataset_json(out_file)
+    step2_cols = [c.name for c in step2_env.columns]
+    assert "RECORD_ID" not in step2_cols
+    row_dicts = [dict(zip(step2_cols, r, strict=False)) for r in step2_env.rows]
+    # Prior untouched SUBJ-200 retained; SUBJ-100 pruned DIABP (VSSEQ=1), retained SYSBP (VSSEQ=2), and advanced PULSE monotonically (VSSEQ=3)
+    assert len(row_dicts) == 3
+    subj200_rows = [r for r in row_dicts if str(r["USUBJID"]).endswith("SUBJ-200")]
+    assert len(subj200_rows) == 1
+    assert subj200_rows[0]["VSSEQ"] == 1
+    subj100_rows = sorted(
+        [r for r in row_dicts if str(r["USUBJID"]).endswith("SUBJ-100")],
+        key=lambda x: int(x["VSSEQ"]),
+    )
+    assert [r["VSSEQ"] for r in subj100_rows] == [2, 3]
+    assert subj100_rows[0]["VSORRES"] == "124"
+    assert subj100_rows[1]["VSORRES"] == "66"
+
+
+def test_incremental_odm_preserves_scheduled_interval_without_repeat_key_and_filters_remove(
+    tmp_path: Path,
+) -> None:
+    """Incremental export_to_odm preserves scheduled StudyEventOID placements without StudyEventRepeatKey and drops TransactionType=Remove items."""
+    records: dict[int, Record] = {
+        1: Record(
+            record_id=1,
+            study_key="CDISC_STUDY",
+            subject_id=500,
+            subject_key="SUBJ-100",
+            site_id=1,
+            form_id=102,
+            form_key="VS",
+            visit_id=None,
+            interval_id=201,
+            date_modified="2026-02-01T10:00:00Z",
+            record_data={"SYSBP": 115},
+        ),
+    }
+    sdk = _build_stateful_cdisc_sdk(records)
+    odm_file = tmp_path / "interval_sync.odm.xml"
+    ledger_path = tmp_path / "interval_odm_ledger.json"
+
+    export_to_odm(
+        sdk,
+        "CDISC_STUDY",
+        odm_file,
+        incremental=True,
+        ledger_path=ledger_path,
+        stream_name="odm_interval_sync",
+    )
+    arch1 = load_odm_archive(odm_file, strict=True)
+    se1 = arch1.clinical_data[0].subjects[0].study_events[0]
+    assert se1.study_event_oid == "SE.Visit_1"
+    assert se1.study_event_repeat_key is None
+
+    # Inject a Transactional Remove ItemGroupData into the prior archive on disk to verify it cannot resurrect
+    prior_subj = arch1.clinical_data[0].subjects[0]
+    prior_form = prior_subj.study_events[0].forms[0]
+    removed_ig = OdmItemGroupData(
+        item_group_oid=prior_form.item_group_data[0].item_group_oid,
+        itemGroupRepeatKey="999",
+        transactionType="Remove",
+        items=(OdmItemData(item_oid="SYSBP", value="999"),),
+    )
+    patched_form = prior_form.model_copy(
+        update={"item_groups": (*prior_form.item_groups, removed_ig)}
+    )
+    patched_se = prior_subj.study_events[0].model_copy(update={"forms": (patched_form,)})
+    patched_subj = prior_subj.model_copy(update={"study_events": (patched_se,)})
+    patched_clin = arch1.clinical_data[0].model_copy(update={"subjects": (patched_subj,)})
+    transactional_arch = arch1.model_copy(
+        update={"file_type": "Transactional", "clinical_data": (patched_clin,)}
+    )
+    to_odm_file(transactional_arch, odm_file, mask_phi=False)
+    assert validate_odm_xml(odm_file) == []
+
+    # Step 2: Add a second Subject record; prior SUBJ-100 scheduled StudyEventOID without RepeatKey must be preserved and Remove item 999 dropped
+    records[2] = Record(
+        record_id=2,
+        study_key="CDISC_STUDY",
+        subject_id=501,
+        subject_key="SUBJ-200",
+        site_id=1,
+        form_id=101,
+        form_key="DM",
+        visit_id=None,
+        date_modified="2026-02-03T10:00:00Z",
+        record_data={"SUBJID": "200", "SEX": "F"},
+    )
+    export_to_odm(
+        sdk,
+        "CDISC_STUDY",
+        odm_file,
+        incremental=True,
+        ledger_path=ledger_path,
+        stream_name="odm_interval_sync",
+    )
+    assert validate_odm_xml(odm_file) == []
+    arch2 = load_odm_archive(odm_file, strict=True)
+    assert arch2.file_type == "Snapshot"
+    subjs_by_key = {s.subject_key: s for s in arch2.clinical_data[0].subjects}
+    s100_events = subjs_by_key["SUBJ-100"].study_events
+    assert len(s100_events) == 1
+    assert s100_events[0].study_event_oid == "SE.Visit_1"
+    assert s100_events[0].study_event_repeat_key is None
+    repeat_keys = [ig.item_group_repeat_key for ig in s100_events[0].forms[0].item_groups]
+    assert repeat_keys == ["1"]
+    assert "999" not in repeat_keys

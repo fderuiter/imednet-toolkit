@@ -30,9 +30,12 @@ if TYPE_CHECKING:
     from .query_management import AsyncQueryManagementWorkflow, QueryManagementWorkflow
     from .record_mapper import (
         AsyncRecordMapper,
+        DatasetJsonBundle,
+        DatasetJsonEnvelope,
         RecordMapper,
         format_iso8601_dtc,
         transform_records_to_dataset_json,
+        transform_records_to_dataset_json_bundle,
         transform_records_to_sdtm,
     )
     from .record_update import AsyncRecordUpdateWorkflow, RecordUpdateWorkflow
@@ -97,6 +100,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "ConfigVersionStore": ("imednet_workflows.config_version_control", "ConfigVersionStore"),
     "DEFAULT_LEDGER_PATH": ("imednet_workflows.state_ledger", "DEFAULT_LEDGER_PATH"),
     "DataExtractionWorkflow": ("imednet_workflows.data_extraction", "DataExtractionWorkflow"),
+    "DatasetJsonBundle": ("imednet_workflows.record_mapper", "DatasetJsonBundle"),
+    "DatasetJsonEnvelope": ("imednet_workflows.record_mapper", "DatasetJsonEnvelope"),
     "DuckDBIngestionWorkflow": (
         "imednet_workflows.duckdb_centralizer",
         "DuckDBIngestionWorkflow",
@@ -159,6 +164,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "imednet_workflows.record_mapper",
         "transform_records_to_dataset_json",
     ),
+    "transform_records_to_dataset_json_bundle": (
+        "imednet_workflows.record_mapper",
+        "transform_records_to_dataset_json_bundle",
+    ),
     "transform_records_to_sdtm": (
         "imednet_workflows.record_mapper",
         "transform_records_to_sdtm",
@@ -206,6 +215,8 @@ __all__ = [
     "ChunkedRecordPipeline",
     "ConfigVersionStore",
     "DataExtractionWorkflow",
+    "DatasetJsonBundle",
+    "DatasetJsonEnvelope",
     "DuckDBIngestionWorkflow",
     "ExtractionResult",
     "ExtractionStateLedger",
@@ -247,5 +258,6 @@ __all__ = [
     "get_study_structure",
     "iter_chunks",
     "transform_records_to_dataset_json",
+    "transform_records_to_dataset_json_bundle",
     "transform_records_to_sdtm",
 ]

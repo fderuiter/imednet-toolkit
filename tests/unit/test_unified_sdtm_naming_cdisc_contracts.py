@@ -170,9 +170,9 @@ def test_unassigned_subject_preserves_none_in_sdtm_dataset_json_and_neo4j(
         sdtm_domain="VS",
     )
     assert validate_dataset_json(to_dataset_json(env)) == []
-    ig = env.clinical_data.item_group_data["IG.VS"]
-    usub_idx = [it.name for it in ig.items].index("USUBJID")
-    assert [row[usub_idx] for row in ig.item_data] == [None, None]
+    assert env.item_group_oid == "IG.VS"
+    usub_idx = [it.name for it in env.columns].index("USUBJID")
+    assert [row[usub_idx] for row in env.rows] == [None, None]
 
     # Neo4j SDTM export guards null/empty USUBJID and links Study -> Record without Subject node
     neo4j_calls: list[tuple[str, dict[str, Any]]] = []
@@ -405,7 +405,7 @@ def test_incremental_only_preserve_record_id_and_explicit_as_sdtm_false(
     # RecordMapper.to_dataset_json honors explicit as_sdtm=False with domain="AE"
     rm = RecordMapper(sdk)
     dj_env = rm.to_dataset_json("S1", as_sdtm=False, domain="AE", naming_convention="sdtm")
-    assert "IG.VS" in dj_env.clinical_data.item_group_data
+    assert dj_env.item_group_oid == "IG.VS"
 
     # Airflow ImednetExportOperator honors explicit as_sdtm=False when sdtm_domain="AE"
     import apache_airflow_providers_imednet.operators.export as airflow_export_mod
@@ -479,7 +479,8 @@ def test_dm_deduplication_and_composite_keying_across_mappers_and_all_sinks(
     assert len(df_dm) == 1
     assert df_dm.iloc[0]["SEX"] == "F"
     env_dm = rm.sdtm_dataset_json(study_key, "DM")
-    assert env_dm.clinical_data.item_group_data["IG.DM"].records == 1
+    assert env_dm.item_group_oid == "IG.DM"
+    assert env_dm.records == 1
 
     # Incremental Run 1 (recordId=101) -> Run 2 (recordId=102) across tabular, CDISC, and plugin sinks
     current_records = [dm_r1]
@@ -580,7 +581,8 @@ def test_dm_deduplication_and_composite_keying_across_mappers_and_all_sinks(
 
     dj_payload = json.loads(dj_file.read_text(encoding="utf-8"))
     assert validate_dataset_json(dj_payload) == []
-    assert dj_payload["clinicalData"]["itemGroupData"]["IG.DM"]["records"] == 1
+    assert dj_payload["itemGroupOID"] == "IG.DM"
+    assert dj_payload["records"] == 1
 
     # Plugin sinks (MongoDB, Neo4j, Snowflake) key DM on (STUDYID, DOMAIN, USUBJID) even with RECORD_ID
     docs_store: dict[str, dict[str, Any]] = {}
@@ -799,16 +801,16 @@ def test_dataset_json_enrichment_order_and_collision_disambiguation() -> None:
         enrichment_pipeline=pipeline,
     )
     assert validate_dataset_json(to_dataset_json(env_snake)) == []
-    ig_snake = env_snake.clinical_data.item_group_data["IG.VS"]
-    snake_names = [it.name for it in ig_snake.items]
-    snake_oids = [it.oid for it in ig_snake.items]
+    assert env_snake.item_group_oid == "IG.VS"
+    snake_names = [it.name for it in env_snake.columns]
+    snake_oids = [it.oid for it in env_snake.columns]
     assert len(snake_names) == len(set(snake_names))
     assert len(snake_oids) == len(set(snake_oids))
     assert "derived_score" in snake_names
     assert "var_record_id" in snake_names
     assert "bp_val" in snake_names
     assert "bp_val_2" in snake_names
-    row_map = dict(zip(snake_names, ig_snake.item_data[0], strict=True))
+    row_map = dict(zip(snake_names, env_snake.rows[0], strict=True))
     assert row_map["derived_score"] == 15
     assert row_map["record_id"] == 501
     assert row_map["var_record_id"] == 999
@@ -824,9 +826,9 @@ def test_dataset_json_enrichment_order_and_collision_disambiguation() -> None:
         enrichment_pipeline=pipeline,
     )
     assert validate_dataset_json(to_dataset_json(env_labels)) == []
-    ig_lbl = env_labels.clinical_data.item_group_data["IG.VS"]
-    lbl_names = [it.name for it in ig_lbl.items]
-    lbl_oids = [it.oid for it in ig_lbl.items]
+    assert env_labels.item_group_oid == "IG.VS"
+    lbl_names = [it.name for it in env_labels.columns]
+    lbl_oids = [it.oid for it in env_labels.columns]
     assert len(lbl_names) == len(set(lbl_names))
     assert len(lbl_oids) == len(set(lbl_oids))
     assert "Blood Pressure" in lbl_names
@@ -1082,7 +1084,8 @@ async def test_uniform_naming_convention_across_hive_parquet_hierarchical_json_l
         "S_NAMING", "VS", naming_convention="camelCase", preserve_record_id=True
     )
     assert validate_dataset_json(to_dataset_json(sdtm_camel_dj)) == []
-    dj_item_names = [it.name for it in sdtm_camel_dj.clinical_data.item_group_data["IG.VS"].items]
+    assert sdtm_camel_dj.item_group_oid == "IG.VS"
+    dj_item_names = [it.name for it in sdtm_camel_dj.columns]
     assert "studyid" in dj_item_names
     assert "vsseq" in dj_item_names
     assert "recordId" in dj_item_names
@@ -1111,7 +1114,8 @@ async def test_uniform_naming_convention_across_hive_parquet_hierarchical_json_l
         "S_NAMING", "VS", naming_convention="snake_case", preserve_record_id=True
     )
     assert validate_dataset_json(to_dataset_json(adj)) == []
-    adj_names = [it.name for it in adj.clinical_data.item_group_data["IG.VS"].items]
+    assert adj.item_group_oid == "IG.VS"
+    adj_names = [it.name for it in adj.columns]
     assert "studyid" in adj_names
     assert "record_id" in adj_names
     assert "sys_bp" in adj_names

@@ -277,6 +277,7 @@ def _item_def_signature(var: Variable) -> Any:
         "role",
         "RoleCodeListOID",
         "roleCodeListOid",
+        "itemOID",
     }
     merged_extra = {k: v for k, v in (var.model_extra or {}).items() if k not in excluded_keys}
     for k, v in var.extraAttributes.items():
@@ -304,13 +305,23 @@ def _item_def_signature(var: Variable) -> Any:
     )
 
 
-def _default_unwrapped_name(item_oid: str, form_key: str) -> str:
+def _default_unwrapped_name(item_oid: str, form_key: str, ig_oid: str | None = None) -> str:
     """Return the variableName that ODM import infers from item_oid without VariableName."""
     raw_oid = item_oid.strip()
     prefixes: list[str] = []
     if form_key:
         prefixes.extend([f"IT.{form_key}.", f"{form_key}."])
-    prefixes.append(f"IG_{form_key}.")
+        for f_lead in ("F.", "F_", "FORM.", "FORM_"):
+            if form_key.startswith(f_lead) and len(form_key) > len(f_lead):
+                f_stem = form_key[len(f_lead) :]
+                prefixes.extend([f"IT.{f_stem}.", f"{f_stem}."])
+    eff_ig = ig_oid if ig_oid else f"IG_{form_key}"
+    if eff_ig:
+        prefixes.append(f"{eff_ig}.")
+        for ig_lead in ("IG.", "IG_"):
+            if eff_ig.startswith(ig_lead) and len(eff_ig) > len(ig_lead):
+                ig_stem = eff_ig[len(ig_lead) :]
+                prefixes.extend([f"IT.{ig_stem}.", f"{ig_stem}."])
     for prefix in prefixes:
         if raw_oid.startswith(prefix):
             suffix = raw_oid[len(prefix) :].strip()
@@ -457,12 +468,28 @@ def _allocate_item_oids(
 
     scoped_var_names = {v_name for v_name, sigs in sigs_by_var_name.items() if len(sigs) > 1}
     used_item_oids: set[str] = set()
+    preserved_oid_by_occ: dict[tuple[int, int], str] = {}
+    preserved_sig_by_oid: dict[str, Any] = {}
+    for f_idx, sorted_vars in enumerate(sorted_vars_by_form):
+        for v_idx, var in enumerate(sorted_vars):
+            raw_pres = var.extraAttributes.get("itemOID")
+            pres_oid = raw_pres.strip() if isinstance(raw_pres, str) else ""
+            if pres_oid:
+                sig = sig_by_occ[(f_idx, v_idx)]
+                existing_sig = preserved_sig_by_oid.get(pres_oid)
+                if existing_sig is None or existing_sig == sig:
+                    preserved_sig_by_oid[pres_oid] = sig
+                    preserved_oid_by_occ[(f_idx, v_idx)] = pres_oid
+                    used_item_oids.add(pres_oid)
+
     unscoped_oid_by_name: dict[str, str] = {}
     scoped_oid_by_group: dict[tuple[str, str, Any], str] = {}
 
     # Pass 1: Reserve unprefixed OIDs for variables with a single consistent definition
-    for sorted_vars in sorted_vars_by_form:
-        for var in sorted_vars:
+    for f_idx, sorted_vars in enumerate(sorted_vars_by_form):
+        for v_idx, var in enumerate(sorted_vars):
+            if (f_idx, v_idx) in preserved_oid_by_occ:
+                continue
             if (
                 var.variableName not in scoped_var_names
                 and var.variableName not in unscoped_oid_by_name
@@ -478,17 +505,20 @@ def _allocate_item_oids(
     for f_idx, form in enumerate(sorted_forms):
         sorted_vars = sorted_vars_by_form[f_idx]
         for v_idx, var in enumerate(sorted_vars):
-            if var.variableName in scoped_var_names:
+            if (f_idx, v_idx) in preserved_oid_by_occ:
+                item_oid = preserved_oid_by_occ[(f_idx, v_idx)]
+            elif var.variableName in scoped_var_names:
                 group_key = (form.formKey, var.variableName, sig_by_occ[(f_idx, v_idx)])
-                item_oid = scoped_oid_by_group.get(group_key)
-                if item_oid is None:
-                    item_oid = _allocate_scoped_oid(
+                cached_scoped = scoped_oid_by_group.get(group_key)
+                if cached_scoped is None:
+                    cached_scoped = _allocate_scoped_oid(
                         form.formKey,
                         var.variableName,
                         used_item_oids,
                         reserved_raw_names,
                     )
-                    scoped_oid_by_group[group_key] = item_oid
+                    scoped_oid_by_group[group_key] = cached_scoped
+                item_oid = cached_scoped
             else:
                 item_oid = unscoped_oid_by_name[var.variableName]
 
@@ -787,6 +817,7 @@ def _collect_referenced_archive_defs(
                     _scan_annotations(fd.annotations)
                     _scan_item_groups(fd.item_groups)
             for fd in subj.forms:
+                event_oids.add("SE.UNSCHEDULED")
                 _scan_annotations(fd.annotations)
                 _scan_item_groups(fd.item_groups)
 
@@ -795,16 +826,92 @@ def _collect_referenced_archive_defs(
 
 _FREE_TEXT_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _FREE_TEXT_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_FREE_TEXT_PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\b\d{3})[\s.-]\d{3}[\s.-]\d{4}\b"
+)
+_FREE_TEXT_ISO_DATE_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b"
+)
+_FREE_TEXT_SLASH_DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+_FREE_TEXT_NAMED_SUBJECT_RE = re.compile(
+    r"(?i)\b(patient(?:\s+name)?|subject\s+name)\s*([:=])\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}"
+)
+_FREE_TEXT_PROSE_PERSON_RE = re.compile(
+    r"\b([Pp]atient|[Ss]ubject)\s+"
+    r"(?!(?:Key|Id|ID|Identifier|Status|Number|Visit|Data|Record|Report|Reported|Enrolled|Enrollment|Disposition|Consent|Demographics)\b)"
+    r"[A-Z][a-z]{1,20}\s+"
+    r"(?!(?:Key|Id|ID|Identifier|Status|Number|Visit|Data|Record|Report|Reported|Enrolled|Enrollment|Disposition|Consent|Demographics)\b)"
+    r"[A-Z][a-z]{1,20}\b"
+)
+
+
+def _iter_cdisc_identifier_tokens(*identifiers: str | None) -> list[str]:
+    """Expand prefixed CDISC OIDs (e.g. ``IT.DM.PATNAME``) and raw variable names."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _add(val: str) -> None:
+        cleaned = val.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            tokens.append(cleaned)
+
+    for raw in identifiers:
+        if not raw or not isinstance(raw, str):
+            continue
+        _add(raw)
+        stripped = raw.strip()
+        if stripped.startswith(("IT.", "IG.", "CL.")):
+            rest = stripped[3:]
+            _add(rest)
+            if "." in rest:
+                _add(rest.split(".", 1)[1])
+                _add(rest.rsplit(".", 1)[-1])
+        elif "." in stripped:
+            _add(stripped.split(".", 1)[1])
+            _add(stripped.rsplit(".", 1)[-1])
+    return tokens
+
+
+def _is_cdisc_identifier_sensitive(
+    registry: SensitivityRegistry,
+    *identifiers: str | None,
+    label: str | None = None,
+) -> bool:
+    """Return True when any prefixed OID, unwrapped variable name, or label is PHI-sensitive."""
+    tokens = _iter_cdisc_identifier_tokens(*identifiers)
+    if any(registry.is_exempt(tok) for tok in tokens):
+        return False
+    if any(registry.is_sensitive(tok) for tok in tokens):
+        return True
+    return bool(label and label.strip() and registry.is_sensitive(label))
 
 
 def _scrub_clinical_free_text(text: str, *, registry: SensitivityRegistry) -> str:
-    """Scrub diagnostic key-value pairs plus inline emails and SSNs in clinical free text."""
+    """Scrub diagnostic key-value pairs plus inline emails, phones, dates, and SSNs."""
     sanitized = sanitize_diagnostic_text(text, registry=registry)
+    if registry.is_sensitive("patient_name"):
+        sanitized = _FREE_TEXT_NAMED_SUBJECT_RE.sub(rf"\1\2 {MASKED_SENTINEL}", sanitized)
+        sanitized = _FREE_TEXT_PROSE_PERSON_RE.sub(rf"\1 {MASKED_SENTINEL}", sanitized)
     if registry.is_sensitive("email"):
         sanitized = _FREE_TEXT_EMAIL_RE.sub(MASKED_SENTINEL, sanitized)
     if registry.is_sensitive("ssn"):
         sanitized = _FREE_TEXT_SSN_RE.sub(MASKED_SENTINEL, sanitized)
+    if registry.is_sensitive("phone"):
+        sanitized = _FREE_TEXT_PHONE_RE.sub(MASKED_SENTINEL, sanitized)
+    if (
+        registry.is_sensitive("dob")
+        or registry.is_sensitive("date_of_birth")
+        or registry.is_sensitive("birth_date")
+        or registry.is_sensitive("brthdat")
+    ):
+        sanitized = _FREE_TEXT_ISO_DATE_RE.sub(MASKED_SENTINEL, sanitized)
+        sanitized = _FREE_TEXT_SLASH_DATE_RE.sub(MASKED_SENTINEL, sanitized)
     return sanitized
+
+
+def _should_emit_transaction_type(tx_type: str | None, *, allow_remove: bool) -> bool:
+    return bool(tx_type) and (tx_type != "Remove" or allow_remove)
 
 
 def _build_audit_record_elem(
@@ -812,6 +919,8 @@ def _build_audit_record_elem(
     audit: OdmAuditRecord,
     *,
     used_xml_ids: set[str],
+    reserved_pool_ids: set[str] | None = None,
+    is_pool_element: bool = False,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
@@ -820,7 +929,12 @@ def _build_audit_record_elem(
         attribs["EditPoint"] = audit.edit_point
     if audit.used_imputation_method:
         attribs["UsedImputationMethod"] = audit.used_imputation_method
-    if audit.id and audit.id not in used_xml_ids:
+    can_emit_id = (
+        bool(audit.id)
+        and audit.id not in used_xml_ids
+        and (is_pool_element or not reserved_pool_ids or audit.id not in reserved_pool_ids)
+    )
+    if can_emit_id and audit.id:
         used_xml_ids.add(audit.id)
         attribs["ID"] = audit.id
 
@@ -847,13 +961,24 @@ def _build_annotation_elem(
     ann: OdmAnnotation,
     *,
     used_xml_ids: set[str],
+    reserved_pool_ids: set[str] | None = None,
+    is_pool_element: bool = False,
+    allow_remove: bool = True,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
     attribs: dict[str, str] = {"SeqNum": str(ann.seq_num)}
-    if ann.transaction_type:
+    if (
+        _should_emit_transaction_type(ann.transaction_type, allow_remove=allow_remove)
+        and ann.transaction_type
+    ):
         attribs["TransactionType"] = ann.transaction_type
-    if ann.id and ann.id not in used_xml_ids:
+    can_emit_id = (
+        bool(ann.id)
+        and ann.id not in used_xml_ids
+        and (is_pool_element or not reserved_pool_ids or ann.id not in reserved_pool_ids)
+    )
+    if can_emit_id and ann.id:
         used_xml_ids.add(ann.id)
         attribs["ID"] = ann.id
 
@@ -890,32 +1015,40 @@ def _build_item_data_elem(
     *,
     item_meta_by_oid: dict[str, tuple[str, str | None]],
     used_xml_ids: set[str],
+    known_target_xml_ids: set[str] | None = None,
+    reserved_pool_ids: set[str] | None = None,
+    allow_remove: bool = True,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
     attribs: dict[str, str] = {"ItemOID": item.item_oid}
-    if item.transaction_type:
+    if (
+        _should_emit_transaction_type(item.transaction_type, allow_remove=allow_remove)
+        and item.transaction_type
+    ):
         attribs["TransactionType"] = item.transaction_type
 
     var_name, var_label = item_meta_by_oid.get(item.item_oid, (item.item_oid, None))
     raw_val = item.value
-    if mask_phi and raw_val is not None and not item.is_null:
-        is_sens = registry.is_sensitive(var_name) or (
-            bool(var_label)
-            and not registry.is_exempt(var_name)
-            and registry.is_sensitive(var_label)
-        )
-        if is_sens:
-            raw_val = MASKED_SENTINEL
+    if (
+        mask_phi
+        and raw_val is not None
+        and not item.is_null
+        and _is_cdisc_identifier_sensitive(registry, item.item_oid, var_name, label=var_label)
+    ):
+        raw_val = MASKED_SENTINEL
 
     if item.is_null or raw_val is None:
         attribs["IsNull"] = "Yes"
     else:
         attribs["Value"] = raw_val
 
-    if item.audit_record_id and item.audit_record_id in used_xml_ids:
+    valid_idrefs = (
+        used_xml_ids if known_target_xml_ids is None else (used_xml_ids | known_target_xml_ids)
+    )
+    if item.audit_record_id and item.audit_record_id in valid_idrefs:
         attribs["AuditRecordID"] = item.audit_record_id
-    if item.annotation_id and item.annotation_id in used_xml_ids:
+    if item.annotation_id and item.annotation_id in valid_idrefs:
         attribs["AnnotationID"] = item.annotation_id
 
     id_elem = ET.SubElement(parent, f"{{{ODM_NS}}}ItemData", attribs)
@@ -924,6 +1057,7 @@ def _build_item_data_elem(
             id_elem,
             item.audit_record,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -938,6 +1072,8 @@ def _build_item_data_elem(
             id_elem,
             ann,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -950,13 +1086,19 @@ def _build_item_group_data_elem(
     *,
     item_meta_by_oid: dict[str, tuple[str, str | None]],
     used_xml_ids: set[str],
+    known_target_xml_ids: set[str] | None = None,
+    reserved_pool_ids: set[str] | None = None,
+    allow_remove: bool = True,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
     attribs: dict[str, str] = {"ItemGroupOID": ig.item_group_oid}
     if ig.item_group_repeat_key is not None:
         attribs["ItemGroupRepeatKey"] = ig.item_group_repeat_key
-    if ig.transaction_type:
+    if (
+        _should_emit_transaction_type(ig.transaction_type, allow_remove=allow_remove)
+        and ig.transaction_type
+    ):
         attribs["TransactionType"] = ig.transaction_type
     ig_elem = ET.SubElement(parent, f"{{{ODM_NS}}}ItemGroupData", attribs)
     if ig.audit_record is not None:
@@ -964,6 +1106,7 @@ def _build_item_group_data_elem(
             ig_elem,
             ig.audit_record,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -972,6 +1115,8 @@ def _build_item_group_data_elem(
             ig_elem,
             ann,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -981,6 +1126,9 @@ def _build_item_group_data_elem(
             item,
             item_meta_by_oid=item_meta_by_oid,
             used_xml_ids=used_xml_ids,
+            known_target_xml_ids=known_target_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -993,13 +1141,19 @@ def _build_form_data_elem(
     *,
     item_meta_by_oid: dict[str, tuple[str, str | None]],
     used_xml_ids: set[str],
+    known_target_xml_ids: set[str] | None = None,
+    reserved_pool_ids: set[str] | None = None,
+    allow_remove: bool = True,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
     attribs: dict[str, str] = {"FormOID": fd.form_oid}
     if fd.form_repeat_key is not None:
         attribs["FormRepeatKey"] = fd.form_repeat_key
-    if fd.transaction_type:
+    if (
+        _should_emit_transaction_type(fd.transaction_type, allow_remove=allow_remove)
+        and fd.transaction_type
+    ):
         attribs["TransactionType"] = fd.transaction_type
     fd_elem = ET.SubElement(parent, f"{{{ODM_NS}}}FormData", attribs)
     if fd.audit_record is not None:
@@ -1007,6 +1161,7 @@ def _build_form_data_elem(
             fd_elem,
             fd.audit_record,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -1015,6 +1170,8 @@ def _build_form_data_elem(
             fd_elem,
             ann,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -1024,6 +1181,9 @@ def _build_form_data_elem(
             ig,
             item_meta_by_oid=item_meta_by_oid,
             used_xml_ids=used_xml_ids,
+            known_target_xml_ids=known_target_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -1035,11 +1195,17 @@ def _build_subject_data_elem(
     *,
     item_meta_by_oid: dict[str, tuple[str, str | None]],
     used_xml_ids: set[str],
+    known_target_xml_ids: set[str] | None = None,
+    reserved_pool_ids: set[str] | None = None,
+    allow_remove: bool = True,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
     attribs: dict[str, str] = {"SubjectKey": subj.subject_key}
-    if subj.transaction_type:
+    if (
+        _should_emit_transaction_type(subj.transaction_type, allow_remove=allow_remove)
+        and subj.transaction_type
+    ):
         attribs["TransactionType"] = subj.transaction_type
     subj_elem = ET.Element(f"{{{ODM_NS}}}SubjectData", attribs)
     if subj.audit_record is not None:
@@ -1047,6 +1213,7 @@ def _build_subject_data_elem(
             subj_elem,
             subj.audit_record,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -1067,21 +1234,34 @@ def _build_subject_data_elem(
             subj_elem,
             ann,
             used_xml_ids=used_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
+    unscheduled_se_elem: ET.Element | None = None
     for se in subj.study_events:
         se_attribs: dict[str, str] = {"StudyEventOID": se.study_event_oid}
         if se.study_event_repeat_key is not None:
             se_attribs["StudyEventRepeatKey"] = se.study_event_repeat_key
-        if se.transaction_type:
+        if (
+            _should_emit_transaction_type(se.transaction_type, allow_remove=allow_remove)
+            and se.transaction_type
+        ):
             se_attribs["TransactionType"] = se.transaction_type
         se_elem = ET.SubElement(subj_elem, f"{{{ODM_NS}}}StudyEventData", se_attribs)
+        if (
+            se.study_event_oid == "SE.UNSCHEDULED"
+            and se.study_event_repeat_key is None
+            and unscheduled_se_elem is None
+        ):
+            unscheduled_se_elem = se_elem
         if se.audit_record is not None:
             _build_audit_record_elem(
                 se_elem,
                 se.audit_record,
                 used_xml_ids=used_xml_ids,
+                reserved_pool_ids=reserved_pool_ids,
                 mask_phi=mask_phi,
                 registry=registry,
             )
@@ -1090,6 +1270,8 @@ def _build_subject_data_elem(
                 se_elem,
                 ann,
                 used_xml_ids=used_xml_ids,
+                reserved_pool_ids=reserved_pool_ids,
+                allow_remove=allow_remove,
                 mask_phi=mask_phi,
                 registry=registry,
             )
@@ -1099,18 +1281,31 @@ def _build_subject_data_elem(
                 fd,
                 item_meta_by_oid=item_meta_by_oid,
                 used_xml_ids=used_xml_ids,
+                known_target_xml_ids=known_target_xml_ids,
+                reserved_pool_ids=reserved_pool_ids,
+                allow_remove=allow_remove,
                 mask_phi=mask_phi,
                 registry=registry,
             )
-    for fd in subj.forms:
-        _build_form_data_elem(
-            subj_elem,
-            fd,
-            item_meta_by_oid=item_meta_by_oid,
-            used_xml_ids=used_xml_ids,
-            mask_phi=mask_phi,
-            registry=registry,
-        )
+    if subj.forms:
+        if unscheduled_se_elem is None:
+            unscheduled_se_elem = ET.SubElement(
+                subj_elem,
+                f"{{{ODM_NS}}}StudyEventData",
+                {"StudyEventOID": "SE.UNSCHEDULED"},
+            )
+        for fd in subj.forms:
+            _build_form_data_elem(
+                unscheduled_se_elem,
+                fd,
+                item_meta_by_oid=item_meta_by_oid,
+                used_xml_ids=used_xml_ids,
+                known_target_xml_ids=known_target_xml_ids,
+                reserved_pool_ids=reserved_pool_ids,
+                allow_remove=allow_remove,
+                mask_phi=mask_phi,
+                registry=registry,
+            )
     return subj_elem
 
 
@@ -1198,6 +1393,9 @@ def _build_reference_data_elem(
     *,
     item_meta_by_oid: dict[str, tuple[str, str | None]],
     used_xml_ids: set[str],
+    known_target_xml_ids: set[str] | None = None,
+    reserved_pool_ids: set[str] | None = None,
+    allow_remove: bool = True,
     mask_phi: bool,
     registry: SensitivityRegistry,
 ) -> ET.Element:
@@ -1214,6 +1412,9 @@ def _build_reference_data_elem(
             ig,
             item_meta_by_oid=item_meta_by_oid,
             used_xml_ids=used_xml_ids,
+            known_target_xml_ids=known_target_xml_ids,
+            reserved_pool_ids=reserved_pool_ids,
+            allow_remove=allow_remove,
             mask_phi=mask_phi,
             registry=registry,
         )
@@ -1345,7 +1546,12 @@ def _build_study_metadata_elem(
             form_attribs[f"{{{IMEDNET_NS}}}FormId"] = str(norm_fid)
 
         form_elem = ET.SubElement(mdv_elem, f"{{{ODM_NS}}}FormDef", form_attribs)
-        ig_oid = f"IG_{form.formKey}"
+        raw_ig_oid = form.extraAttributes.get("itemGroupOID")
+        ig_oid = (
+            raw_ig_oid.strip()
+            if isinstance(raw_ig_oid, str) and raw_ig_oid.strip()
+            else f"IG_{form.formKey}"
+        )
         ig_ref_attribs: dict[str, str] = {
             "ItemGroupOID": ig_oid,
             "OrderNumber": "1",
@@ -1362,10 +1568,17 @@ def _build_study_metadata_elem(
         )
 
     # 3. ItemGroupDef elements
+    ig_oid_by_form_key: dict[str, str] = {}
     emitted_ig_oids: set[str] = set()
     referenced_role_codelists: dict[str, list[str]] = {}
     for f_idx, form in enumerate(sorted_forms):
-        ig_oid_val = f"IG_{form.formKey}"
+        raw_ig_oid_val = form.extraAttributes.get("itemGroupOID")
+        ig_oid_val = (
+            raw_ig_oid_val.strip()
+            if isinstance(raw_ig_oid_val, str) and raw_ig_oid_val.strip()
+            else f"IG_{form.formKey}"
+        )
+        ig_oid_by_form_key[form.formKey] = ig_oid_val
         emitted_ig_oids.add(ig_oid_val)
         ig_attribs: dict[str, str] = {
             "OID": ig_oid_val,
@@ -1503,7 +1716,7 @@ def _build_study_metadata_elem(
             vendor_item_attribs[f"{{{IMEDNET_NS}}}VariableType"] = vt_norm
         ref_forms = referencing_forms_by_oid.get(item_oid, [form_key])
         if any(
-            _default_unwrapped_name(item_oid, fk) != var.variableName
+            _default_unwrapped_name(item_oid, fk, ig_oid_by_form_key.get(fk)) != var.variableName
             or (fk and var.variableName.startswith((f"{fk}.", f"IT.{fk}.", f"IG_{fk}.")))
             for fk in ref_forms
         ):
@@ -1894,6 +2107,7 @@ def write_odm_xml_stream(
         )
 
         used_xml_ids: set[str] = set()
+        allow_remove = eff_file_type == "Transactional"
 
         for admin in admin_list:
             admin_elem = _build_admin_data_elem(
@@ -1910,11 +2124,32 @@ def write_odm_xml_stream(
                 is_binary,
             )
 
+        effective_clin_list = list(clin_list)
+        if subject_stream is not None and not effective_clin_list:
+            effective_clin_list = [
+                OdmClinicalData(
+                    studyOID=study_key,
+                    metaDataVersionOID=eff_mdv_oid,
+                )
+            ]
+
+        reserved_pool_ids: set[str] = set()
+        for clin_pre in effective_clin_list:
+            for ar_pre in clin_pre.audit_records:
+                if ar_pre.id:
+                    reserved_pool_ids.add(ar_pre.id)
+            for ann_pre in clin_pre.annotations:
+                if ann_pre.id:
+                    reserved_pool_ids.add(ann_pre.id)
+
         for ref in ref_list:
             ref_elem = _build_reference_data_elem(
                 ref,
                 item_meta_by_oid=item_meta_by_oid,
                 used_xml_ids=used_xml_ids,
+                known_target_xml_ids=reserved_pool_ids,
+                reserved_pool_ids=reserved_pool_ids,
+                allow_remove=allow_remove,
                 mask_phi=mask_phi,
                 registry=registry,
             )
@@ -1925,21 +2160,21 @@ def write_odm_xml_stream(
                 is_binary,
             )
 
-        effective_clin_list = list(clin_list)
-        if subject_stream is not None and not effective_clin_list:
-            effective_clin_list = [
-                OdmClinicalData(
-                    studyOID=study_key,
-                    metaDataVersionOID=eff_mdv_oid,
-                )
-            ]
-
         for c_idx, clin in enumerate(effective_clin_list):
             clin_study = _xml_escape_attr(clin.study_oid)
             clin_mdv = _xml_escape_attr(clin.metadata_version_oid)
             subjects_iter: Iterable[OdmSubjectData] = (
                 subject_stream if (c_idx == 0 and subject_stream is not None) else clin.subjects
             )
+
+            # Pre-register pool AuditRecord and Annotation XML IDs before streaming SubjectData
+            clin_pool_ids: set[str] = set(reserved_pool_ids)
+            for ar_pool in clin.audit_records:
+                if ar_pool.id:
+                    clin_pool_ids.add(ar_pool.id)
+            for ann_pool in clin.annotations:
+                if ann_pool.id:
+                    clin_pool_ids.add(ann_pool.id)
 
             opened_clin = False
 
@@ -1963,6 +2198,9 @@ def write_odm_xml_stream(
                     subj,
                     item_meta_by_oid=item_meta_by_oid,
                     used_xml_ids=used_xml_ids,
+                    known_target_xml_ids=clin_pool_ids,
+                    reserved_pool_ids=reserved_pool_ids,
+                    allow_remove=allow_remove,
                     mask_phi=mask_phi,
                     registry=registry,
                 )
@@ -1982,6 +2220,8 @@ def write_odm_xml_stream(
                         ars_elem,
                         ar,
                         used_xml_ids=used_xml_ids,
+                        reserved_pool_ids=reserved_pool_ids,
+                        is_pool_element=True,
                         mask_phi=mask_phi,
                         registry=registry,
                     )
@@ -2001,6 +2241,9 @@ def write_odm_xml_stream(
                         anns_elem,
                         ann,
                         used_xml_ids=used_xml_ids,
+                        reserved_pool_ids=reserved_pool_ids,
+                        is_pool_element=True,
+                        allow_remove=allow_remove,
                         mask_phi=mask_phi,
                         registry=registry,
                     )

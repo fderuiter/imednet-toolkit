@@ -15,8 +15,10 @@ from unittest.mock import NonCallableMock
 
 from imednet.core.context import sdk_governance_context
 from imednet.datadict.cdisc_builders import (
+    UNSCHEDULED_EVENT_OID,
     _coerce_dataset_json_cell,
     build_datadict_from_sdk_metadata,
+    build_dataset_json_bundle,
     build_dataset_json_envelope,
     build_odm_archive,
     load_dataset_json,
@@ -25,10 +27,8 @@ from imednet.datadict.cdisc_builders import (
 )
 from imednet.datadict.emit import write_odm_xml_stream
 from imednet.datadict.exchange import (
-    DatasetJsonClinicalData,
+    DatasetJsonColumn,
     DatasetJsonEnvelope,
-    DatasetJsonItem,
-    DatasetJsonItemGroup,
     OdmReferenceData,
 )
 from imednet.datadict.loaders.cdisc_odm import load_odm_archive
@@ -46,14 +46,17 @@ from imednet.integrations.sink_base import (
     ExportSink,
     SinkConfig,
     apply_quality_gate,
+    commit_sdtm_lineage,
     deduplicate_sdtm_rows,
     extract_record_id,
     is_incremental_sink_config,
     iter_batches,
+    rehydrate_sdtm_lineage,
     resolve_voided_sdtm_keys,
     run_streaming_export,
     should_preserve_sdtm_record_id,
 )
+from imednet.models.sdtm import build_form_sdtm_domain_map
 
 if TYPE_CHECKING:
     from imednet.sdk import ImednetSDK
@@ -234,16 +237,46 @@ def _extract_existing_odm_records(
     oid_to_var: dict[tuple[str, str], str] = {}
     ig_oid_to_form_key: dict[str, str] = {}
     for form in dd.forms:
-        for ig_oid in (f"IG.{form.formKey}", f"IG_{form.formKey}"):
+        extra_form = form.extraAttributes if isinstance(form.extraAttributes, Mapping) else {}
+        preserved_ig = extra_form.get("itemGroupOID")
+        ig_oids = [f"IG.{form.formKey}", f"IG_{form.formKey}"]
+        if isinstance(preserved_ig, str) and preserved_ig.strip():
+            ig_oids.append(preserved_ig.strip())
+        for ig_oid in ig_oids:
             ig_oid_to_form_key[ig_oid] = form.formKey
-            for var in form.variables:
-                for cand_oid in (
-                    var.variableName,
-                    f"{form.formKey}.{var.variableName}",
-                    f"IT.{form.formKey}.{var.variableName}",
-                ):
-                    oid_to_var[(form.formKey, cand_oid)] = var.variableName
+        for var in form.variables:
+            extra_var = var.extraAttributes if isinstance(var.extraAttributes, Mapping) else {}
+            preserved_it = extra_var.get("itemOID")
+            cand_oids = [
+                var.variableName,
+                f"{form.formKey}.{var.variableName}",
+                f"IT.{form.formKey}.{var.variableName}",
+            ]
+            if isinstance(preserved_it, str) and preserved_it.strip():
+                cand_oids.append(preserved_it.strip())
+            for cand_oid in cand_oids:
+                oid_to_var[(form.formKey, cand_oid)] = var.variableName
+                for ig_oid in ig_oids:
                     oid_to_var[(ig_oid, cand_oid)] = var.variableName
+
+    se_oid_to_interval_name: dict[str, str] = {}
+    visits_meta = (
+        dd.metadata.extraAttributes.get("visits")
+        if isinstance(dd.metadata.extraAttributes, Mapping)
+        else None
+    )
+    if isinstance(visits_meta, Sequence):
+        for v_entry in visits_meta:
+            if isinstance(v_entry, Mapping):
+                v_oid = v_entry.get("oid")
+                v_name = v_entry.get("name")
+                if (
+                    isinstance(v_oid, str)
+                    and v_oid.strip()
+                    and isinstance(v_name, str)
+                    and v_name.strip()
+                ):
+                    se_oid_to_interval_name[v_oid.strip()] = v_name.strip()
 
     def _collect_item_groups(
         item_groups: Sequence[Any],
@@ -252,8 +285,13 @@ def _extract_existing_odm_records(
         subj_key: str | None,
         site_oid: str | None,
         visit_id: int | None,
+        interval_name: str | None,
+        study_event_oid: str | None,
+        study_event_repeat_key: str | None,
     ) -> None:
         for ig in item_groups:
+            if getattr(ig, "transaction_type", None) == "Remove":
+                continue
             rep_key = ig.item_group_repeat_key
             if rep_key and rep_key in exclude_record_ids:
                 continue
@@ -267,7 +305,11 @@ def _extract_existing_odm_records(
                     rec_oid = rep_key
             rec_data: dict[str, Any] = {}
             for item in ig.items:
-                vname = oid_to_var.get((form_key, item.item_oid))
+                if getattr(item, "transaction_type", None) == "Remove":
+                    continue
+                vname = oid_to_var.get((form_key, item.item_oid)) or oid_to_var.get(
+                    (ig.item_group_oid, item.item_oid)
+                )
                 if vname is None:
                     for prefix in (f"IT.{form_key}.", f"{form_key}."):
                         if item.item_oid.startswith(prefix):
@@ -276,20 +318,24 @@ def _extract_existing_odm_records(
                     else:
                         vname = item.item_oid
                 rec_data[vname] = None if item.is_null else item.value
-            retained.append(
-                {
-                    "study_key": study_key,
-                    "subject_key": subj_key,
-                    "site_name": (
-                        site_oid[4:] if site_oid and site_oid.startswith("LOC.") else site_oid
-                    ),
-                    "visit_id": visit_id,
-                    "form_key": form_key,
-                    "record_id": rec_id,
-                    "record_oid": rec_oid,
-                    "record_data": rec_data,
-                }
-            )
+            rec_entry: dict[str, Any] = {
+                "study_key": study_key,
+                "subject_key": subj_key,
+                "site_name": (
+                    site_oid[4:] if site_oid and site_oid.startswith("LOC.") else site_oid
+                ),
+                "visit_id": visit_id,
+                "interval_name": interval_name,
+                "form_key": form_key,
+                "record_id": rec_id,
+                "record_oid": rec_oid,
+                "record_data": rec_data,
+            }
+            if study_event_oid:
+                rec_entry["study_event_oid"] = study_event_oid
+            if study_event_repeat_key is not None:
+                rec_entry["study_event_repeat_key"] = study_event_repeat_key
+            retained.append(rec_entry)
 
     def _collect_form_records(
         fd: Any,
@@ -297,7 +343,12 @@ def _extract_existing_odm_records(
         subj_key: str | None,
         site_oid: str | None,
         visit_id: int | None,
+        interval_name: str | None,
+        study_event_oid: str | None,
+        study_event_repeat_key: str | None,
     ) -> None:
+        if getattr(fd, "transaction_type", None) == "Remove":
+            return
         form_key = fd.form_oid.removeprefix("F.")
         _collect_item_groups(
             fd.item_groups,
@@ -305,11 +356,16 @@ def _extract_existing_odm_records(
             subj_key=subj_key,
             site_oid=site_oid,
             visit_id=visit_id,
+            interval_name=interval_name,
+            study_event_oid=study_event_oid,
+            study_event_repeat_key=study_event_repeat_key,
         )
 
     retained: list[dict[str, Any]] = []
     for ref_container in getattr(existing_archive, "reference_data", ()):
         for ig in ref_container.item_groups:
+            if getattr(ig, "transaction_type", None) == "Remove":
+                continue
             mapped_fk = ig_oid_to_form_key.get(ig.item_group_oid)
             if mapped_fk is not None:
                 _collect_item_groups(
@@ -318,20 +374,36 @@ def _extract_existing_odm_records(
                     subj_key=None,
                     site_oid=None,
                     visit_id=None,
+                    interval_name=None,
+                    study_event_oid=None,
+                    study_event_repeat_key=None,
                 )
     for cdata in existing_archive.clinical_data:
         for subj in cdata.subjects:
+            if getattr(subj, "transaction_type", None) == "Remove":
+                continue
             site_oid = subj.site_location_oid
             for se in subj.study_events:
+                if getattr(se, "transaction_type", None) == "Remove":
+                    continue
                 visit_id: int | None = None
                 if se.study_event_repeat_key and se.study_event_repeat_key.isdigit():
                     visit_id = int(se.study_event_repeat_key)
+                is_scheduled = se.study_event_oid != UNSCHEDULED_EVENT_OID
+                interval_name = (
+                    se_oid_to_interval_name.get(se.study_event_oid, se.study_event_oid)
+                    if is_scheduled
+                    else None
+                )
                 for fd in se.forms:
                     _collect_form_records(
                         fd,
                         subj_key=subj.subject_key,
                         site_oid=site_oid,
                         visit_id=visit_id,
+                        interval_name=interval_name,
+                        study_event_oid=se.study_event_oid if is_scheduled else None,
+                        study_event_repeat_key=se.study_event_repeat_key if is_scheduled else None,
                     )
             for fd in subj.forms:
                 _collect_form_records(
@@ -339,6 +411,9 @@ def _extract_existing_odm_records(
                     subj_key=subj.subject_key,
                     site_oid=site_oid,
                     visit_id=None,
+                    interval_name=None,
+                    study_event_oid=None,
+                    study_event_repeat_key=None,
                 )
     return retained
 
@@ -346,9 +421,14 @@ def _extract_existing_odm_records(
 def _retain_static_odm_reference_data(existing_archive: Any) -> list[OdmReferenceData]:
     """Return non-form static ``OdmReferenceData`` blocks from *existing_archive*."""
     dd = existing_archive.data_dictionary
-    form_ig_oids = {
-        ig_oid for form in dd.forms for ig_oid in (f"IG.{form.formKey}", f"IG_{form.formKey}")
-    }
+    form_ig_oids: set[str] = set()
+    for form in dd.forms:
+        form_ig_oids.add(f"IG.{form.formKey}")
+        form_ig_oids.add(f"IG_{form.formKey}")
+        extra_form = form.extraAttributes if isinstance(form.extraAttributes, Mapping) else {}
+        preserved_ig = extra_form.get("itemGroupOID")
+        if isinstance(preserved_ig, str) and preserved_ig.strip():
+            form_ig_oids.add(preserved_ig.strip())
     static_refs: list[OdmReferenceData] = []
     for ref_container in getattr(existing_archive, "reference_data", ()):
         kept_igs = tuple(
@@ -574,52 +654,53 @@ class _OdmArchiveSink(ExportSink):
                 in allowed_vnames
             ]
 
-        dd = self._data_dictionary or build_datadict_from_sdk_metadata(
-            self._study_key,
-            forms=forms,
-            variables=variables,
-            intervals=intervals,
-        )
-        archive = build_odm_archive(
-            self._study_key,
-            data_dictionary=dd,
-            forms=forms,
-            variables=variables,
-            intervals=intervals,
-            subjects=subjects,
-            visits=visits,
-            records=merged_records,
-            revisions=revisions,
-            queries=queries,
-            sites=sites,
-            users=users,
-            reference_data=existing_ref_data,
-            metadata_version_oid=self._metadata_version_oid,
-            file_oid=self._file_oid or prior_file_oid,
-            creation_datetime=self._creation_datetime or prior_creation_dt,
-            mask_phi=self.config.mask_phi,
-            custom_phi_keys=self._phi_keys or None,
-            enrichment_pipeline=self._pipeline,
-            include_deleted=self.config.include_deleted,
-        )
+        with sdk_governance_context(self._sdk):
+            dd = self._data_dictionary or build_datadict_from_sdk_metadata(
+                self._study_key,
+                forms=forms,
+                variables=variables,
+                intervals=intervals,
+            )
+            archive = build_odm_archive(
+                self._study_key,
+                data_dictionary=dd,
+                forms=forms,
+                variables=variables,
+                intervals=intervals,
+                subjects=subjects,
+                visits=visits,
+                records=merged_records,
+                revisions=revisions,
+                queries=queries,
+                sites=sites,
+                users=users,
+                reference_data=existing_ref_data,
+                metadata_version_oid=self._metadata_version_oid,
+                file_oid=self._file_oid or prior_file_oid,
+                creation_datetime=self._creation_datetime or prior_creation_dt,
+                mask_phi=self.config.mask_phi,
+                custom_phi_keys=self._phi_keys or None,
+                enrichment_pipeline=self._pipeline,
+                include_deleted=self.config.include_deleted,
+            )
 
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = (
-            self._path.parent / f".{self._path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
-        )
-        try:
-            with tmp_path.open("w", encoding="utf-8") as fh:
-                write_odm_xml_stream(
-                    archive,
-                    fh,
-                    mask_phi=self.config.mask_phi,
-                    custom_phi_keys=self._phi_keys or None,
-                )
-            os.replace(tmp_path, self._path)
-        except Exception:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink(missing_ok=True)
-            raise
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = (
+                self._path.parent / f".{self._path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+            )
+            try:
+                with tmp_path.open("w", encoding="utf-8") as fh:
+                    write_odm_xml_stream(
+                        archive,
+                        fh,
+                        mask_phi=self.config.mask_phi,
+                        custom_phi_keys=self._phi_keys or None,
+                    )
+                os.replace(tmp_path, self._path)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
+                raise
 
         _append_file_manifest(
             self._manifest_path,
@@ -636,25 +717,53 @@ class _OdmArchiveSink(ExportSink):
         self._voided_ids.clear()
 
 
-def _merge_dataset_json_item_groups(
-    prior_group: DatasetJsonItemGroup,
-    delta_group: DatasetJsonItemGroup | None,
+def _seed_sdtm_counters_from_envelope(
+    env: DatasetJsonEnvelope,
+    domain_seq_counters: dict[str, dict[str, int]],
+) -> None:
+    """Ensure ``domain_seq_counters`` never assigns below existing ``<DOM>SEQ`` values on disk."""
+    dom = env.name.strip().upper()
+    seq_col = f"{dom}SEQ"
+    col_names = [c.name for c in env.columns]
+    if "USUBJID" not in col_names or seq_col not in col_names:
+        return
+    usubjid_idx = col_names.index("USUBJID")
+    seq_idx = col_names.index(seq_col)
+    dom_bucket = domain_seq_counters.setdefault(dom, {})
+    for row in env.rows:
+        if len(row) <= max(usubjid_idx, seq_idx):
+            continue
+        usubjid = row[usubjid_idx]
+        seq_val = row[seq_idx]
+        if (
+            isinstance(usubjid, str)
+            and usubjid.strip()
+            and isinstance(seq_val, int)
+            and not isinstance(seq_val, bool)
+            and seq_val > dom_bucket.get(usubjid, 0)
+        ):
+            dom_bucket[usubjid] = seq_val
+
+
+def _merge_dataset_json_envelopes(
+    prior_env: DatasetJsonEnvelope,
+    delta_env: DatasetJsonEnvelope | None,
     *,
     voided_record_ids: set[str],
     voided_sdtm_keys: set[tuple[Any, ...]],
-) -> DatasetJsonItemGroup:
-    """Merge an existing ``DatasetJsonItemGroup`` with delta updates and voided deletions."""
-    prior_col_names = [it.name for it in prior_group.items]
+    creation_datetime_override: str | None = None,
+    file_oid_override: str | None = None,
+) -> DatasetJsonEnvelope:
+    """Merge an existing flat Dataset-JSON v1.1 envelope with delta updates and voided deletions."""
+    prior_col_names = [col.name for col in prior_env.columns]
     prior_rows: list[dict[str, Any]] = [
-        dict(zip(prior_col_names, row, strict=False)) for row in prior_group.item_data
+        dict(zip(prior_col_names, row, strict=False)) for row in prior_env.rows
     ]
 
     delta_rows: list[dict[str, Any]] = []
-    if delta_group is not None:
-        delta_col_names = [it.name for it in delta_group.items]
-        delta_rows = [
-            dict(zip(delta_col_names, row, strict=False)) for row in delta_group.item_data
-        ]
+    if delta_env is not None:
+        delta_col_names = [col.name for col in delta_env.columns]
+        delta_rows = [dict(zip(delta_col_names, row, strict=False)) for row in delta_env.rows]
 
     def _row_rec_id(row: Mapping[str, Any]) -> str | None:
         for k in ("recordId", "record_id", "RECORD_ID"):
@@ -668,7 +777,7 @@ def _merge_dataset_json_item_groups(
         usubjid = row.get("USUBJID")
         if not st_id or not usubjid:
             return None
-        dom = str(row.get("DOMAIN") or prior_group.name).strip().upper()
+        dom = str(row.get("DOMAIN") or prior_env.name).strip().upper()
         if dom == "DM":
             return (str(st_id), "DM", str(usubjid), None, None)
         seq_col = f"{dom}SEQ"
@@ -694,37 +803,39 @@ def _merge_dataset_json_item_groups(
         kept_prior.append(prow)
 
     combined_rows = [*kept_prior, *delta_rows]
-    if prior_group.name.strip().upper() == "DM":
+    if prior_env.name.strip().upper() == "DM":
         combined_rows = deduplicate_sdtm_rows(combined_rows)
 
-    # Unify items preserving prior order then appending new delta columns
-    unified_items_by_name: dict[str, DatasetJsonItem] = {it.name: it for it in prior_group.items}
-    ordered_names = list(prior_col_names)
-    if delta_group is not None:
-        for d_it in delta_group.items:
-            if d_it.name not in unified_items_by_name:
-                unified_items_by_name[d_it.name] = d_it
-                ordered_names.append(d_it.name)
-            elif unified_items_by_name[d_it.name].type != d_it.type:
-                # Widen type mismatch to string
-                base_it = unified_items_by_name[d_it.name]
-                unified_items_by_name[d_it.name] = DatasetJsonItem(
-                    OID=base_it.oid,
-                    name=base_it.name,
-                    label=base_it.label,
-                    type="string",
-                    length=base_it.length,
-                    displayFormat=base_it.display_format,
-                    keySequence=base_it.key_sequence,
+    unified_cols_by_name: dict[str, DatasetJsonColumn] = {
+        col.name: col for col in prior_env.columns if col.name != "ITEMGROUPDATASEQ"
+    }
+    ordered_names = [n for n in prior_col_names if n != "ITEMGROUPDATASEQ"]
+    if delta_env is not None:
+        for d_col in delta_env.columns:
+            if d_col.name == "ITEMGROUPDATASEQ":
+                continue
+            if d_col.name not in unified_cols_by_name:
+                unified_cols_by_name[d_col.name] = d_col
+                ordered_names.append(d_col.name)
+            elif unified_cols_by_name[d_col.name].data_type != d_col.data_type:
+                base_col = unified_cols_by_name[d_col.name]
+                unified_cols_by_name[d_col.name] = DatasetJsonColumn(
+                    itemOID=base_col.item_oid,
+                    name=base_col.name,
+                    label=base_col.label,
+                    dataType="string",
+                    targetDataType=None,
+                    length=base_col.length,
+                    displayFormat=base_col.display_format,
+                    keySequence=base_col.key_sequence,
                 )
 
-    final_items = tuple(unified_items_by_name[n] for n in ordered_names)
+    final_cols = tuple(unified_cols_by_name[n] for n in ordered_names)
 
-    # Sort deterministically by keySequence columns when available
     key_cols = [
-        it.name
-        for it in sorted(
-            (i for i in final_items if i.key_sequence is not None),
+        col.name
+        for col in sorted(
+            (c for c in final_cols if c.key_sequence is not None),
             key=lambda x: x.key_sequence or 0,
         )
     ]
@@ -738,19 +849,51 @@ def _merge_dataset_json_item_groups(
             )
         )
 
-    for idx_seq, r_dict in enumerate(combined_rows, 1):
-        r_dict["ITEMGROUPDATASEQ"] = idx_seq
-
     tuple_rows = tuple(
-        tuple(_coerce_dataset_json_cell(r.get(it.name), it.type) for it in final_items)
+        tuple(_coerce_dataset_json_cell(r.get(col.name), col.data_type) for col in final_cols)
         for r in combined_rows
     )
-    return DatasetJsonItemGroup(
+
+    resolved_dt = (
+        creation_datetime_override
+        if creation_datetime_override
+        else (
+            max(prior_env.dataset_json_creation_datetime, delta_env.dataset_json_creation_datetime)
+            if delta_env is not None
+            else prior_env.dataset_json_creation_datetime
+        )
+    )
+    resolved_db_dt: str | None = prior_env.db_last_modified_datetime
+    if (
+        delta_env is not None
+        and delta_env.db_last_modified_datetime is not None
+        and (resolved_db_dt is None or delta_env.db_last_modified_datetime > resolved_db_dt)
+    ):
+        resolved_db_dt = delta_env.db_last_modified_datetime
+
+    return DatasetJsonEnvelope(
+        datasetJSONCreationDateTime=resolved_dt,
+        datasetJSONVersion="1.1.0",
+        fileOID=file_oid_override or prior_env.file_oid,
+        dbLastModifiedDateTime=resolved_db_dt,
+        originator=delta_env.originator if delta_env is not None else prior_env.originator,
+        sourceSystem=delta_env.source_system if delta_env is not None else prior_env.source_system,
+        studyOID=delta_env.study_oid if delta_env is not None else prior_env.study_oid,
+        metaDataVersionOID=(
+            delta_env.metadata_version_oid
+            if delta_env is not None
+            else prior_env.metadata_version_oid
+        ),
+        metaDataRef=delta_env.metadata_ref if delta_env is not None else prior_env.metadata_ref,
+        itemGroupOID=prior_env.item_group_oid,
+        isReferenceData=(
+            delta_env.is_reference_data if delta_env is not None else prior_env.is_reference_data
+        ),
         records=len(tuple_rows),
-        name=prior_group.name,
-        label=delta_group.label if delta_group is not None else prior_group.label,
-        items=final_items,
-        itemData=tuple_rows,
+        name=prior_env.name,
+        label=delta_env.label if delta_env is not None else prior_env.label,
+        columns=final_cols,
+        rows=tuple_rows,
     )
 
 
@@ -799,7 +942,10 @@ class _DatasetJsonSink(ExportSink):
         self._staged_by_id: dict[str, Any] = {}
         self._unkeyed_records: list[Any] = []
         self._voided_ids: set[str] = set()
+        self._voided_records: list[Any] = []
         self._voided_sdtm_keys: set[tuple[Any, ...]] = set()
+        self._sdtm_lineage: dict[str, dict[str, Any]] = {}
+        self._sdtm_seq_watermarks: dict[str, int] = {}
         self._flushed = False
 
     def write_batch(self, records: Sequence[Any], *, batch_id: str) -> int:
@@ -826,6 +972,11 @@ class _DatasetJsonSink(ExportSink):
 
         def _reconcile() -> int:
             reconciled = 0
+            effective_sdtm = (
+                bool(self.config.as_sdtm)
+                if getattr(self.config, "_as_sdtm_explicit", False)
+                else bool(self.config.as_sdtm or self.config.sdtm_domain)
+            )
             for rec in records:
                 rid = extract_record_id(rec)
                 if rid is not None and not isinstance(rid, bool):
@@ -833,7 +984,9 @@ class _DatasetJsonSink(ExportSink):
                     self._staged_by_id.pop(rid_str, None)
                     self._voided_ids.add(rid_str)
                     reconciled += 1
-            if self.config.as_sdtm and records:
+                if effective_sdtm:
+                    self._voided_records.append(rec)
+            if effective_sdtm and records:
                 for entry in resolve_voided_sdtm_keys(
                     records,
                     self,
@@ -853,14 +1006,14 @@ class _DatasetJsonSink(ExportSink):
         return self._execute_with_retry("reconcile_dataset_json_deleted", batch_id, _reconcile)
 
     def flush(self) -> None:
-        """Build or incrementally merge the Dataset-JSON v1.1 envelope and write atomically."""
+        """Build or incrementally merge the Dataset-JSON v1.1 envelope(s) and write atomically."""
         if self._flushed:
             return
         self._flushed = True
 
         is_incremental = is_incremental_sink_config(self.config)
         staged_records = [*self._staged_by_id.values(), *self._unkeyed_records]
-        has_voided = bool(self._voided_ids or self._voided_sdtm_keys)
+        has_voided = bool(self._voided_ids or self._voided_sdtm_keys or self._voided_records)
 
         is_dir_target = self._path.is_dir() or self._path.suffix == ""
         if (
@@ -873,187 +1026,244 @@ class _DatasetJsonSink(ExportSink):
         ):
             return
 
-        forms = _safe_fetch_sdk_items(self._sdk, self._study_key, "forms", "get_forms")
-        visits = _safe_fetch_sdk_items(self._sdk, self._study_key, "visits", "get_visits")
-        variables = (
-            []
-            if self.config.as_sdtm
-            else _safe_fetch_sdk_items(self._sdk, self._study_key, "variables", "get_variables")
-        )
-        effective_preserve_rec_id = should_preserve_sdtm_record_id(
-            self.config,
-            self._preserve_record_id,
+        effective_sdtm = (
+            bool(self.config.as_sdtm)
+            if getattr(self.config, "_as_sdtm_explicit", False)
+            else bool(self.config.as_sdtm or self.config.sdtm_domain)
         )
 
-        delta_envelope = build_dataset_json_envelope(
-            self._study_key,
-            records=staged_records,
-            forms=forms,
-            variables=variables,
-            visits=visits,
-            as_sdtm=self.config.as_sdtm,
-            sdtm_domain=self.config.sdtm_domain,
-            use_labels_as_columns=self._use_labels_as_columns,
-            variable_whitelist=self._variable_whitelist,
-            form_whitelist=self._form_whitelist,
-            naming_convention=self.config.naming_convention,
-            preserve_record_id=effective_preserve_rec_id,
-            include_deleted=self.config.include_deleted,
-            mask_phi=self.config.mask_phi,
-            custom_phi_keys=self._phi_keys or None,
-            enrichment_pipeline=self._pipeline,
-            metadata_version_oid=self._metadata_version_oid,
-            file_oid=self._file_oid,
-            creation_datetime=self._creation_datetime,
-        )
+        with sdk_governance_context(self._sdk):
+            forms = _safe_fetch_sdk_items(self._sdk, self._study_key, "forms", "get_forms")
+            visits = _safe_fetch_sdk_items(self._sdk, self._study_key, "visits", "get_visits")
+            variables = (
+                []
+                if effective_sdtm
+                else _safe_fetch_sdk_items(
+                    self._sdk,
+                    self._study_key,
+                    "variables",
+                    "get_variables",
+                )
+            )
+            effective_preserve_rec_id = should_preserve_sdtm_record_id(
+                self.config,
+                self._preserve_record_id,
+            )
 
-        if is_dir_target:
-            self._path.mkdir(parents=True, exist_ok=True)
-            delta_clin = delta_envelope.clinical_data
-            delta_groups = delta_clin.item_group_data if delta_clin is not None else {}
+            domain_seq_counters: dict[str, dict[str, int]] | None = None
+            seq_overrides: dict[str, int] | None = None
+            lineage_updates: dict[str, dict[str, Any]] = {}
 
-            prior_by_oid: dict[str, tuple[Path, DatasetJsonEnvelope, DatasetJsonItemGroup]] = {}
-            if self.config.idempotent and (is_incremental or has_voided):
-                for existing_file in sorted(self._path.glob("*.json")):
-                    try:
-                        p_env = load_dataset_json(existing_file)
-                        if p_env.clinical_data is not None:
-                            for p_oid, p_grp in p_env.clinical_data.item_group_data.items():
-                                prior_by_oid[p_oid] = (existing_file, p_env, p_grp)
-                    except Exception as exc:
-                        logger.warning(
-                            "Skipping unreadable Dataset-JSON file '%s': %s",
-                            existing_file,
-                            exc,
+            if effective_sdtm:
+                form_domain_map = build_form_sdtm_domain_map(
+                    forms,
+                    study_config=getattr(self._pipeline, "config", None),
+                    study_key=self._study_key,
+                )
+                domain_seq_counters, seq_overrides, _ = rehydrate_sdtm_lineage(
+                    self,
+                    study_key=self._study_key,
+                )
+                if self._voided_records:
+                    for entry in resolve_voided_sdtm_keys(
+                        self._voided_records,
+                        self,
+                        study_key=self._study_key,
+                        sdtm_domain=self.config.sdtm_domain,
+                        form_domain_map=form_domain_map,
+                    ):
+                        self._voided_sdtm_keys.add(
+                            (
+                                entry.get("study_id"),
+                                entry.get("domain"),
+                                entry.get("usubjid"),
+                                entry.get("seq_col"),
+                                entry.get("seq_val"),
+                            )
                         )
 
-            total_rows = 0
-            all_oids = sorted(set(prior_by_oid) | set(delta_groups))
-            for ig_oid in all_oids:
-                d_grp = delta_groups.get(ig_oid)
-                if ig_oid in prior_by_oid:
-                    dest_file, p_env, p_grp = prior_by_oid[ig_oid]
-                    merged_grp = _merge_dataset_json_item_groups(
-                        p_grp,
-                        d_grp if (d_grp is not None and d_grp.records > 0) else None,
-                        voided_record_ids=self._voided_ids,
-                        voided_sdtm_keys=self._voided_sdtm_keys,
-                    )
-                    resolved_dt = (
-                        self._creation_datetime
-                        if self._creation_datetime
-                        else max(p_env.creation_datetime, delta_envelope.creation_datetime)
-                    )
-                    f_oid = self._file_oid or p_env.file_oid
-                else:
-                    assert d_grp is not None
-                    merged_grp = d_grp
-                    dest_file = self._path / f"{make_oid_slug(d_grp.name).lower()}.json"
-                    resolved_dt = delta_envelope.creation_datetime
-                    f_oid = (
-                        f"{self._file_oid}.{make_oid_slug(d_grp.name)}"
-                        if self._file_oid
-                        else f"DSJ.{make_oid_slug(self._study_key)}.{make_oid_slug(d_grp.name)}"
-                    )
-
-                per_dom_env = DatasetJsonEnvelope(
-                    creationDateTime=resolved_dt,
-                    datasetJSONVersion="1.1.0",
-                    fileOID=f_oid,
-                    originator=delta_envelope.originator,
-                    sourceSystem=delta_envelope.source_system,
-                    sourceSystemVersion=delta_envelope.source_system_version,
-                    clinicalData=DatasetJsonClinicalData(
-                        studyOID=self._study_key,
-                        metaDataVersionOID=self._metadata_version_oid,
-                        itemGroupData={ig_oid: merged_grp},
-                    ),
-                )
-                _atomic_write_text(dest_file, to_dataset_json(per_dom_env, indent=self._indent))
-                total_rows += merged_grp.records
-                _append_file_manifest(
-                    self._manifest_path,
-                    destination="dataset_json",
-                    study_key=self._study_key,
-                    row_count=merged_grp.records,
-                    file_path=dest_file,
-                )
-            return
-
-        final_envelope = delta_envelope
-        if (
-            self.config.idempotent
-            and (is_incremental or has_voided)
-            and self._path.exists()
-            and self._path.stat().st_size > 0
-        ):
-            try:
-                prior_envelope = load_dataset_json(self._path)
-                if (
-                    prior_envelope.clinical_data is not None
-                    and delta_envelope.clinical_data is not None
-                ):
-                    prior_groups = prior_envelope.clinical_data.item_group_data
-                    delta_groups = delta_envelope.clinical_data.item_group_data
-                    merged_groups: dict[str, DatasetJsonItemGroup] = {}
-                    for ig_oid in sorted(set(prior_groups) | set(delta_groups)):
-                        if ig_oid in prior_groups:
-                            d_grp = delta_groups.get(ig_oid)
-                            merged_groups[ig_oid] = _merge_dataset_json_item_groups(
-                                prior_groups[ig_oid],
-                                d_grp if (d_grp is not None and d_grp.records > 0) else None,
-                                voided_record_ids=self._voided_ids,
-                                voided_sdtm_keys=self._voided_sdtm_keys,
+            if is_dir_target:
+                self._path.mkdir(parents=True, exist_ok=True)
+                prior_by_oid: dict[str, tuple[Path, DatasetJsonEnvelope]] = {}
+                if self.config.idempotent and (is_incremental or has_voided):
+                    for existing_file in sorted(self._path.glob("*.json")):
+                        try:
+                            p_env = load_dataset_json(existing_file)
+                            prior_by_oid[p_env.item_group_oid] = (existing_file, p_env)
+                            if effective_sdtm and domain_seq_counters is not None:
+                                _seed_sdtm_counters_from_envelope(p_env, domain_seq_counters)
+                        except Exception as exc:
+                            logger.warning(
+                                "Skipping unreadable Dataset-JSON file '%s': %s",
+                                existing_file,
+                                exc,
                             )
-                        else:
-                            merged_groups[ig_oid] = delta_groups[ig_oid]
-                    resolved_dt = max(
-                        prior_envelope.creation_datetime,
-                        delta_envelope.creation_datetime,
+
+                delta_datasets: dict[str, DatasetJsonEnvelope] = {}
+                if staged_records or not prior_by_oid:
+                    bundle = build_dataset_json_bundle(
+                        self._study_key,
+                        records=staged_records,
+                        forms=forms,
+                        variables=variables,
+                        visits=visits,
+                        as_sdtm=effective_sdtm,
+                        sdtm_domain=self.config.sdtm_domain,
+                        use_labels_as_columns=self._use_labels_as_columns,
+                        variable_whitelist=self._variable_whitelist,
+                        form_whitelist=self._form_whitelist,
+                        naming_convention=self.config.naming_convention,
+                        preserve_record_id=effective_preserve_rec_id,
+                        include_deleted=self.config.include_deleted,
+                        mask_phi=self.config.mask_phi,
+                        custom_phi_keys=self._phi_keys or None,
+                        enrichment_pipeline=self._pipeline,
+                        metadata_version_oid=self._metadata_version_oid,
+                        file_oid=self._file_oid,
+                        creation_datetime=self._creation_datetime,
+                        domain_seq_counters=domain_seq_counters,
+                        seq_overrides=seq_overrides,
+                        lineage_out=lineage_updates if effective_sdtm else None,
                     )
-                    final_envelope = DatasetJsonEnvelope(
-                        creationDateTime=(
-                            self._creation_datetime if self._creation_datetime else resolved_dt
-                        ),
-                        datasetJSONVersion="1.1.0",
-                        fileOID=self._file_oid or prior_envelope.file_oid,
-                        originator=delta_envelope.originator,
-                        sourceSystem=delta_envelope.source_system,
-                        sourceSystemVersion=delta_envelope.source_system_version,
-                        clinicalData=DatasetJsonClinicalData(
-                            studyOID=self._study_key,
-                            metaDataVersionOID=self._metadata_version_oid,
-                            itemGroupData=merged_groups,
-                        ),
+                    delta_datasets = dict(bundle.datasets)
+
+                all_oids = sorted(set(prior_by_oid) | set(delta_datasets))
+                for ig_oid in all_oids:
+                    d_env = delta_datasets.get(ig_oid)
+                    if ig_oid in prior_by_oid:
+                        dest_file, p_env = prior_by_oid[ig_oid]
+                        per_dom_env = _merge_dataset_json_envelopes(
+                            p_env,
+                            d_env if (d_env is not None and d_env.records > 0) else None,
+                            voided_record_ids=self._voided_ids,
+                            voided_sdtm_keys=self._voided_sdtm_keys,
+                            creation_datetime_override=self._creation_datetime,
+                            file_oid_override=self._file_oid,
+                        )
+                    else:
+                        assert d_env is not None
+                        per_dom_env = d_env
+                        dest_file = self._path / f"{make_oid_slug(d_env.name).lower()}.json"
+
+                    _atomic_write_text(
+                        dest_file,
+                        to_dataset_json(per_dom_env, indent=self._indent),
                     )
-            except Exception as exc:
-                logger.warning(
-                    "Unable to merge existing Dataset-JSON archive at '%s'; writing fresh envelope: %s",
-                    self._path,
-                    exc,
+                    _append_file_manifest(
+                        self._manifest_path,
+                        destination="dataset_json",
+                        study_key=self._study_key,
+                        row_count=per_dom_env.records,
+                        file_path=dest_file,
+                    )
+
+                if effective_sdtm and lineage_updates:
+                    commit_sdtm_lineage(self, lineage_updates, study_key=self._study_key)
+                return
+
+            prior_envelope: DatasetJsonEnvelope | None = None
+            if (
+                self.config.idempotent
+                and (is_incremental or has_voided)
+                and self._path.exists()
+                and self._path.stat().st_size > 0
+            ):
+                try:
+                    prior_envelope = load_dataset_json(self._path)
+                    if effective_sdtm and domain_seq_counters is not None:
+                        _seed_sdtm_counters_from_envelope(prior_envelope, domain_seq_counters)
+                except Exception as exc:
+                    logger.warning(
+                        "Unable to merge existing Dataset-JSON archive at '%s'; writing fresh envelope: %s",
+                        self._path,
+                        exc,
+                    )
+                    prior_envelope = None
+
+            if prior_envelope is not None:
+                delta_env: DatasetJsonEnvelope | None = None
+                if staged_records:
+                    bundle = build_dataset_json_bundle(
+                        self._study_key,
+                        records=staged_records,
+                        forms=forms,
+                        variables=variables,
+                        visits=visits,
+                        as_sdtm=effective_sdtm,
+                        sdtm_domain=self.config.sdtm_domain,
+                        use_labels_as_columns=self._use_labels_as_columns,
+                        variable_whitelist=self._variable_whitelist,
+                        form_whitelist=self._form_whitelist,
+                        naming_convention=self.config.naming_convention,
+                        preserve_record_id=effective_preserve_rec_id,
+                        include_deleted=self.config.include_deleted,
+                        mask_phi=self.config.mask_phi,
+                        custom_phi_keys=self._phi_keys or None,
+                        enrichment_pipeline=self._pipeline,
+                        metadata_version_oid=self._metadata_version_oid,
+                        file_oid=self._file_oid,
+                        creation_datetime=self._creation_datetime,
+                        domain_seq_counters=domain_seq_counters,
+                        seq_overrides=seq_overrides,
+                        lineage_out=lineage_updates if effective_sdtm else None,
+                    )
+                    delta_env = bundle.datasets.get(prior_envelope.item_group_oid)
+                    if delta_env is None and len(bundle.datasets) == 1:
+                        delta_env = next(iter(bundle.datasets.values()))
+                final_envelope = _merge_dataset_json_envelopes(
+                    prior_envelope,
+                    delta_env if (delta_env is not None and delta_env.records > 0) else None,
+                    voided_record_ids=self._voided_ids,
+                    voided_sdtm_keys=self._voided_sdtm_keys,
+                    creation_datetime_override=self._creation_datetime,
+                    file_oid_override=self._file_oid,
+                )
+            else:
+                final_envelope = build_dataset_json_envelope(
+                    self._study_key,
+                    records=staged_records,
+                    forms=forms,
+                    variables=variables,
+                    visits=visits,
+                    as_sdtm=effective_sdtm,
+                    sdtm_domain=self.config.sdtm_domain,
+                    use_labels_as_columns=self._use_labels_as_columns,
+                    variable_whitelist=self._variable_whitelist,
+                    form_whitelist=self._form_whitelist,
+                    naming_convention=self.config.naming_convention,
+                    preserve_record_id=effective_preserve_rec_id,
+                    include_deleted=self.config.include_deleted,
+                    mask_phi=self.config.mask_phi,
+                    custom_phi_keys=self._phi_keys or None,
+                    enrichment_pipeline=self._pipeline,
+                    metadata_version_oid=self._metadata_version_oid,
+                    file_oid=self._file_oid,
+                    creation_datetime=self._creation_datetime,
+                    domain_seq_counters=domain_seq_counters,
+                    seq_overrides=seq_overrides,
+                    lineage_out=lineage_updates if effective_sdtm else None,
                 )
 
-        rendered = to_dataset_json(final_envelope, indent=self._indent)
-        _atomic_write_text(self._path, rendered)
+            rendered = to_dataset_json(final_envelope, indent=self._indent)
+            _atomic_write_text(self._path, rendered)
 
-        total_rows = (
-            sum(g.records for g in final_envelope.clinical_data.item_group_data.values())
-            if final_envelope.clinical_data is not None
-            else 0
-        )
-        _append_file_manifest(
-            self._manifest_path,
-            destination="dataset_json",
-            study_key=self._study_key,
-            row_count=total_rows,
-            file_path=self._path,
-        )
+            if effective_sdtm and lineage_updates:
+                commit_sdtm_lineage(self, lineage_updates, study_key=self._study_key)
+
+            _append_file_manifest(
+                self._manifest_path,
+                destination="dataset_json",
+                study_key=self._study_key,
+                row_count=final_envelope.records,
+                file_path=self._path,
+            )
 
     def close(self) -> None:
         """Clear staged buffers."""
         self._staged_by_id.clear()
         self._unkeyed_records.clear()
         self._voided_ids.clear()
+        self._voided_records.clear()
         self._voided_sdtm_keys.clear()
 
 

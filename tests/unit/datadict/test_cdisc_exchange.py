@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import json
 from pathlib import Path
 
 import pytest
@@ -12,12 +11,16 @@ from pydantic import ValidationError
 
 from imednet import spi
 from imednet.datadict import (
+    DatasetJsonBundle,
+    DatasetJsonColumn,
     DatasetJsonEnvelope,
     DatasetJsonItem,
+    DatasetJsonSourceSystem,
     OdmArchive,
     OdmItemData,
     OdmItemGroupData,
     OdmReferenceData,
+    build_dataset_json_bundle,
     build_dataset_json_envelope,
     build_odm_archive,
     get_dataset_json_schema,
@@ -327,8 +330,11 @@ def test_exchange_models_are_frozen_and_exposed_on_spi() -> None:
     """Exchange models enforce read-only immutability, forbid extra keys, and resolve via imednet.spi."""
     assert spi.cdisc.OdmArchive is OdmArchive
     assert spi.cdisc.DatasetJsonEnvelope is DatasetJsonEnvelope
+    assert spi.cdisc.DatasetJsonBundle is DatasetJsonBundle
+    assert spi.cdisc.DatasetJsonColumn is DatasetJsonColumn
     assert spi.models.OdmArchive is OdmArchive
     assert spi.models.DatasetJsonEnvelope is DatasetJsonEnvelope
+    assert spi.models.DatasetJsonBundle is DatasetJsonBundle
 
     item = OdmItemData(item_oid="IT.SYSBP", value="120")
     with pytest.raises(ValidationError):
@@ -338,7 +344,7 @@ def test_exchange_models_are_frozen_and_exposed_on_spi() -> None:
         OdmItemData(item_oid="IT.SYSBP", value="120", unexpected_field="x")  # type: ignore[call-arg]
 
     dj_item = DatasetJsonItem(
-        OID="IT.SYSBP",
+        itemOID="IT.SYSBP",
         name="SYSBP",
         label="Systolic BP",
         dataType="integer",
@@ -346,29 +352,44 @@ def test_exchange_models_are_frozen_and_exposed_on_spi() -> None:
     with pytest.raises(ValidationError):
         dj_item.name = "DIABP"  # type: ignore[misc]
 
-    # DatasetJsonItemGroup arity & records invariants
-    from imednet.datadict import DatasetJsonClinicalData, DatasetJsonItemGroup
-
+    # Flat DatasetJsonEnvelope v1.1 arity & records invariants
     with pytest.raises(ValidationError, match="records"):
-        DatasetJsonItemGroup(
+        DatasetJsonEnvelope(
+            datasetJSONCreationDateTime="2026-01-01T00:00:00Z",
+            studyOID="S1",
+            metaDataVersionOID="MDV.1",
+            itemGroupOID="IG.VS",
             records=2,
             name="VS",
             label="Vitals",
-            items=(dj_item,),
-            itemData=((120,),),
+            columns=(dj_item,),
+            rows=((120,),),
         )
 
     with pytest.raises(ValidationError, match="row 0 length"):
-        DatasetJsonItemGroup(
+        DatasetJsonEnvelope(
+            datasetJSONCreationDateTime="2026-01-01T00:00:00Z",
+            studyOID="S1",
+            metaDataVersionOID="MDV.1",
+            itemGroupOID="IG.VS",
             records=1,
             name="VS",
             label="Vitals",
-            items=(dj_item,),
-            itemData=((120, 80),),
+            columns=(dj_item,),
+            rows=((120, 80),),
         )
 
-    with pytest.raises(ValidationError, match="clinicalData or referenceData"):
-        DatasetJsonEnvelope(creationDateTime="2026-01-01T00:00:00Z")
+    with pytest.raises(ValidationError):
+        DatasetJsonEnvelope(
+            datasetJSONCreationDateTime="2026-01-01T00:00:00Z",
+            itemGroupOID="IG.VS",
+            records=0,
+            name="VS",
+            label="Vitals",
+            columns=(),
+            rows=(),
+            clinicalData={},  # type: ignore[call-arg]
+        )
 
     # Validator error branches on missing files, malformed payloads, and cell type mismatches
     assert validate_odm_xml(Path("/nonexistent/missing.xml"))
@@ -376,30 +397,20 @@ def test_exchange_models_are_frozen_and_exposed_on_spi() -> None:
     assert validate_dataset_json(Path("/nonexistent/missing.json"))
     assert validate_dataset_json("[]")
     mismatch_dict = DatasetJsonEnvelope(
-        creationDateTime="2026-01-01T00:00:00Z",
-        clinicalData=DatasetJsonClinicalData(
-            studyOID="S1",
-            metaDataVersionOID="MDV.1",
-            itemGroupData={
-                "IG.VS": DatasetJsonItemGroup(
-                    records=1,
-                    name="VS",
-                    label="Vitals",
-                    items=(
-                        DatasetJsonItem(
-                            OID="ITEMGROUPDATASEQ",
-                            name="ITEMGROUPDATASEQ",
-                            label="Seq",
-                            type="integer",
-                        ),
-                        dj_item,
-                    ),
-                    itemData=((1, "not_an_int"),),
-                )
-            },
-        ),
+        datasetJSONCreationDateTime="2026-01-01T00:00:00Z",
+        sourceSystem=DatasetJsonSourceSystem(name="imednet-sdk", version="1.0.0"),
+        studyOID="S1",
+        metaDataVersionOID="MDV.1",
+        itemGroupOID="IG.VS",
+        records=1,
+        name="VS",
+        label="Vitals",
+        columns=(dj_item,),
+        rows=(("not_an_int",),),
     ).to_json_dict()
-    assert any("does not match declared type" in e for e in validate_dataset_json(mismatch_dict))
+    assert any(
+        "does not match declared dataType" in e for e in validate_dataset_json(mismatch_dict)
+    )
 
 
 def test_odm_132_round_trip_and_xsd_validation(tmp_path: Path) -> None:
@@ -483,18 +494,24 @@ def test_odm_132_round_trip_and_xsd_validation(tmp_path: Path) -> None:
     assert subj.subject_key == "SUBJ-001"
     assert subj.site_location_oid == admin.locations[0].oid
 
-    # Unscheduled / subject-level DM form and scheduled Screening VS form
-    assert len(subj.forms) == 1
-    assert subj.forms[0].form_oid == "DM"
-    dm_items = {it.item_oid: it.value for it in subj.forms[0].item_group_data[0].items}
+    # Unscheduled / subject-level DM form wrapped in SE.UNSCHEDULED and scheduled Screening VS form
+    assert subj.forms == ()
+    events_by_oid = {se.study_event_oid: se for se in subj.study_events}
+    assert "SE.UNSCHEDULED" in events_by_oid
+    dm_form = events_by_oid["SE.UNSCHEDULED"].forms[0]
+    assert dm_form.form_oid == "DM"
+    dm_items = {it.item_oid: it.value for it in dm_form.item_group_data[0].items}
     assert dm_items["BRTHDAT"] == "1980-07-15"
     assert dm_items["patientName"] == "Alice Example"
 
-    assert len(subj.study_events) == 1
-    vs_form = subj.study_events[0].forms[0]
+    scheduled_events = [se for se in subj.study_events if se.study_event_oid != "SE.UNSCHEDULED"]
+    assert len(scheduled_events) == 1
+    vs_form = scheduled_events[0].forms[0]
     assert vs_form.form_oid == "VS"
     vs_ig = vs_form.item_group_data[0]
     assert vs_ig.items[0].value == "122"
+    assert vs_ig.items[0].audit_record_id is not None
+    assert vs_ig.items[0].annotation_id is not None
 
     # AuditRecord preserved (either nested or in AuditRecords pool)
     all_audits = list(clin.audit_records) + list(vs_ig.audit_records)
@@ -643,13 +660,27 @@ def test_dataset_json_v11_cdash_and_sdtm_schema_validation_and_roundtrip(tmp_pat
     schema = get_dataset_json_schema()
     assert schema["$schema"].startswith("https://json-schema.org/draft/2020-12")
 
-    # 1. CDASH Dataset-JSON envelope
+    # 1. CDASH Dataset-JSON envelope & multi-Form bundle
+    cdash_bundle = build_dataset_json_bundle(
+        study_key="ONCO_01",
+        records=bundle["records"],  # type: ignore[arg-type]
+        forms=bundle["forms"],  # type: ignore[arg-type]
+        variables=bundle["variables"],  # type: ignore[arg-type]
+        data_dictionary=bundle["data_dictionary"],  # type: ignore[arg-type]
+        as_sdtm=False,
+        mask_phi=True,
+        creation_datetime="2026-03-05T00:00:00Z",
+        file_oid="OID.DJ.CDASH",
+    )
+    assert set(cdash_bundle.datasets.keys()) == {"IG.DM", "IG.VS"}
+
     cdash_env = build_dataset_json_envelope(
         study_key="ONCO_01",
         records=bundle["records"],  # type: ignore[arg-type]
         forms=bundle["forms"],  # type: ignore[arg-type]
         variables=bundle["variables"],  # type: ignore[arg-type]
         data_dictionary=bundle["data_dictionary"],  # type: ignore[arg-type]
+        form_whitelist=[301],
         as_sdtm=False,
         mask_phi=True,
         creation_datetime="2026-03-05T00:00:00Z",
@@ -661,6 +692,7 @@ def test_dataset_json_v11_cdash_and_sdtm_schema_validation_and_roundtrip(tmp_pat
     json_str = to_dataset_json(cdash_env)
     assert validate_dataset_json(json_str) == []
     assert "vault" not in json_str.lower()
+    assert "ITEMGROUPDATASEQ" not in json_str
 
     dj_file = tmp_path / "cdash.dataset.json"
     to_dataset_json_file(cdash_env, dj_file)
@@ -668,16 +700,17 @@ def test_dataset_json_v11_cdash_and_sdtm_schema_validation_and_roundtrip(tmp_pat
 
     reloaded_env = load_dataset_json(dj_file)
     assert reloaded_env == cdash_env
-    assert "IG.DM" in reloaded_env.clinical_data.item_group_data
-    dm_group = reloaded_env.clinical_data.item_group_data["IG.DM"]
-    assert dm_group.records == 1
-    assert dm_group.items[0].name == "ITEMGROUPDATASEQ"
-    # PHI masked by default in CDASH Dataset-JSON
-    item_names = [it.name for it in dm_group.items]
+    assert reloaded_env.item_group_oid == "IG.DM"
+    assert reloaded_env.records == 1
+    item_names = [col.name for col in reloaded_env.columns]
+    assert "ITEMGROUPDATASEQ" not in item_names
+    # PHI masked by default in CDASH Dataset-JSON while structural SUBJID/subjectKey/recordId remain unmasked
     pname_idx = item_names.index("patientName")
     brth_idx = item_names.index("BRTHDAT")
-    assert dm_group.item_data[0][pname_idx] == "***MASKED***"
-    assert dm_group.item_data[0][brth_idx] == "***MASKED***"
+    subjid_idx = item_names.index("SUBJID")
+    assert reloaded_env.rows[0][pname_idx] == "***MASKED***"
+    assert reloaded_env.rows[0][brth_idx] == "***MASKED***"
+    assert reloaded_env.rows[0][subjid_idx] == "001"
 
     # 2. SDTM Dataset-JSON envelope (DM and VS)
     sdtm_dm = build_dataset_json_envelope(
@@ -692,21 +725,44 @@ def test_dataset_json_v11_cdash_and_sdtm_schema_validation_and_roundtrip(tmp_pat
         creation_datetime="2026-03-05T00:00:00Z",
     )
     assert validate_dataset_json(sdtm_dm) == []
-    assert "IG.DM" in sdtm_dm.clinical_data.item_group_data
-    sdtm_dm_group = sdtm_dm.clinical_data.item_group_data["IG.DM"]
-    sdtm_cols = [it.name for it in sdtm_dm_group.items]
+    assert sdtm_dm.item_group_oid == "IG.DM"
+    sdtm_cols = [col.name for col in sdtm_dm.columns]
+    assert "ITEMGROUPDATASEQ" not in sdtm_cols
     assert "STUDYID" in sdtm_cols
     assert "DOMAIN" in sdtm_cols
     assert "USUBJID" in sdtm_cols
     if "BRTHDTC" in sdtm_cols:
-        brthdtc_val = sdtm_dm_group.item_data[0][sdtm_cols.index("BRTHDTC")]
+        brthdtc_val = sdtm_dm.rows[0][sdtm_cols.index("BRTHDTC")]
         # SDTM BRTHDTC truncates birth date to 4-digit year under PHI masking
         assert brthdtc_val in ("1980", "***MASKED***")
 
-    # Negative schema validation check: missing ITEMGROUPDATASEQ first column
-    bad_payload = json.loads(json_str)
-    bad_payload["clinicalData"]["itemGroupData"]["IG.DM"]["items"][0]["name"] = "NOT_SEQ"
-    schema_errs = validate_dataset_json(bad_payload)
+    # Negative schema validation check: legacy v1.0 clinicalData.itemGroupData payload is rejected
+    legacy_v10_payload = {
+        "creationDateTime": "2026-03-05T00:00:00Z",
+        "datasetJSONVersion": "1.1.0",
+        "fileOID": "OID.LEGACY",
+        "clinicalData": {
+            "studyOID": "ONCO_01",
+            "metaDataVersionOID": "MDV.ONCO_01",
+            "itemGroupData": {
+                "IG.DM": {
+                    "records": 1,
+                    "name": "DM",
+                    "label": "Demographics",
+                    "items": [
+                        {
+                            "OID": "ITEMGROUPDATASEQ",
+                            "name": "ITEMGROUPDATASEQ",
+                            "label": "Seq",
+                            "type": "integer",
+                        }
+                    ],
+                    "itemData": [[1]],
+                }
+            },
+        },
+    }
+    schema_errs = validate_dataset_json(legacy_v10_payload)
     assert len(schema_errs) >= 1
 
 
@@ -894,7 +950,7 @@ def test_cdisc_builder_edge_cases_coercions_and_validators(tmp_path: Path) -> No
     assert validate_dataset_json(auto_sdtm) == []
 
     empty_sdtm = build_dataset_json_envelope("EDGE_STUDY", records=[], as_sdtm=True)
-    assert "IG.DM" in empty_sdtm.clinical_data.item_group_data
+    assert empty_sdtm.item_group_oid == "IG.DM"
 
     class _DummyPipeline:
         def process(self, data: dict[str, object], *, mask_phi: bool = True) -> dict[str, object]:
@@ -915,6 +971,7 @@ def test_cdisc_builder_edge_cases_coercions_and_validators(tmp_path: Path) -> No
         enrichment_pipeline=_DummyPipeline(),
     )
     assert validate_dataset_json(labeled_cdash) == []
+    assert "DERIVED_COL" in [c.name for c in labeled_cdash.columns]
 
     # Negative validation paths for validate_dataset_json and validate_odm_xml
     assert validate_dataset_json(tmp_path / "missing.json")
@@ -923,10 +980,265 @@ def test_cdisc_builder_edge_cases_coercions_and_validators(tmp_path: Path) -> No
     assert validate_dataset_json({"datasetJSONVersion": "1.1.0"})
 
     mismatch_dict = auto_sdtm.to_json_dict()
-    mismatch_dict["clinicalData"]["itemGroupData"]["IG.VS"]["itemData"][0][0] = "not-an-int"
-    assert any("does not match declared type" in e for e in validate_dataset_json(mismatch_dict))
+    vsseq_idx = [c["name"] for c in mismatch_dict["columns"]].index("VSSEQ")
+    mismatch_dict["rows"][0][vsseq_idx] = "not-an-int"
+    assert any(
+        "does not match declared dataType" in e for e in validate_dataset_json(mismatch_dict)
+    )
 
     assert validate_odm_xml(tmp_path / "missing.xml")
     assert validate_odm_xml("<<<not xml")
     assert validate_odm_xml("<WrongRoot/>") == ["Root element must be ODM, got 'WrongRoot'"]
     assert validate_odm_xml(12345)  # type: ignore[arg-type]
+
+
+def test_custom_keyed_sdtm_forms_and_post_enrichment_cdash_variables() -> None:
+    """build_dataset_json_envelope maps custom-keyed Forms via formName and discovers post-enrichment CDASH variables without ITEMGROUPDATASEQ."""
+    from imednet.integrations.enrichment import EnrichmentPipeline
+    from imednet.models.study_config import StudyConfiguration
+
+    custom_forms = [
+        Form(form_id=501, form_key="ECRF_01", form_name="Vital Signs", form_type="Visit"),
+    ]
+    custom_vars = [
+        Variable(
+            variable_id=11,
+            variable_name="RAW_BP",
+            label="Raw Systolic BP",
+            variable_type="int",
+            form_id=501,
+            form_key="ECRF_01",
+            sequence=1,
+        )
+    ]
+    records = [
+        Record(
+            record_id=701,
+            study_key="CUSTOM_ST",
+            subject_id=10,
+            subject_key="SUBJ-01",
+            site_id=1,
+            form_id=501,
+            form_key="ECRF_01",
+            visit_id=1,
+            record_data={"RAW_BP": 128, "VSTESTCD": "SYSBP", "VSORRES": "128"},
+        )
+    ]
+
+    sdtm_env = build_dataset_json_envelope(
+        "CUSTOM_ST",
+        records=records,
+        forms=custom_forms,
+        as_sdtm=True,
+    )
+    assert validate_dataset_json(sdtm_env) == []
+    assert sdtm_env.item_group_oid == "IG.VS"
+    assert sdtm_env.name == "VS"
+    assert sdtm_env.records == 1
+    sdtm_col_names = [c.name for c in sdtm_env.columns]
+    assert "VSSEQ" in sdtm_col_names
+    assert "ITEMGROUPDATASEQ" not in sdtm_col_names
+
+    from imednet.models.study_config import MappingRule
+
+    cfg = StudyConfiguration(
+        study_key="CUSTOM_ST",
+        mappings=[
+            MappingRule(
+                domain="VS",
+                source_form_key="ECRF_01",
+                source_variable_name="RAW_BP",
+                target_field="MAPPED_SYSBP",
+            )
+        ],
+    )
+    pipeline = EnrichmentPipeline(cfg)
+    cdash_env = build_dataset_json_envelope(
+        "CUSTOM_ST",
+        records=records,
+        forms=custom_forms,
+        variables=custom_vars,
+        as_sdtm=False,
+        enrichment_pipeline=pipeline,
+    )
+    assert validate_dataset_json(cdash_env) == []
+    cdash_col_names = [c.name for c in cdash_env.columns]
+    assert "MAPPED_SYSBP" in cdash_col_names
+    assert "ITEMGROUPDATASEQ" not in cdash_col_names
+    mapped_idx = cdash_col_names.index("MAPPED_SYSBP")
+    assert cdash_env.rows[0][mapped_idx] == 128
+
+
+def test_odm_132_rejects_direct_subject_formdata_and_snapshot_remove_and_preserves_forward_ids() -> (
+    None
+):
+    """validate_odm_xml rejects direct SubjectData/FormData and Snapshot TransactionType=Remove while preserving forward AuditRecordID/AnnotationID."""
+    direct_formdata_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" FileOID="F1" CreationDateTime="2026-01-01T00:00:00Z">
+  <Study OID="S1">
+    <GlobalVariables>
+      <StudyName>S1</StudyName>
+      <StudyDescription>D</StudyDescription>
+      <ProtocolName>P1</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.1" Name="v1">
+      <FormDef OID="DM" Name="Demographics" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG.DM" Mandatory="No"/>
+      </FormDef>
+      <ItemGroupDef OID="IG.DM" Name="DM" Repeating="No">
+        <ItemRef ItemOID="IT.SUBJID" Mandatory="No"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.SUBJID" Name="SUBJID" DataType="text"/>
+    </MetaDataVersion>
+  </Study>
+  <ClinicalData StudyOID="S1" MetaDataVersionOID="MDV.1">
+    <SubjectData SubjectKey="SUBJ-1">
+      <FormData FormOID="DM">
+        <ItemGroupData ItemGroupOID="IG.DM">
+          <ItemData ItemOID="IT.SUBJID" Value="001"/>
+        </ItemGroupData>
+      </FormData>
+    </SubjectData>
+  </ClinicalData>
+</ODM>
+"""
+    assert validate_odm_xml(direct_formdata_xml) != []
+
+    snapshot_remove_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" FileOID="F1" CreationDateTime="2026-01-01T00:00:00Z">
+  <Study OID="S1">
+    <GlobalVariables>
+      <StudyName>S1</StudyName>
+      <StudyDescription>D</StudyDescription>
+      <ProtocolName>P1</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.1" Name="v1">
+      <StudyEventDef OID="SE.UNSCHEDULED" Name="Unscheduled" Repeating="Yes" Type="Unscheduled">
+        <FormRef FormOID="DM" Mandatory="No"/>
+      </StudyEventDef>
+      <FormDef OID="DM" Name="Demographics" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG.DM" Mandatory="No"/>
+      </FormDef>
+      <ItemGroupDef OID="IG.DM" Name="DM" Repeating="No">
+        <ItemRef ItemOID="IT.SUBJID" Mandatory="No"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.SUBJID" Name="SUBJID" DataType="text"/>
+    </MetaDataVersion>
+  </Study>
+  <ClinicalData StudyOID="S1" MetaDataVersionOID="MDV.1">
+    <SubjectData SubjectKey="SUBJ-1">
+      <StudyEventData StudyEventOID="SE.UNSCHEDULED">
+        <FormData FormOID="DM">
+          <ItemGroupData ItemGroupOID="IG.DM" TransactionType="Remove"/>
+        </FormData>
+      </StudyEventData>
+    </SubjectData>
+  </ClinicalData>
+</ODM>
+"""
+    remove_errs = validate_odm_xml(snapshot_remove_xml)
+    assert any('TransactionType="Remove"' in e for e in remove_errs)
+    transactional_xml = snapshot_remove_xml.replace(
+        'FileType="Snapshot"', 'FileType="Transactional"'
+    )
+    assert validate_odm_xml(transactional_xml) == []
+
+    # Verify build_odm_archive + write_odm_xml_stream preserve forward AuditRecordID and AnnotationID
+    bundle = _sample_clinical_bundle()
+    archive = build_odm_archive(
+        study_key="ONCO_01",
+        study=bundle["study"],  # type: ignore[arg-type]
+        data_dictionary=bundle["data_dictionary"],  # type: ignore[arg-type]
+        forms=bundle["forms"],  # type: ignore[arg-type]
+        variables=bundle["variables"],  # type: ignore[arg-type]
+        sites=bundle["sites"],  # type: ignore[arg-type]
+        users=bundle["users"],  # type: ignore[arg-type]
+        subjects=bundle["subjects"],  # type: ignore[arg-type]
+        visits=bundle["visits"],  # type: ignore[arg-type]
+        records=bundle["records"],  # type: ignore[arg-type]
+        revisions=bundle["revisions"],  # type: ignore[arg-type]
+        queries=bundle["queries"],  # type: ignore[arg-type]
+    )
+    buf = io.StringIO()
+    write_odm_xml_stream(archive, buf)
+    streamed_xml = buf.getvalue()
+    assert validate_odm_xml(streamed_xml) == []
+    assert 'AuditRecordID="AR_9002_1"' in streamed_xml
+    assert 'AnnotationID="ANN_8001_1"' in streamed_xml
+    assert 'ID="AR_9002_1"' in streamed_xml
+    assert 'ID="ANN_8001_1"' in streamed_xml
+
+
+def test_odm_roundtrip_preserves_prefixed_ig_and_item_oids_and_masks_phi() -> None:
+    """Round-tripping an ODM 1.3.2 archive with IG.DM and IT.DM.* OIDs preserves OIDs under strict=True and masks IT.DM.PATNAME and IT.DM.SSN."""
+    inbound_odm = """<?xml version="1.0" encoding="UTF-8"?>
+<ODM xmlns="http://www.cdisc.org/ns/odm/v1.3" ODMVersion="1.3.2" FileType="Snapshot" FileOID="OID.EXT.DM" CreationDateTime="2026-03-10T00:00:00Z">
+  <Study OID="EXT_STUDY">
+    <GlobalVariables>
+      <StudyName>External ODM Study</StudyName>
+      <StudyDescription>Prefixed OID round-trip</StudyDescription>
+      <ProtocolName>EXT-01</ProtocolName>
+    </GlobalVariables>
+    <MetaDataVersion OID="MDV.EXT" Name="v1">
+      <StudyEventDef OID="SE.BASELINE" Name="Baseline" Repeating="No" Type="Scheduled">
+        <FormRef FormOID="F.DM" Mandatory="Yes"/>
+      </StudyEventDef>
+      <FormDef OID="F.DM" Name="Demographics" Repeating="No">
+        <ItemGroupRef ItemGroupOID="IG.DM" Mandatory="Yes"/>
+      </FormDef>
+      <ItemGroupDef OID="IG.DM" Name="Demographics" Repeating="No">
+        <ItemRef ItemOID="IT.DM.SUBJID" Mandatory="Yes" OrderNumber="1"/>
+        <ItemRef ItemOID="IT.DM.PATNAME" Mandatory="No" OrderNumber="2"/>
+        <ItemRef ItemOID="IT.DM.SSN" Mandatory="No" OrderNumber="3"/>
+        <ItemRef ItemOID="IT.DM.SEX" Mandatory="No" OrderNumber="4"/>
+      </ItemGroupDef>
+      <ItemDef OID="IT.DM.SUBJID" Name="SUBJID" DataType="text">
+        <Question><TranslatedText>Subject Identifier</TranslatedText></Question>
+      </ItemDef>
+      <ItemDef OID="IT.DM.PATNAME" Name="PATNAME" DataType="text">
+        <Question><TranslatedText>Patient Legal Name</TranslatedText></Question>
+      </ItemDef>
+      <ItemDef OID="IT.DM.SSN" Name="SSN" DataType="text">
+        <Question><TranslatedText>Social Security Number</TranslatedText></Question>
+      </ItemDef>
+      <ItemDef OID="IT.DM.SEX" Name="SEX" DataType="text">
+        <Question><TranslatedText>Sex</TranslatedText></Question>
+      </ItemDef>
+    </MetaDataVersion>
+  </Study>
+  <ClinicalData StudyOID="EXT_STUDY" MetaDataVersionOID="MDV.EXT">
+    <SubjectData SubjectKey="SUBJ-777">
+      <StudyEventData StudyEventOID="SE.BASELINE">
+        <FormData FormOID="F.DM">
+          <ItemGroupData ItemGroupOID="IG.DM" ItemGroupRepeatKey="1">
+            <ItemData ItemOID="IT.DM.SUBJID" Value="777"/>
+            <ItemData ItemOID="IT.DM.PATNAME" Value="RobertSensitive"/>
+            <ItemData ItemOID="IT.DM.SSN" Value="123-45-6789"/>
+            <ItemData ItemOID="IT.DM.SEX" Value="M"/>
+          </ItemGroupData>
+        </FormData>
+      </StudyEventData>
+    </SubjectData>
+  </ClinicalData>
+</ODM>
+"""
+    loaded_arch = load_odm_archive(inbound_odm, strict=True)
+    dm_form = loaded_arch.data_dictionary.forms[0]
+    assert dm_form.extraAttributes.get("itemGroupOID") == "IG.DM"
+    var_oids = {v.variableName: v.extraAttributes.get("itemOID") for v in dm_form.variables}
+    assert var_oids["PATNAME"] == "IT.DM.PATNAME"
+    assert var_oids["SSN"] == "IT.DM.SSN"
+
+    re_emitted_masked = to_odm_xml(loaded_arch, mask_phi=True)
+    assert validate_odm_xml(re_emitted_masked) == []
+    assert "RobertSensitive" not in re_emitted_masked
+    assert "123-45-6789" not in re_emitted_masked
+
+    strict_reloaded = load_odm_archive(re_emitted_masked, strict=True)
+    ig = strict_reloaded.clinical_data[0].subjects[0].study_events[0].forms[0].item_group_data[0]
+    assert ig.item_group_oid == "IG.DM"
+    masked_items = {it.item_oid: it.value for it in ig.items}
+    assert masked_items["IT.DM.SUBJID"] == "777"
+    assert masked_items["IT.DM.PATNAME"] == "***MASKED***"
+    assert masked_items["IT.DM.SSN"] == "***MASKED***"
+    assert masked_items["IT.DM.SEX"] == "M"
