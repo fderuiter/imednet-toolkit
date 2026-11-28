@@ -112,6 +112,25 @@ def monotonic_timestamp(
     return max(normalized) if normalized else None
 
 
+def merge_legacy_stream_entries(
+    provider: AirflowStateProvider,
+    study_key: str,
+    legacy_entries: Sequence[tuple[str, dict[str, Any]]],
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Reconstruct ``(resolved_study, streams)`` from legacy per-stream Variable entries."""
+    streams: dict[str, dict[str, Any]] = {}
+    resolved_study = study_key
+    for legacy_key, entry in legacy_entries:
+        parsed = provider._parse_variable_key(legacy_key)
+        entry_study = entry.get("study_key")
+        if isinstance(entry_study, str) and entry_study:
+            resolved_study = entry_study
+        s_name = entry.get("stream_name") or (parsed[1] if parsed else None)
+        if isinstance(s_name, str) and s_name:
+            streams[s_name] = dict(entry)
+    return resolved_study, streams
+
+
 def load_orm_cas_snapshot(provider: AirflowStateProvider, study_key: str) -> OrmStudySnapshot:
     """Load Study checkpoints and raw DB column value for optimistic ORM CAS."""
     if not provider._airflow_available():
@@ -194,16 +213,7 @@ def load_orm_cas_snapshot(provider: AirflowStateProvider, study_key: str) -> Orm
             expected_raw_val=expected_raw_val,
         )
 
-    streams = {}
-    resolved_study = study_key
-    for legacy_key, entry in legacy_entries:
-        parsed = provider._parse_variable_key(legacy_key)
-        entry_study = entry.get("study_key")
-        if isinstance(entry_study, str) and entry_study:
-            resolved_study = entry_study
-        s_name = entry.get("stream_name") or (parsed[1] if parsed else None)
-        if isinstance(s_name, str) and s_name:
-            streams[s_name] = dict(entry)
+    resolved_study, streams = merge_legacy_stream_entries(provider, study_key, legacy_entries)
     return OrmStudySnapshot(
         resolved_study=resolved_study,
         streams=streams,

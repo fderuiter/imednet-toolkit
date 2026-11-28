@@ -481,11 +481,12 @@ def test_triage_store_propagates_integrity_error_without_retries(
 def test_triage_store_default_path_and_entry_point_registration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Verify TriageStore is registered under imednet.stores and supports default db_path."""
+    """Verify TriageStore is registered under imednet.stores and scopes IMEDNET_TRIAGE_DB_PATH by origin."""
     from importlib.metadata import entry_points
 
     env_db = tmp_path / "default_env" / "triage.sqlite3"
     monkeypatch.setenv("IMEDNET_TRIAGE_DB_PATH", str(env_db))
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
 
     eps = list(entry_points(group="imednet.stores", name="TriageStore"))
     assert len(eps) == 1
@@ -493,5 +494,278 @@ def test_triage_store_default_path_and_entry_point_registration(
     assert loaded_cls is TriageStore
 
     default_store = loaded_cls()
-    assert default_store.db_path == env_db
-    assert env_db.exists()
+    expected_db = env_db.parent / "edc.prod.imednetapi.com" / env_db.name
+    assert default_store.db_path == expected_db
+    assert expected_db.exists()
+
+
+def test_triage_store_dynamic_home_and_origin_scoping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify dynamic HOME/Path.home resolution and origin scoping vs explicit db_path compatibility."""
+    from types import SimpleNamespace
+
+    from imednet.core.context import reset_base_url_context, set_base_url_context
+    from imednet_workflows.triage_store import DEFAULT_TRIAGE_DB_PATH
+
+    assert str(DEFAULT_TRIAGE_DB_PATH).startswith("~")
+    monkeypatch.delenv("IMEDNET_TRIAGE_DB_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_BASE_URL", raising=False)
+
+    # 1. Dynamic HOME env resolution across consecutive store initializations
+    home_a = tmp_path / "home_a"
+    home_b = tmp_path / "home_b"
+    monkeypatch.setenv("HOME", str(home_a))
+    store_home_a = TriageStore()
+    assert (
+        store_home_a.db_path == home_a / ".imednet" / "edc.prod.imednetapi.com" / "triage.sqlite3"
+    )
+
+    monkeypatch.setenv("HOME", str(home_b))
+    store_home_b = TriageStore()
+    assert (
+        store_home_b.db_path == home_b / ".imednet" / "edc.prod.imednetapi.com" / "triage.sqlite3"
+    )
+
+    # 2. Monkeypatched Path.home() resolution and tilde expansion
+    patched_home = tmp_path / "patched_home"
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: patched_home))
+    store_patched = TriageStore()
+    assert (
+        store_patched.db_path
+        == patched_home / ".imednet" / "edc.prod.imednetapi.com" / "triage.sqlite3"
+    )
+    tilde_explicit = TriageStore("~/explicit_tilde.sqlite3")
+    assert tilde_explicit.db_path == patched_home / "explicit_tilde.sqlite3"
+
+    # 3. Normalized origin scoping via base_url kwarg, sdk kwarg, and contextvars
+    store_norm = TriageStore(
+        base_url="https://user:secretpass@TENANT-A.EDC.EXAMPLE.TEST:443/api/v1/edc/"  # pragma: allowlist secret
+    )
+    assert (
+        store_norm.db_path
+        == patched_home / ".imednet" / "tenant-a.edc.example.test" / "triage.sqlite3"
+    )
+    assert "secretpass" not in str(store_norm.db_path)
+
+    stub_sdk = SimpleNamespace(base_url="https://tenant-b.edc.example.test:8443/api/v1")
+    store_sdk = TriageStore(sdk=stub_sdk)
+    assert (
+        store_sdk.db_path
+        == patched_home / ".imednet" / "tenant-b.edc.example.test_8443" / "triage.sqlite3"
+    )
+
+    tok = set_base_url_context("")
+    try:
+        store_empty_ctx = TriageStore(tmp_path / "ctx_store" / "triage.sqlite3")
+        assert store_empty_ctx.db_path == tmp_path / "ctx_store" / "localhost" / "triage.sqlite3"
+    finally:
+        reset_base_url_context(tok)
+
+
+@pytest.mark.parametrize(
+    "crafted_url",
+    [
+        "../escaped",
+        "../../escaped",
+        "https://..",
+        "https://.",
+        "https://%2e%2e",
+        "https://edc.example.test/../../escaped",
+        "https://edc.example.test/%2e%2e/escaped",
+        "/etc/passwd",
+        "file:///etc/passwd",
+        "C:\\Windows\\System32",
+        "https://bad\x00host.example.test",
+        "https://bad\nhost.example.test",
+    ],
+)
+def test_triage_store_rejects_crafted_base_url_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crafted_url: str
+) -> None:
+    """Verify crafted base_url inputs raise PathTraversalValidationError and never escape .imednet."""
+    from imednet.errors import PathTraversalValidationError
+
+    safe_home = tmp_path / "isolated_home"
+    monkeypatch.setenv("HOME", str(safe_home))
+    monkeypatch.delenv("IMEDNET_TRIAGE_DB_PATH", raising=False)
+
+    with pytest.raises(PathTraversalValidationError):
+        TriageStore(base_url=crafted_url)
+
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_triage_store_rejects_invalid_study_context(tmp_path: Path) -> None:
+    """Verify invalid active study_context keys raise PathTraversalValidationError."""
+    from imednet.core.context import reset_study_context, set_study_context
+    from imednet.errors import PathTraversalValidationError
+
+    tok = set_study_context("../../escape_study")
+    try:
+        with pytest.raises(PathTraversalValidationError):
+            TriageStore(tmp_path / "triage.sqlite3")
+    finally:
+        reset_study_context(tok)
+
+
+def test_triage_store_posix_permissions_and_standalone_without_encryption_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify 0700/0600 POSIX permissions and standalone operation with no encryption keys set."""
+    import os
+    import stat
+
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_CONFIG_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "standalone_home"))
+    monkeypatch.delenv("IMEDNET_TRIAGE_DB_PATH", raising=False)
+
+    # Pre-create an insecure 0644 SQLite file as well to verify permission remediation
+    insecure_db = tmp_path / "legacy_dir" / "insecure.sqlite3"
+    insecure_db.parent.mkdir(parents=True, exist_ok=True)
+    insecure_db.write_bytes(b"")
+    if os.name == "posix":
+        os.chmod(insecure_db, 0o644)
+
+    standalone_store = TriageStore(base_url="https://standalone.edc.example.test")
+    standalone_store.upsert_item(_seed_item("STANDALONE-1"))
+    standalone_store.add_annotation(
+        "STANDALONE-1",
+        "reviewer",
+        "patient_name=CANARY_STANDALONE_NAME token=CANARY_STANDALONE_TOKEN",
+    )
+    standalone_store.update_status(
+        "STANDALONE-1",
+        TriageStatus.UNDER_REVIEW,
+        "reviewer",
+        "dob=1990-01-01",
+    )
+    stored = standalone_store.get_triage_item("STANDALONE-1")
+    assert stored is not None
+    assert "CANARY_STANDALONE_NAME" not in stored.annotations[-1].comment
+    assert "CANARY_STANDALONE_TOKEN" not in stored.annotations[-1].comment
+    assert "1990-01-01" not in (stored.history[-1].comment or "")
+
+    remediated_store = TriageStore(insecure_db)
+    remediated_store.upsert_item(_seed_item("LEGACY-PERM-1"))
+
+    if os.name == "posix":
+        imednet_dir = tmp_path / "standalone_home" / ".imednet"
+        origin_dir = standalone_store.db_path.parent
+        assert stat.S_IMODE(imednet_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(origin_dir.stat().st_mode) == 0o700
+        for candidate in (
+            standalone_store.db_path,
+            Path(f"{standalone_store.db_path}-wal"),
+            Path(f"{standalone_store.db_path}-shm"),
+            remediated_store.db_path,
+        ):
+            if candidate.exists():
+                assert stat.S_IMODE(candidate.stat().st_mode) == 0o600
+                assert (stat.S_IMODE(candidate.stat().st_mode) & 0o077) == 0
+
+
+def test_triage_store_scrubs_committed_study_phi_and_credentials_on_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify upsert_item, add_annotation, and update_status scrub PHI and secrets before SQLite write."""
+    from imednet.models.study_config import StudyConfiguration
+    from imednet.sdk import ImednetSDK
+    from imednet.simulation import SimulationState, create_simulation_transport
+    from imednet_workflows.config_version_control import ConfigVersionStore
+
+    monkeypatch.setenv("HOME", str(tmp_path / "scrub_home"))
+    monkeypatch.delenv("IMEDNET_CONFIG_DB_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_TRIAGE_DB_PATH", raising=False)
+    monkeypatch.delenv("IMEDNET_SECURITY_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("IMEDNET_CONFIG_ENCRYPTION_KEY", raising=False)
+
+    transport = create_simulation_transport(SimulationState())
+    sdk = ImednetSDK(
+        api_key="scrub-api-key",  # pragma: allowlist secret
+        security_key="scrub-sec-key",  # pragma: allowlist secret
+        base_url="https://scrub.edc.example.test",
+        transport=transport,
+        simulation_mode=True,
+    )
+
+    with sdk.study_context("DEMO"):
+        ConfigVersionStore().commit_config(
+            "DEMO",
+            StudyConfiguration(study_key="DEMO", phi_fields=["custom_mrn"]),
+            "Register custom_mrn PHI",
+            sdk=sdk,
+        )
+
+    store = TriageStore(sdk=sdk)
+    store.upsert_item(
+        TriageItem(
+            item_id="DEMO:10",
+            study_key="DEMO",
+            status=TriageStatus.NEW,
+            severity="high",
+            annotations=[
+                TriageAnnotation(
+                    annotation_id="ann-1",
+                    user_id="site-user",
+                    comment=(
+                        "patient_name=CANARY_PATIENT_NAME_UPSERT "
+                        "custom_mrn=CANARY_CUSTOM_MRN_UPSERT "
+                        "https://u:CANARY_URI_SECRET@edc.test/q?token=CANARY_URL_TOKEN"  # pragma: allowlist secret
+                    ),
+                    timestamp=datetime.now(timezone.utc),
+                )
+            ],
+            history=[
+                TriageHistoryEntry(
+                    transition_id="tr-1",
+                    from_status=TriageStatus.NEW,
+                    to_status=TriageStatus.NEW,
+                    user_id="site-user",
+                    comment="dob=1982-11-23 Authorization: Bearer CANARY_HIST_BEARER",
+                    timestamp=datetime.now(timezone.utc),
+                )
+            ],
+        )
+    )
+    store.add_annotation(
+        "DEMO:10",
+        "reviewer",
+        '{"custom_mrn": "CANARY_CUSTOM_MRN_ANN", "x-api-key": "CANARY_HEADER_KEY"}',
+    )
+    store.update_status(
+        "DEMO:10",
+        TriageStatus.UNDER_REVIEW,
+        "reviewer",
+        "Reviewed customMrn='CANARY_CUSTOM_MRN_STATUS' patient_name='CANARY_PATIENT_STATUS'",
+    )
+
+    # Checkpoint WAL and verify raw bytes across SQLite + WAL/SHM files contain zero canary values
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+
+    raw_bytes = b"".join(
+        p.read_bytes()
+        for p in (
+            store.db_path,
+            Path(f"{store.db_path}-wal"),
+            Path(f"{store.db_path}-shm"),
+        )
+        if p.exists()
+    )
+    for forbidden in (
+        b"CANARY_PATIENT_NAME_UPSERT",
+        b"CANARY_CUSTOM_MRN_UPSERT",
+        b"CANARY_URI_SECRET",
+        b"CANARY_URL_TOKEN",
+        b"1982-11-23",
+        b"CANARY_HIST_BEARER",
+        b"CANARY_CUSTOM_MRN_ANN",
+        b"CANARY_HEADER_KEY",
+        b"CANARY_CUSTOM_MRN_STATUS",
+        b"CANARY_PATIENT_STATUS",
+    ):
+        assert forbidden not in raw_bytes

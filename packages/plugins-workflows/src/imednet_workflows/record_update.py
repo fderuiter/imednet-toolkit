@@ -5,12 +5,13 @@ from __future__ import annotations
 import functools
 import inspect
 import os
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from typing_extensions import deprecated
 
 from imednet.spi.errors import ValidationError
-from imednet.spi.models import Job
+from imednet.spi.models import BaseRecordRequest, Job
 from imednet.spi.utils import (
     DEFAULT_BATCH_CHUNK_SIZE,
     BatchSubmissionSummary,
@@ -45,15 +46,38 @@ from ._workflow_helpers import (
 
 if TYPE_CHECKING:
     from imednet.spi.facade import AsyncImednetFacade, ImednetFacade
+    from imednet.spi.models import RecordStatus
 
 
-def _extract_record_form_ref(record: dict[str, Any]) -> tuple[str | None, Any]:
+def _extract_record_form_ref(
+    record: BaseRecordRequest | Mapping[str, Any],
+) -> tuple[str | None, Any]:
     """Extract (form_key, form_id) from a record payload without coalescing None to 0."""
-    raw_fk = record.get("formKey") or record.get("form_key")
+    rec_map: Mapping[str, Any] = (
+        record.model_dump(by_alias=True, exclude_none=True)
+        if isinstance(record, BaseRecordRequest)
+        else record
+    )
+    raw_fk = rec_map.get("formKey") or rec_map.get("form_key")
     fk = str(raw_fk) if raw_fk else None
-    raw_fid = record.get("formId") if record.get("formId") is not None else record.get("form_id")
+    raw_fid = rec_map.get("formId") if rec_map.get("formId") is not None else rec_map.get("form_id")
     fid = None if raw_fid == "" else raw_fid
     return fk, fid
+
+
+def _require_update_record_target(
+    *,
+    record_id: int | None,
+    record_oid: str | None,
+    visit_id: int | None,
+    interval_identifier: str | int | None,
+) -> None:
+    """Ensure at least one existing-record target selector is supplied to update_record."""
+    if record_id is None and not record_oid and visit_id is None and interval_identifier is None:
+        raise ValueError(
+            "update_record requires at least one target identifier "
+            "(record_id, record_oid, visit_id, or interval_identifier)."
+        )
 
 
 class _RecordUpdateBase:
@@ -83,7 +107,7 @@ class _RecordUpdateBase:
         return self._schema, not isinstance(self._schema, BaseSchemaCache)
 
     def _collect_distinct_form_refs(
-        self, records_data: list[dict[str, Any]]
+        self, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
     ) -> tuple[list[str], list[Any]]:
         """Collect distinct explicit form keys and form IDs across all records in order."""
         seen_keys: set[str] = set()
@@ -142,7 +166,7 @@ class _RecordUpdateBase:
                 raise ValidationError(f"Unknown form ID {fid}")
 
     def _prepare_form_ref_validation(
-        self, study_key: str, records_data: list[dict[str, Any]]
+        self, study_key: str, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
     ) -> tuple[BaseSchemaCache[Any], list[str], list[Any], bool] | None:
         """Collect distinct form references and determine whether cache refresh is needed."""
         if not records_data or not isinstance(self._schema, BaseSchemaCache):
@@ -161,7 +185,7 @@ class _RecordUpdateBase:
             await res
 
     async def _async_validate_form_key(
-        self, study_key: str, records_data: list[dict[str, Any]]
+        self, study_key: str, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
     ) -> None:
         """Asynchronous form-key and form-ID validation with single-pass cache refresh."""
         prepared = self._prepare_form_ref_validation(study_key, records_data)
@@ -202,6 +226,8 @@ class _RecordUpdateBase:
         chunk_size: int,
         options: tuple[bool, int, int, JobProgressHandler | None, bool, bool],
         single_job_method: tuple[str, str] | None,
+        *,
+        resolve_results: bool = True,
     ) -> WorkflowBatchSpec:
         """Normalize tabular or sequence record inputs and assemble a batch submission spec."""
         wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors = options
@@ -221,6 +247,7 @@ class _RecordUpdateBase:
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
         )
 
     async def _execute_batch_async(
@@ -238,6 +265,7 @@ class _RecordUpdateBase:
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Canonical asynchronous batch validation, chunked submission, and optional job polling."""
@@ -248,7 +276,13 @@ class _RecordUpdateBase:
             await self._await_validator_refresh(study_key)
         opts = (wait_for_completion, timeout, poll_interval, on_progress, dry_run, collect_errors)
         spec = self._build_batch_spec(
-            study_key, records_data, active_schema, eff_chunk, opts, _single_job_method
+            study_key,
+            records_data,
+            active_schema,
+            eff_chunk,
+            opts,
+            _single_job_method,
+            resolve_results=resolve_results,
         )
         if not is_offline:
             await self._async_validate_form_key(study_key, spec.records_data)
@@ -316,6 +350,7 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Asynchronously validate once, submit chunks, and return a batch summary."""
@@ -332,6 +367,7 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
             _single_job_method=_single_job_method,
         )
 
@@ -348,21 +384,27 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously submit a single-chunk record payload and return its Job."""
         pair = ("create_or_update_records", "create_or_update_records_batch")
+        batch_kwargs: dict[str, Any] = {
+            "email_notify": email_notify,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         summary = await self.create_or_update_records_batch(
             study_key,
             records_data,
             wait_for_completion,
             timeout,
             poll_interval,
-            email_notify=email_notify,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=pair,
+            **batch_kwargs,
         )
         return unwrap_single_submitted_job(summary, pair)
 
@@ -378,18 +420,27 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously register a new subject by submitting a single record."""
         rec = build_record_payload(
             form_identifier,
             form_identifier_type,
             data,
+            subject_key=subject_key,
+            subject_oid=subject_oid,
             site_id=site_identifier,
             site_type=site_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return await self.create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -408,8 +459,11 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously update an existing scheduled record for a subject."""
         rec = build_record_payload(
@@ -420,8 +474,10 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
             subject_type=subject_identifier_type,
             interval_id=interval_identifier,
             interval_type=interval_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return await self.create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -438,8 +494,11 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Asynchronously create a new (unscheduled) record for an existing subject."""
         rec = build_record_payload(
@@ -448,8 +507,63 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
             data,
             subject_id=subject_identifier,
             subject_type=subject_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
+        return await self.create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
+        )
+
+    async def update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Asynchronously update an existing record by recordId, recordOid, visitId, or interval."""
+        _require_update_record_target(
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            interval_identifier=interval_identifier,
+        )
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
+            site_id=site_identifier,
+            site_type=site_identifier_type,
+            interval_id=interval_identifier,
+            interval_type=interval_identifier_type,
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
+        )
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return await self.create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -473,22 +587,28 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Deprecated alias for :meth:`create_or_update_records_batch`."""
+        batch_kwargs: dict[str, Any] = {
+            "email_notify": email_notify,
+            "chunk_size": chunk_size,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": _single_job_method,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         return await self.create_or_update_records_batch(
             study_key,
             records_data,
             wait_for_completion,
             timeout,
             poll_interval,
-            email_notify=email_notify,
-            chunk_size=chunk_size,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=_single_job_method,
+            **batch_kwargs,
         )
 
     @deprecated(
@@ -509,9 +629,20 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated alias for :meth:`create_or_update_records`."""
         pair = ("async_create_or_update_records", "async_create_or_update_records_batch")
+        batch_kwargs: dict[str, Any] = {
+            "email_notify": email_notify,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         if "async_create_or_update_records_batch" in vars(self):
             summary = await self.async_create_or_update_records_batch(
                 study_key,
@@ -519,12 +650,7 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
                 wait_for_completion,
                 timeout,
                 poll_interval,
-                email_notify=email_notify,
-                schema=schema,
-                on_progress=on_progress,
-                dry_run=dry_run,
-                collect_errors=collect_errors,
-                _single_job_method=pair,
+                **batch_kwargs,
             )
         else:
             summary = await self.create_or_update_records_batch(
@@ -533,12 +659,7 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
                 wait_for_completion,
                 timeout,
                 poll_interval,
-                email_notify=email_notify,
-                schema=schema,
-                on_progress=on_progress,
-                dry_run=dry_run,
-                collect_errors=collect_errors,
-                _single_job_method=pair,
+                **batch_kwargs,
             )
         return unwrap_single_submitted_job(summary, pair)
 
@@ -558,18 +679,27 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated alias for :meth:`register_subject`."""
         rec = build_record_payload(
             form_identifier,
             form_identifier_type,
             data,
+            subject_key=subject_key,
+            subject_oid=subject_oid,
             site_id=site_identifier,
             site_type=site_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         call_kwargs = build_single_record_call_kwargs(study_key, rec, *opts)
         if "async_create_or_update_records" in vars(self):
             return await self.async_create_or_update_records(**call_kwargs)
@@ -594,8 +724,11 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated alias for :meth:`update_scheduled_record`."""
         rec = build_record_payload(
@@ -606,8 +739,10 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
             subject_type=subject_identifier_type,
             interval_id=interval_identifier,
             interval_type=interval_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         call_kwargs = build_single_record_call_kwargs(study_key, rec, *opts)
         if "async_create_or_update_records" in vars(self):
             return await self.async_create_or_update_records(**call_kwargs)
@@ -629,8 +764,11 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated alias for :meth:`create_new_record`."""
         rec = build_record_payload(
@@ -639,8 +777,68 @@ class AsyncRecordUpdateWorkflow(_RecordUpdateBase):
             data,
             subject_id=subject_identifier,
             subject_type=subject_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
+        call_kwargs = build_single_record_call_kwargs(study_key, rec, *opts)
+        if "async_create_or_update_records" in vars(self):
+            return await self.async_create_or_update_records(**call_kwargs)
+        return await self.create_or_update_records(**call_kwargs)
+
+    @deprecated(
+        "async_update_record() is deprecated; use await update_record(...) instead.",
+        category=DeprecationWarning,
+    )
+    async def async_update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Deprecated alias for :meth:`update_record`."""
+        _require_update_record_target(
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            interval_identifier=interval_identifier,
+        )
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
+            site_id=site_identifier,
+            site_type=site_identifier_type,
+            interval_id=interval_identifier,
+            interval_type=interval_identifier_type,
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
+        )
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         call_kwargs = build_single_record_call_kwargs(study_key, rec, *opts)
         if "async_create_or_update_records" in vars(self):
             return await self.async_create_or_update_records(**call_kwargs)
@@ -696,7 +894,9 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             SyncToAsyncFacadeAdapter(cast("ImednetFacade", self._sdk)),
         )
 
-    def _validate_form_key(self, study_key: str, records_data: list[dict[str, Any]]) -> None:
+    def _validate_form_key(
+        self, study_key: str, records_data: Sequence[BaseRecordRequest | Mapping[str, Any]]
+    ) -> None:
         """Refresh schema once if any distinct form key or form ID in the batch is uncached."""
         self._ensure_sync_mode("_validate_form_key", "_async_validate_form_key")
         run_sync_over_async(lambda: self._async_validate_form_key(study_key, records_data))
@@ -715,6 +915,7 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Validate once, submit records in bounded chunks, and return a batch summary."""
@@ -736,6 +937,7 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
                 on_progress=on_progress,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
+                resolve_results=resolve_results,
                 _single_job_method=_single_job_method,
             )
         )
@@ -753,22 +955,28 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Submit a single-chunk record payload and return its Job."""
         self._ensure_sync_mode("create_or_update_records", "async_create_or_update_records")
         pair = ("create_or_update_records", "create_or_update_records_batch")
+        batch_kwargs: dict[str, Any] = {
+            "email_notify": email_notify,
+            "schema": schema,
+            "on_progress": on_progress,
+            "dry_run": dry_run,
+            "collect_errors": collect_errors,
+            "_single_job_method": pair,
+        }
+        if not resolve_results:
+            batch_kwargs["resolve_results"] = False
         summary = self.create_or_update_records_batch(
             study_key,
             records_data,
             wait_for_completion,
             timeout,
             poll_interval,
-            email_notify=email_notify,
-            schema=schema,
-            on_progress=on_progress,
-            dry_run=dry_run,
-            collect_errors=collect_errors,
-            _single_job_method=pair,
+            **batch_kwargs,
         )
         return unwrap_single_submitted_job(summary, pair)
 
@@ -792,6 +1000,7 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
         _single_job_method: tuple[str, str] | None = None,
     ) -> BatchSubmissionSummary:
         """Deprecated asynchronous alias for batch record submission."""
@@ -808,6 +1017,7 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             on_progress=on_progress,
             dry_run=dry_run,
             collect_errors=collect_errors,
+            resolve_results=resolve_results,
             _single_job_method=_single_job_method,
         )
 
@@ -830,22 +1040,28 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         on_progress: JobProgressHandler | None = None,
         dry_run: bool = False,
         collect_errors: bool = False,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated asynchronous variant of :meth:`create_or_update_records`."""
         pair = ("async_create_or_update_records", "async_create_or_update_records_batch")
         if "async_create_or_update_records_batch" in vars(self):
+            batch_kwargs: dict[str, Any] = {
+                "email_notify": email_notify,
+                "schema": schema,
+                "on_progress": on_progress,
+                "dry_run": dry_run,
+                "collect_errors": collect_errors,
+                "_single_job_method": pair,
+            }
+            if not resolve_results:
+                batch_kwargs["resolve_results"] = False
             summary = await self.async_create_or_update_records_batch(
                 study_key,
                 records_data,
                 wait_for_completion,
                 timeout,
                 poll_interval,
-                email_notify=email_notify,
-                schema=schema,
-                on_progress=on_progress,
-                dry_run=dry_run,
-                collect_errors=collect_errors,
-                _single_job_method=pair,
+                **batch_kwargs,
             )
         else:
             summary = await self._execute_batch_async(
@@ -860,6 +1076,7 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
                 on_progress=on_progress,
                 dry_run=dry_run,
                 collect_errors=collect_errors,
+                resolve_results=resolve_results,
                 _single_job_method=pair,
             )
         return unwrap_single_submitted_job(summary, pair)
@@ -876,8 +1093,13 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Register a new subject by submitting a single enrollment record."""
         self._ensure_sync_mode("register_subject", "async_register_subject")
@@ -885,10 +1107,14 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             form_identifier,
             form_identifier_type,
             data,
+            subject_key=subject_key,
+            subject_oid=subject_oid,
             site_id=site_identifier,
             site_type=site_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return self.create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -911,18 +1137,27 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        subject_key: str | None = None,
+        subject_oid: str | None = None,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated asynchronous alias for :meth:`register_subject`."""
         rec = build_record_payload(
             form_identifier,
             form_identifier_type,
             data,
+            subject_key=subject_key,
+            subject_oid=subject_oid,
             site_id=site_identifier,
             site_type=site_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return await self.async_create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -941,8 +1176,11 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Update an existing scheduled visit record for a subject."""
         self._ensure_sync_mode("update_scheduled_record", "async_update_scheduled_record")
@@ -954,8 +1192,10 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             subject_type=subject_identifier_type,
             interval_id=interval_identifier,
             interval_type=interval_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return self.create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -980,8 +1220,11 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated asynchronous alias for :meth:`update_scheduled_record`."""
         rec = build_record_payload(
@@ -992,8 +1235,10 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             subject_type=subject_identifier_type,
             interval_id=interval_identifier,
             interval_type=interval_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return await self.async_create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -1010,8 +1255,11 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Create a new unscheduled record for an existing subject."""
         self._ensure_sync_mode("create_new_record", "async_create_new_record")
@@ -1021,8 +1269,10 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             data,
             subject_id=subject_identifier,
             subject_type=subject_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return self.create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )
@@ -1045,8 +1295,11 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
         timeout: int = 300,
         poll_interval: int = 5,
         *,
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
         email_notify: bool | str | None = None,
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
     ) -> Job:
         """Deprecated asynchronous alias for :meth:`create_new_record`."""
         rec = build_record_payload(
@@ -1055,8 +1308,123 @@ class RecordUpdateWorkflow(_RecordUpdateBase):
             data,
             subject_id=subject_identifier,
             subject_type=subject_identifier_type,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
         )
-        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema)
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
+        return await self.async_create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
+        )
+
+    def update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Update an existing record by recordId, recordOid, visitId, or interval."""
+        self._ensure_sync_mode("update_record", "async_update_record")
+        _require_update_record_target(
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            interval_identifier=interval_identifier,
+        )
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
+            site_id=site_identifier,
+            site_type=site_identifier_type,
+            interval_id=interval_identifier,
+            interval_type=interval_identifier_type,
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
+        )
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
+        return self.create_or_update_records(
+            **build_single_record_call_kwargs(study_key, rec, *opts)
+        )
+
+    @deprecated(
+        "RecordUpdateWorkflow.async_update_record() is deprecated; "
+        "use AsyncRecordUpdateWorkflow.update_record(...) via "
+        "async_sdk.workflows.record_update instead.",
+        category=DeprecationWarning,
+    )
+    async def async_update_record(
+        self,
+        study_key: str,
+        data: dict[str, Any] | None = None,
+        *,
+        record_id: int | None = None,
+        record_oid: str | None = None,
+        visit_id: int | None = None,
+        form_identifier: str | int | None = None,
+        form_identifier_type: Literal["key", "id"] = "key",
+        subject_identifier: str | int | None = None,
+        subject_identifier_type: Literal["key", "id", "oid"] = "key",
+        interval_identifier: str | int | None = None,
+        interval_identifier_type: Literal["name", "id"] = "name",
+        site_identifier: str | int | None = None,
+        site_identifier_type: Literal["name", "id"] = "name",
+        record_status: RecordStatus | str | None = None,
+        reason_for_change: str | None = None,
+        wait_for_completion: bool = False,
+        timeout: int = 300,
+        poll_interval: int = 5,
+        email_notify: bool | str | None = None,
+        schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool = True,
+    ) -> Job:
+        """Deprecated asynchronous alias for :meth:`update_record`."""
+        _require_update_record_target(
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            interval_identifier=interval_identifier,
+        )
+        rec = build_record_payload(
+            form_identifier,
+            form_identifier_type,
+            data,
+            subject_id=subject_identifier,
+            subject_type=subject_identifier_type,
+            site_id=site_identifier,
+            site_type=site_identifier_type,
+            interval_id=interval_identifier,
+            interval_type=interval_identifier_type,
+            record_id=record_id,
+            record_oid=record_oid,
+            visit_id=visit_id,
+            record_status=record_status,
+            reason_for_change=reason_for_change,
+        )
+        opts = (wait_for_completion, timeout, poll_interval, email_notify, schema, resolve_results)
         return await self.async_create_or_update_records(
             **build_single_record_call_kwargs(study_key, rec, *opts)
         )

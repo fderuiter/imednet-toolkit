@@ -443,10 +443,10 @@ def test_simulation_record_data_filter_and_missing_keys():
         none_cmp = list(sdk.records.list(study_key="STUDY", record_data_filter="V_EMPTY>0"))
         assert none_cmp == []
 
-        # record_data_filter="none" projects records with wire recordData=None (normalized to {} on Record)
+        # record_data_filter="none" projects records with wire recordData=None
         projected = list(sdk.records.list(study_key="STUDY", record_data_filter="none"))
         assert len(projected) == 4
-        assert all(r.record_data == {} for r in projected)
+        assert all(r.record_data is None for r in projected)
 
         client = httpx.Client(transport=transport, base_url="https://sim.local")
         sorted_proj_resp = client.get(
@@ -854,7 +854,7 @@ def test_simulation_filters_sorting_and_subresources():
             sdk.records.list(study_key="STUDY", record_data_filter="none", limit=1)
         )
         assert len(no_data_records) == 1
-        assert no_data_records[0].record_data == {}
+        assert no_data_records[0].record_data is None
 
         age_filtered = list(
             sdk.records.list(study_key="STUDY", recordDataFilter="V_AGE>=30;V_GENDER==Female")

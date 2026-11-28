@@ -997,7 +997,7 @@ class ApiMethodDocumenter(MethodDocumenter):
         bound_is_async = inspect.iscoroutinefunction(self.object) or inspect.isasyncgenfunction(
             self.object
         )
-        if bound_is_async and not raw_is_async:
+        if (bound_is_async or self.object_name == "__aiter__") and not raw_is_async:
             self.add_line("   :async:", self.get_sourcename())
 
     def format_signature(self, **kwargs: Any) -> str:

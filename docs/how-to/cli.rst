@@ -53,15 +53,15 @@ launch to open a study and monitor specific batch jobs immediately (or pass ``--
 without ``--study`` to stage ``QUEUED`` batches until a ``Study`` is selected), and pass
 ``--force`` only when intentionally bypassing TTY stream checks.
 
-When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a non-``dumb``
-``TERM``), core list commands render results in ``InteractiveDataGrid``, a curses-driven
-table with live filtering and a side inspection panel:
+When ``stdin`` and ``stdout`` are attached to an interactive terminal (with a valid
+non-``dumb`` ``TERM`` entry in terminfo), core list commands render results in
+``InteractiveDataGrid``, a curses-driven table with live filtering and record inspection:
 
 * ``Up`` / ``Down`` (or ``k`` / ``j``), ``Page Up`` / ``Page Down``, ``Home`` / ``End``: navigate rows.
 * ``Left`` / ``Right`` (or ``h`` / ``l``): scroll columns horizontally across wide tables.
-* ``/``: enter live search mode across table columns, record metadata, and form variables (``Enter`` or ``Esc`` exits search input; in normal mode, ``Esc`` closes an open side panel first and then clears the active filter).
+* ``/``: enter live search mode across table columns, record metadata, and form variables (``Enter`` commits search input; ``Esc`` cancels uncommitted search edits and restores the anchored selection; in normal mode, ``Esc`` closes an open inspection panel/modal first and then clears the active filter).
 * ``a``: load all remaining pages into ``InteractiveDataGrid`` when the initial 100-item TTY view is truncated, re-evaluating any active ``/`` filter.
-* ``Space``: toggle the side inspection panel (``[`` / ``]`` scrolls overflowing panel lines and ``{`` / ``}`` scrolls panel pages with ``Lines X-Y of Z`` ``▲`` / ``▼`` cues; ``Esc`` or ``Space`` closes the panel).
+* ``Space``: toggle record inspection—opening a split side panel on ``>= 50``-column terminals or a full-width detail modal on narrow ``24``–``49``-column panes (``[`` / ``]`` scrolls overflowing lines and ``{`` / ``}`` scrolls pages with ``Lines X-Y of Z`` ``▲`` / ``▼`` cues; ``Esc`` or ``Space`` closes the panel or modal).
 * ``q``: exit ``InteractiveDataGrid``.
 
 Set ``IMEDNET_NON_INTERACTIVE=1`` or pass ``--no-interactive`` (or pipe stdout in scripts
@@ -102,7 +102,7 @@ dotenv/logging helpers. Use the existing nested ``--help`` for command-specific 
    imednet codings list STUDY -f dictionaryName=MedDRA --format json
    imednet records list STUDY --format json
    imednet jobs status STUDY BATCH --format json
-   imednet jobs wait STUDY JOB-1002 --timeout 60 --format json
+   imednet jobs wait STUDY JOB-1002 --resolve-results --timeout 60 --format json
    imednet workflows extract-records STUDY --format json
    imednet workflows state show --study-key STUDY --format json
    imednet workflows uat run STUDY --dry-run --simulation --format json
@@ -141,10 +141,24 @@ connections):
 
    imednet records create STUDY --form-key F_DM --subject-key SUB-001 \
        -d ZIP_CODE=90210 -d 'NOTE="0042"' --schema ./study_dd.json --dry-run
-   imednet records update STUDY --record-id 601 -d V_AGE=51 \
-       --reason-for-change "Chart correction" --wait --format json
+   imednet records update STUDY --record-id 601 --visit-id 401 --record-status Complete \
+       -d V_AGE=51 --reason-for-change "Chart correction" --wait --format json
    cat batch.csv | imednet records import STUDY - --schema api --wait --format json
    imednet subjects register STUDY --file subjects.csv --skip-existing --wait
+   imednet subjects register STUDY --form-id 10 --site-id 1 \
+       --record-status "Record Complete" --reason-for-change "Enrollment" --wait --format json
+
+When ``--wait`` is supplied on write commands, terminal ``resultUrl`` payloads are resolved
+automatically (opt out with ``--no-resolve-results``) and JSON batch summaries include
+``createdRecordIds``, ``enrolledSubjectKeys``, and sanitized ``recordErrors``; ``imednet jobs wait``
+keeps read-only polling by default unless ``--resolve-results`` is passed.
+
+``records create`` and ``records update`` accept all 14 iMednet ``POST /records`` write
+attributes via inline flags (``--form-key`` / ``--form-id``, ``--site-name`` / ``--site-id``,
+``--subject-key`` / ``--subject-id`` / ``--subject-oid``, ``--interval-name`` /
+``--interval-id``, ``--visit-id``, ``--record-id`` / ``--record-oid``, ``--record-status``,
+and ``--reason-for-change``) alongside repeatable ``-d`` / ``--data KEY=VALUE`` clinical
+variable assignments or ``--file`` / ``--json`` payloads.
 
 Passing ``--schema`` (``api``, canonical ``DataDictionary`` JSON, CDISC ODM XML, REDCap
 CSV, or a 4-file CSV directory/ZIP) preserves string values on ``text``, ``string``, and
@@ -209,13 +223,14 @@ Data Dictionary commands
 ------------------------
 
 The ``imednet datadict`` subcommands convert Study metadata across 4-file CSV exports,
-CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate canonical JSON
-files, export the JSON Schema, and compute structural revision diffs (see
+CDISC ODM 1.3 XML, REDCap CSV files, and the EDC REST API, validate offline sources
+(``.json``, ``.xml``, REDCap ``.csv``, ``.zip``, or 4-file CSV directories), export the
+JSON Schema or CDISC ODM XML, and compute structural revision diffs across formats (see
 :doc:`/how-to/data_dictionary` for Python equivalents and Record validation):
 
 .. code-block:: bash
 
-   imednet datadict from-csv ./datadict_export.zip -o study_dd.json --strict --no-raw-xml
+   imednet datadict from-csv ./datadict_export.zip --study-key STUDY -o study_dd.json --strict --no-raw-xml
    imednet datadict from-odm ./study_odm.xml --study-key STUDY -o study_dd.json --strict
    imednet datadict to-odm study_dd.json -o study_odm.xml --file-oid ODM.STUDY.001
    imednet datadict from-redcap ./redcap_dictionary.csv --study-key STUDY -o study_dd.json
@@ -260,11 +275,11 @@ double-quoted strings (including empty ``""``), and non-ASCII text (such as
 and boolean attributes reject invalid values on ``stderr`` with exit code ``1``. Commands that take a positional
 ``study_key`` reject redundant ``study_key`` / ``studyKey`` attributes in
 ``--filter`` before issuing requests, whereas ``imednet studies list`` accepts them.
-``records list`` additionally exposes ``--record-data-filter`` (supporting ``=~``
-regular-expression matching in addition to the six standard operators, plus the
-literal ``none`` bypass) to filter Form Variable values on the server. All twelve
-``list`` commands—including ``users list``—accept ``--sort``, ``--limit``, and
-``--all``.
+``records list`` and ``workflows extract-records`` additionally expose
+``--record-data-filter`` (supporting ``=~`` regular-expression matching in addition to the
+six standard operators, plus the literal ``none`` bypass) to filter Form Variable values on
+the server. All twelve ``list`` commands—including ``users list``—accept ``--sort``,
+``--limit``, ``--all``, and ``--mask-phi`` / ``--no-mask-phi`` (enabled by default).
 
 .. code-block:: bash
 

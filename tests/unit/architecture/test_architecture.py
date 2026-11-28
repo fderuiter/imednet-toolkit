@@ -155,6 +155,7 @@ def test_extensions_use_spi():
                     "imednet.AsyncSinksNamespaceProtocol",
                     "imednet.AsyncWorkflowsNamespaceProtocol",
                     "imednet.RecordsInput",
+                    "imednet.DataFrameLike",
                     "imednet.SinksNamespaceProtocol",
                     "imednet.SyncWorkflowsNamespaceProtocol",
                     "imednet.WorkflowsNamespaceProtocol",

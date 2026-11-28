@@ -335,3 +335,87 @@ def test_diff_detects_genuine_normalized_field_modifications() -> None:
     assert "forms[DM].formId" in modified_paths
     assert "forms[DM].formType" in modified_paths
     assert "forms[DM].variables[AGE].variableType" in modified_paths
+
+
+def test_diff_unnamed_duplicate_rules_and_form_sequence_modifications() -> None:
+    """Unnamed/duplicate rules key by (type, form, name, occurrence_index) and diff form & sequence."""
+    # 1. Unnamed duplicate rules without sequence or ID do not overwrite each other
+    dd_same_a = DataDictionary(
+        unassignedBusinessLogic=[
+            BusinessLogicRule(type="Query", form="F1", status="Active", logic={"v": 1}),
+            BusinessLogicRule(type="Query", form="F1", status="Inactive", logic={"v": 2}),
+        ]
+    )
+    dd_same_b = DataDictionary(
+        unassignedBusinessLogic=[
+            BusinessLogicRule(type="Query", form="F1", status="Active", logic={"v": 1}),
+            BusinessLogicRule(type="Query", form="F1", status="Inactive", logic={"v": 2}),
+        ]
+    )
+    assert not diff(dd_same_a, dd_same_b).has_changes
+
+    dd_dup_changed = DataDictionary(
+        unassignedBusinessLogic=[
+            BusinessLogicRule(type="Query", form="F1", status="Active", logic={"v": 1}),
+            BusinessLogicRule(type="Query", form="F1", status="Active", logic={"v": 2}),
+        ]
+    )
+    dup_report = diff(dd_same_a, dd_dup_changed)
+    assert dup_report.has_changes is True
+    assert len(dup_report.items) == 1
+    assert dup_report.items[0].action == "modified"
+    assert dup_report.items[0].path.endswith(".status")
+
+    # 2. Duplicate-named ID-less rules track each occurrence independently
+    dd_named_old = DataDictionary(
+        forms=[
+            Form(
+                formKey="F1",
+                businessLogic=[
+                    BusinessLogicRule(name="Check", type="Form", form="F1", sequence=1),
+                    BusinessLogicRule(name="Check", type="Form", form="F1", sequence=2),
+                ],
+            )
+        ]
+    )
+    dd_named_new = DataDictionary(
+        forms=[
+            Form(
+                formKey="F1",
+                businessLogic=[
+                    BusinessLogicRule(name="Check", type="Form", form="F1", sequence=1),
+                    BusinessLogicRule(name="Check", type="Form", form="F1", sequence=5),
+                ],
+            )
+        ]
+    )
+    seq_report = diff(dd_named_old, dd_named_new)
+    assert seq_report.has_changes is True
+    assert any(
+        item.action == "modified"
+        and item.path.endswith(".sequence")
+        and item.old_value == 2
+        and item.new_value == 5
+        for item in seq_report.items
+    )
+
+    # 3. ID-keyed rules detect form and sequence changes (including sequence 0 -> 1)
+    dd_id_old = DataDictionary(
+        unassignedBusinessLogic=[
+            BusinessLogicRule(
+                id="R_UNASSIGNED", name="CrossForm", type="Query", form="F1", sequence=0
+            )
+        ]
+    )
+    dd_id_new = DataDictionary(
+        unassignedBusinessLogic=[
+            BusinessLogicRule(
+                id="R_UNASSIGNED", name="CrossForm", type="Query", form="F2", sequence=1
+            )
+        ]
+    )
+    id_report = diff(dd_id_old, dd_id_new)
+    assert id_report.has_changes is True
+    mod_by_path = {item.path: (item.old_value, item.new_value) for item in id_report.items}
+    assert mod_by_path["unassignedBusinessLogic.rule[R_UNASSIGNED].form"] == ("F1", "F2")
+    assert mod_by_path["unassignedBusinessLogic.rule[R_UNASSIGNED].sequence"] == (0, 1)

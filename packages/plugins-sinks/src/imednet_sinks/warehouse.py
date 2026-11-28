@@ -109,8 +109,10 @@ from imednet.spi.sinks import (
     commit_sdtm_lineage,
     deduplicate_sdtm_rows,
     extract_record_id,
+    format_nested_variable_name,
     format_variable_name,
     normalize_sink_value,
+    prefix_colliding_variable_name,
     redact_batch_records,
     rehydrate_sdtm_lineage,
     resolve_voided_sdtm_keys,
@@ -361,17 +363,17 @@ def _validate_nested_variable_keys(value: Any) -> None:
 def _normalize_variable_column(raw_key: str, metadata_keys: frozenset[str]) -> str:
     """Normalize a flattened clinical variable key and prefix ``Record`` metadata collisions with ``var_``."""
     parsed = _validate_variable_key_segments(raw_key)
-    normalized_parts: list[str] = []
-    for base, indices in parsed:
-        snake_base = _to_warehouse_snake_case(base)
-        if indices:
-            idx_suffix = indices.replace("[", "_").replace("]", "")
+    if "$" in raw_key:
+        normalized_parts: list[str] = []
+        for base, indices in parsed:
+            snake_base = _to_warehouse_snake_case(base)
+            idx_suffix = indices.replace("[", "_").replace("]", "") if indices else ""
             normalized_parts.append(f"{snake_base}{idx_suffix}")
-        else:
-            normalized_parts.append(snake_base)
-    col = "_".join(normalized_parts)
-    if col in metadata_keys:
-        col = f"var_{col}"
+        base_col = "_".join(normalized_parts)
+    else:
+        base_col = format_nested_variable_name(raw_key, "snake_case")
+    metadata_lower = frozenset(m.lower() for m in metadata_keys)
+    col = prefix_colliding_variable_name(base_col, metadata_lower, convention="snake_case")
     if not _IDENTIFIER_PATTERN.match(col):
         raise ExportConfigurationError(
             f"Warehouse column name contains invalid characters: {raw_key!r}"
@@ -384,29 +386,38 @@ def _normalize_variable_column_for_convention(
     raw_key: str,
     metadata_keys: frozenset[str],
     naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
 ) -> str:
     """Normalize a flattened variable key according to *naming_convention*."""
     if naming_convention in (None, "snake_case"):
         return _normalize_variable_column(raw_key, metadata_keys)
     parsed = _validate_variable_key_segments(raw_key)
-    parts: list[str] = []
-    for idx, (base, indices) in enumerate(parsed):
-        conv_base = format_variable_name(base, naming_convention)
-        if naming_convention == "camelCase" and idx > 0 and conv_base:
-            conv_base = conv_base[0].upper() + conv_base[1:]
-        if indices:
-            idx_suffix = indices.replace("[", "_").replace("]", "")
+    if "$" in raw_key:
+        parts: list[str] = []
+        for idx, (base, indices) in enumerate(parsed):
+            seg_dom = sdtm_domain if idx == len(parsed) - 1 else None
+            conv_base = (
+                base
+                if "$" in base
+                else format_variable_name(base, naming_convention, domain=seg_dom)
+            )
+            if naming_convention == "camelCase" and idx > 0 and conv_base:
+                conv_base = conv_base[0].upper() + conv_base[1:]
+            idx_suffix = indices.replace("[", "_").replace("]", "") if indices else ""
             parts.append(f"{conv_base}{idx_suffix}")
-        else:
-            parts.append(conv_base)
-    if naming_convention == "camelCase":
-        col = "".join(parts)
-        if col in metadata_keys:
-            col = f"var{col[0].upper()}{col[1:]}" if col else "var"
+        base_col = "".join(parts) if naming_convention == "camelCase" else "_".join(parts)
     else:
-        col = "_".join(parts)
-        if col in metadata_keys:
-            col = f"VAR_{col}"
+        base_col = format_nested_variable_name(
+            raw_key,
+            naming_convention,
+            domain=sdtm_domain,
+        )
+    metadata_lower = frozenset(m.lower() for m in metadata_keys)
+    col = prefix_colliding_variable_name(
+        base_col,
+        metadata_lower,
+        convention=naming_convention,
+    )
     if not _IDENTIFIER_PATTERN.match(col):
         raise ExportConfigurationError(
             f"Warehouse column name contains invalid characters: {raw_key!r}"
@@ -458,9 +469,35 @@ def _post_process_warehouse(
     _record_data_masked: bool = False,
     _sensitive_metadata: bool | None = None,
     _record_data_validated: bool = False,
+    _keys_already_formatted: bool = False,
     naming_convention: str | None = None,
+    sdtm_domain: str | None = None,
 ) -> dict[str, Any]:
     """Apply PHI masking, flatten ``record_data`` variables, and protect metadata columns."""
+    if naming_convention is None and "record_data" not in row:
+        if "recordData" in row and ("studyKey" in row or "recordId" in row):
+            naming_convention = "camelCase"
+            rd_probe = row.get("recordData")
+            if isinstance(rd_probe, Mapping) and all(
+                isinstance(k, str)
+                and "." not in k
+                and "[" not in k
+                and k == format_variable_name(k, "camelCase")
+                for k in rd_probe
+            ):
+                _keys_already_formatted = True
+        elif "RECORD_DATA" in row and ("STUDYID" in row or "RECORD_ID" in row):
+            naming_convention = "sdtm"
+            rd_probe = row.get("RECORD_DATA")
+            if isinstance(rd_probe, Mapping) and all(
+                isinstance(k, str)
+                and "." not in k
+                and "[" not in k
+                and k == k.upper()
+                and _IDENTIFIER_PATTERN.match(k) is not None
+                for k in rd_probe
+            ):
+                _keys_already_formatted = True
     is_default_conv = naming_convention in (None, "snake_case")
     rd_key = (
         "record_data"
@@ -533,6 +570,7 @@ def _post_process_warehouse(
 
     metadata_keys = base_meta | frozenset(extra_meta) if extra_meta else base_meta
 
+    has_nested_flat_vars = False
     raw_payload = masked_row.get(rd_key)
     flat_vars: dict[str, Any] = {}
     if raw_payload is None:
@@ -548,6 +586,7 @@ def _post_process_warehouse(
                 mask_clinical_phi(dict(parsed_payload)) if mask_phi else dict(parsed_payload)
             )
             _validate_nested_variable_keys(masked_parsed)
+            has_nested_flat_vars = True
             flat_vars = flatten(masked_parsed)
     elif raw_payload.__class__ is dict or isinstance(raw_payload, Mapping):
         payload_dict: dict[str, Any] = (
@@ -581,6 +620,7 @@ def _post_process_warehouse(
                 if all_json_primitives and not needs_rd_norm
                 else json.dumps(payload_dict, default=str)
             )
+            has_nested_flat_vars = has_nested_payload
             flat_vars = flatten(payload_dict) if has_nested_payload else payload_dict
         else:
             masked_row[rd_key] = "{}"
@@ -593,31 +633,62 @@ def _post_process_warehouse(
     if keywords.__class__ not in _SCALAR_CLASSES and isinstance(keywords, (list, dict, tuple)):
         masked_row[kw_key] = json.dumps(keywords, default=str)
 
+    metadata_lower = frozenset(m.lower() for m in metadata_keys)
+    used_lower: set[str] = {k.lower() for k in masked_row if isinstance(k, str)}
     default_col_cache = _DEFAULT_VAR_COL_CACHE if (is_default_conv and not extra_meta) else None
     for var_key, var_val in flat_vars.items():
-        if default_col_cache is not None:
-            col_name_cached = default_col_cache.get(var_key)
-            if col_name_cached is None:
-                col_name = _normalize_variable_column(var_key, _RECORD_METADATA_KEYS)
-                if len(default_col_cache) < 2048:
-                    default_col_cache[var_key] = col_name
-            else:
-                col_name = col_name_cached
-        elif is_default_conv:
-            col_name = _normalize_variable_column(var_key, metadata_keys)
-        else:
-            col_name = _normalize_variable_column_for_convention(
+        if isinstance(var_val, dict) and not var_val:
+            continue
+        if (
+            _keys_already_formatted
+            and not has_nested_flat_vars
+            and isinstance(var_key, str)
+            and "." not in var_key
+            and "[" not in var_key
+        ):
+            if not isinstance(var_key, str) or not _IDENTIFIER_PATTERN.match(var_key):
+                raise ExportConfigurationError(
+                    f"Warehouse column name contains invalid characters: {var_key!r}"
+                )
+            col_name = prefix_colliding_variable_name(
                 var_key,
-                metadata_keys,
-                naming_convention=naming_convention,
+                metadata_lower,
+                convention=naming_convention,
+                used_lower=used_lower,
             )
+        else:
+            if default_col_cache is not None:
+                col_name_cached = default_col_cache.get(var_key)
+                if col_name_cached is None:
+                    base_col = _normalize_variable_column(var_key, _RECORD_METADATA_KEYS)
+                    if len(default_col_cache) < 2048:
+                        default_col_cache[var_key] = base_col
+                else:
+                    base_col = col_name_cached
+            elif is_default_conv:
+                base_col = _normalize_variable_column(var_key, metadata_keys)
+            else:
+                base_col = _normalize_variable_column_for_convention(
+                    var_key,
+                    metadata_keys,
+                    naming_convention=naming_convention,
+                    sdtm_domain=sdtm_domain,
+                )
+            if base_col.lower() in used_lower:
+                col_name = prefix_colliding_variable_name(
+                    base_col,
+                    metadata_lower,
+                    convention=naming_convention,
+                    used_lower=used_lower,
+                )
+            else:
+                used_lower.add(base_col.lower())
+                col_name = base_col
         val_cls = var_val.__class__
         if val_cls in _SCALAR_CLASSES:
             masked_row[col_name] = var_val
         elif isinstance(var_val, Enum):
             masked_row[col_name] = var_val.value if var_val.value.__class__ is str else str(var_val)
-        elif isinstance(var_val, dict) and not var_val:
-            continue
         elif isinstance(var_val, (dict, list, tuple)):
             masked_row[col_name] = json.dumps(var_val, default=str)
         else:
@@ -639,6 +710,7 @@ def _post_process_warehouse_sdtm(
     if mask_phi and not _already_masked:
         normalized = redact_batch_records(normalized, mask_phi=True, as_sdtm=True)
     cleaned: dict[str, Any] = {}
+    used_lower: set[str] = set()
     for col, val in normalized.items():
         if not isinstance(col, str) or not _IDENTIFIER_PATTERN.match(col):
             raise ExportConfigurationError(
@@ -646,10 +718,15 @@ def _post_process_warehouse_sdtm(
             )
         if isinstance(val, dict) and not val:
             continue
+        unique_col = prefix_colliding_variable_name(
+            col,
+            convention="sdtm",
+            used_lower=used_lower,
+        )
         if isinstance(val, (dict, list, tuple)):
-            cleaned[col] = json.dumps(val, default=str)
+            cleaned[unique_col] = json.dumps(val, default=str)
         else:
-            cleaned[col] = val
+            cleaned[unique_col] = val
     return _omit_empty_structs(cleaned)
 
 
@@ -813,12 +890,18 @@ def _resolve_merge_columns(arrow_table: Any) -> list[str]:
     else:
         columns = list(_WAREHOUSE_RECORD_COLUMNS)
 
+    deduped: list[str] = []
+    seen_upper: set[str] = set()
     for col in columns:
         if not _IDENTIFIER_PATTERN.match(col):
             raise ExportConfigurationError(
                 f"Warehouse column name contains invalid characters: {col!r}"
             )
-    return columns
+        upper = col.upper()
+        if upper not in seen_upper:
+            seen_upper.add(upper)
+            deduped.append(col)
+    return deduped
 
 
 def _resolve_column_types(arrow_table: Any, columns: Sequence[str]) -> dict[str, str]:
@@ -945,13 +1028,14 @@ def _resolve_merge_keys(
     """Resolve Snowflake ``MERGE INTO`` natural key columns for the active schema mode."""
     col_set = set(columns)
     if as_sdtm:
-        if "STUDYID" in col_set and "RECORD_ID" in col_set:
-            return ("STUDYID", "RECORD_ID")
         dom_upper = sdtm_domain.strip().upper() if isinstance(sdtm_domain, str) else ""
         if dom_upper == "DM":
-            seq_col: str | None = None
-        elif dom_upper and f"{dom_upper}SEQ" in col_set:
-            seq_col = f"{dom_upper}SEQ"
+            dm_present = tuple(c for c in ("STUDYID", "DOMAIN", "USUBJID") if c in col_set)
+            return dm_present if dm_present else (columns[0],)
+        if "STUDYID" in col_set and "RECORD_ID" in col_set:
+            return ("STUDYID", "RECORD_ID")
+        if dom_upper and f"{dom_upper}SEQ" in col_set:
+            seq_col: str | None = f"{dom_upper}SEQ"
         else:
             seq_col = next(
                 (
@@ -982,9 +1066,6 @@ def _resolve_sdtm_domain_merge_partitions(
     sdtm_domain: str | None = None,
 ) -> list[tuple[str | None, tuple[str, ...]]]:
     """Resolve ``(domain_filter, merge_keys)`` partitions for single- or mixed-domain SDTM merges."""
-    if "STUDYID" in merge_columns and "RECORD_ID" in merge_columns:
-        return [(None, ("STUDYID", "RECORD_ID"))]
-
     domains_in_batch: list[str] = []
     seen_domains: set[str] = set()
     col_names = getattr(arrow_table, "column_names", ())
@@ -1015,6 +1096,9 @@ def _resolve_sdtm_domain_merge_partitions(
                 ),
             )
         ]
+
+    if "DM" not in domains_in_batch and "STUDYID" in merge_columns and "RECORD_ID" in merge_columns:
+        return [(None, ("STUDYID", "RECORD_ID"))]
 
     return [
         (
@@ -1058,7 +1142,13 @@ def _records_to_arrow_table(
     mapper_convention = getattr(mapper, "naming_convention", naming_convention)
     is_default_conv = mapper_convention in (None, "snake_case")
 
-    def _make_mapped_post_proc(batch_sensitive: bool, conv: str | None = None) -> Any:
+    def _make_mapped_post_proc(
+        batch_sensitive: bool,
+        conv: str | None = None,
+        dom: str | None = None,
+        *,
+        already_formatted: bool = False,
+    ) -> Any:
         def _batch_post_proc_mapped(row: dict[str, Any]) -> dict[str, Any]:
             return _post_process_warehouse(
                 row,
@@ -1066,18 +1156,27 @@ def _records_to_arrow_table(
                 _record_data_masked=True,
                 _sensitive_metadata=batch_sensitive,
                 _record_data_validated=True,
+                _keys_already_formatted=already_formatted,
                 naming_convention=conv,
+                sdtm_domain=dom,
             )
 
         return _batch_post_proc_mapped
 
-    def _make_unmasked_post_proc(conv: str | None = None) -> Any:
+    def _make_unmasked_post_proc(
+        conv: str | None = None,
+        dom: str | None = None,
+        *,
+        already_formatted: bool = False,
+    ) -> Any:
         def _batch_post_proc_unmasked(row: dict[str, Any]) -> dict[str, Any]:
             return _post_process_warehouse(
                 row,
                 mask_phi=False,
                 _record_data_validated=True,
+                _keys_already_formatted=already_formatted,
                 naming_convention=conv,
+                sdtm_domain=dom,
             )
 
         return _batch_post_proc_unmasked
@@ -1099,14 +1198,24 @@ def _records_to_arrow_table(
             raw_rows = deduplicate_sdtm_rows(mapper.map_batch(records, study_key=study_key))
         else:
             post_proc = (
-                _make_mapped_post_proc(False, mapper_convention)
+                _make_mapped_post_proc(
+                    False,
+                    mapper_convention,
+                    sdtm_domain,
+                    already_formatted=True,
+                )
                 if mask_phi
-                else _make_unmasked_post_proc(mapper_convention)
+                else _make_unmasked_post_proc(
+                    mapper_convention,
+                    sdtm_domain,
+                    already_formatted=True,
+                )
             )
             mapper = CentralizedMapper(
                 mode="tabular",
                 post_processor=post_proc,
                 mask_phi=mask_phi,
+                sdtm_domain=sdtm_domain,
                 naming_convention=None if is_default_conv else mapper_convention,
             )
             raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
@@ -1117,9 +1226,19 @@ def _records_to_arrow_table(
             raw_sdtm = [mapper.map_record(r, study_key=study_key) for r in records]
         if raw_sdtm and any("RECORD_ID" in r for r in raw_sdtm):
             dedup_by_rec: dict[tuple[Any, Any], int] = {}
+            dedup_dm_by_subj: dict[tuple[str, str], int] = {}
             staged_sdtm: list[dict[str, Any] | None] = []
             without_rid: list[dict[str, Any]] = []
             for r_row in raw_sdtm:
+                r_dom = str(r_row.get("DOMAIN") or "").strip().upper()
+                r_usub = str(r_row.get("USUBJID") or "").strip()
+                if r_dom == "DM" and r_usub:
+                    dm_key = (str(r_row.get("STUDYID") or ""), r_usub)
+                    if dm_key in dedup_dm_by_subj:
+                        staged_sdtm[dedup_dm_by_subj[dm_key]] = None
+                    dedup_dm_by_subj[dm_key] = len(staged_sdtm)
+                    staged_sdtm.append(r_row)
+                    continue
                 if "RECORD_ID" not in r_row or r_row.get("RECORD_ID") is None:
                     without_rid.append(r_row)
                     continue
@@ -1147,18 +1266,26 @@ def _records_to_arrow_table(
                 for row in mapped_rows
             ]
     else:
+        mapper_dom = getattr(mapper, "sdtm_domain", None) or sdtm_domain
         orig_post_proc = getattr(mapper, "post_processor", None)
         if isinstance(mapper, CentralizedMapper) and orig_post_proc in (
             _post_process_warehouse_mapped,
             _post_process_warehouse_unmasked,
         ):
+            already_fmt = mapper.mode == "tabular"
             mapper.post_processor = (
                 _make_mapped_post_proc(
                     False if mapper.mask_phi else _has_sensitive_record_metadata(),
                     mapper_convention,
+                    mapper_dom,
+                    already_formatted=already_fmt,
                 )
                 if orig_post_proc is _post_process_warehouse_mapped
-                else _make_unmasked_post_proc(mapper_convention)
+                else _make_unmasked_post_proc(
+                    mapper_convention,
+                    mapper_dom,
+                    already_formatted=already_fmt,
+                )
             )
             try:
                 raw_rows = [mapper.map_record(r, study_key=study_key) for r in records]
@@ -1196,7 +1323,9 @@ def _records_to_arrow_table(
                         _record_data_masked=effective_mask and is_tabular_centralized,
                         _sensitive_metadata=batch_sensitive,
                         _record_data_validated=is_tabular_centralized,
+                        _keys_already_formatted=is_tabular_centralized,
                         naming_convention=mapper_convention,
+                        sdtm_domain=mapper_dom,
                     )
                     for row in mapped_rows
                 ]
@@ -1367,22 +1496,39 @@ class _SnowflakeSinkCoreMixin:
                     )
                     existing_cols[name_str.lower()] = (name_str, dtype_str)
 
+        unique_cols: list[str] = []
+        effective_col_types: dict[str, str] = {}
+        seen_upper_cols: dict[str, str] = {}
+        for col in columns:
+            col_upper = col.upper()
+            if col_upper not in seen_upper_cols:
+                seen_upper_cols[col_upper] = col
+                unique_cols.append(col)
+                effective_col_types[col] = col_types[col]
+            else:
+                first_col = seen_upper_cols[col_upper]
+                if _canonical_snowflake_type(
+                    effective_col_types[first_col]
+                ) != _canonical_snowflake_type(col_types[col]):
+                    effective_col_types[first_col] = "VARCHAR"
+
         if not existing_cols:
             col_defs = ", ".join(
-                f"{_quote_identifier(col.upper())} {col_types[col]}" for col in columns
+                f"{_quote_identifier(col.upper())} {effective_col_types[col]}"
+                for col in unique_cols
             )
             cur.execute(f"CREATE TABLE IF NOT EXISTS {target_table} ({col_defs})")  # nosem
             self._ensured_tables.add(target_table)
             return
 
-        for col in columns:
+        for col in unique_cols:
             col_lower = col.lower()
             if col_lower not in existing_cols:
                 continue
             actual_name, existing_dtype = existing_cols[col_lower]
             if _should_widen_to_varchar(
                 existing_dtype,
-                col_types[col],
+                effective_col_types[col],
                 is_null_col=_is_null_arrow_column(arrow_table, col),
             ):
                 safe_existing = (
@@ -1400,10 +1546,11 @@ class _SnowflakeSinkCoreMixin:
                     f"ALTER TABLE {target_table} RENAME COLUMN {quoted_swap} TO {quoted_target}"
                 )  # nosem
 
-        missing_cols = [col for col in columns if col.lower() not in existing_cols]
+        missing_cols = [col for col in unique_cols if col.lower() not in existing_cols]
         if missing_cols:
             add_defs = ", ".join(
-                f"{_quote_identifier(col.upper())} {col_types[col]}" for col in missing_cols
+                f"{_quote_identifier(col.upper())} {effective_col_types[col]}"
+                for col in missing_cols
             )
             cur.execute(f"ALTER TABLE {target_table} ADD COLUMN {add_defs}")  # nosem
         self._ensured_tables.add(target_table)
@@ -1497,7 +1644,10 @@ class _SnowflakeSinkCoreMixin:
                 _post_process_warehouse,
                 mask_phi=self.config.mask_phi,
                 _record_data_masked=self.config.mask_phi,
+                _record_data_validated=True,
+                _keys_already_formatted=True,
                 naming_convention=cfg.naming_convention,
+                sdtm_domain=cfg.sdtm_domain,
             )
         else:
             post_proc = (

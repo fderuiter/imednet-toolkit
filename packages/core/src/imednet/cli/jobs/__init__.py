@@ -18,7 +18,7 @@ from ..utils.args import (
     resolve_study_key,
 )
 from ..utils.output import display_list
-from ..utils.write_helpers import make_job_progress_callback
+from ..utils.write_helpers import _sanitize_job_for_cli, make_job_progress_callback
 
 JOB_SUMMARY_FIELDS: list[str] = [
     "batch_id",
@@ -77,6 +77,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
     wait_parser.add_argument("batch_id", help="Job batch ID.")
     wait_parser.add_argument("--interval", type=int, default=5, help="Polling interval in seconds.")
     wait_parser.add_argument("--timeout", type=int, default=300, help="Maximum time to wait.")
+    wait_parser.add_argument(
+        "--resolve-results",
+        action="store_true",
+        default=False,
+        help="Fetch and attach terminal resultUrl payloads after polling completes.",
+    )
 
     add_output_format(wait_parser)
     add_simulation_arg(wait_parser)
@@ -89,22 +95,35 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         interval: int,
         timeout: int,
         output_format: str | None = None,
+        resolve_results: bool = False,
     ) -> None:
         resolved_format = resolve_output_format(output_format)
         with fetching_status("job result", study_key) as status_ctrl:
-            job = sdk.poll_job(
-                study_key,
-                batch_id,
-                interval=interval,
-                timeout=timeout,
-                on_progress=make_job_progress_callback(status_ctrl),
-            )
+            progress_cb = make_job_progress_callback(status_ctrl)
+            if resolve_results:
+                job = sdk.poll_job(
+                    study_key,
+                    batch_id,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=progress_cb,
+                    resolve_results=True,
+                )
+            else:
+                job = sdk.poll_job(
+                    study_key,
+                    batch_id,
+                    interval=interval,
+                    timeout=timeout,
+                    on_progress=progress_cb,
+                )
+        rendered_job = _sanitize_job_for_cli(job) if resolve_results else job
         display_list(
-            [job],
+            [rendered_job],
             "jobs",
             fields=JOB_SUMMARY_FIELDS,
             output_format=resolved_format,
-            details=[job],
+            details=[rendered_job],
             interactive=False,
         )
 
@@ -120,6 +139,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
                 interval=args.interval,
                 timeout=args.timeout,
                 output_format=resolve_output_format(args.output_format),
+                resolve_results=bool(getattr(args, "resolve_results", False)),
             )
 
     wait_parser.set_defaults(func=_dispatch_job_wait)

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, TypedDict, Unpack, cast
 
 from imednet.errors import ValidationError
-from imednet.models.jobs import Job, JobStatus
+from imednet.models.jobs import FAILED_JOB_STATES, Job, JobStatus
 from imednet.utils.job_poller import (
     BaseJobPoller,
     JobFailedError,
@@ -154,6 +154,123 @@ class BatchSubmissionSummary:
     def unsubmitted_records(self) -> list[dict[str, Any]]:
         """Return flattened unsubmitted record slices across all unsubmitted chunks."""
         return [rec for chunk in self.unsubmitted_chunks for rec in chunk]
+
+    def _iter_settled_statuses(self) -> list[JobStatus]:
+        """Return terminal JobStatus instances in chunk submission order."""
+        settled: list[JobStatus] = []
+        seen_batch_ids: set[str] = set()
+        terminal_map = self.poll_summary.terminal_statuses if self.poll_summary is not None else {}
+        for job in self.jobs:
+            bid = getattr(job, "batch_id", None)
+            if isinstance(bid, str) and bid and bid in terminal_map:
+                if bid not in seen_batch_ids:
+                    settled.append(terminal_map[bid])
+                    seen_batch_ids.add(bid)
+                continue
+            if isinstance(job, JobStatus):
+                if isinstance(bid, str) and bid:
+                    if bid in seen_batch_ids:
+                        continue
+                    seen_batch_ids.add(bid)
+                settled.append(job)
+        for bid, status in terminal_map.items():
+            if bid not in seen_batch_ids:
+                settled.append(status)
+                seen_batch_ids.add(bid)
+        return settled
+
+    @staticmethod
+    def _extract_result_items(results: Any) -> list[dict[str, Any]]:
+        """Extract record result entries from a list or dict ``JobStatus.results`` payload."""
+        if isinstance(results, list):
+            return [item for item in results if isinstance(item, dict)]
+        if isinstance(results, dict):
+            for list_key in ("records", "data", "items"):
+                nested = results.get(list_key)
+                if isinstance(nested, list):
+                    return [item for item in nested if isinstance(item, dict)]
+            if any(
+                id_key in results
+                for id_key in (
+                    "recordId",
+                    "record_id",
+                    "recordOid",
+                    "record_oid",
+                    "subjectKey",
+                    "subject_key",
+                    "subjectId",
+                    "subject_id",
+                )
+            ):
+                return [results]
+        return []
+
+    @property
+    def successful_records(self) -> list[dict[str, Any]]:
+        """Return sanitized successful record result dicts across polled jobs."""
+        collected: list[dict[str, Any]] = []
+        for status in self._iter_settled_statuses():
+            job_failed = bool(status.state in FAILED_JOB_STATES) if status.state else False
+            for item in self._extract_result_items(getattr(status, "results", None)):
+                if JobStatus._item_is_successful(item, job_failed=job_failed):
+                    collected.append(cast(dict[str, Any], sanitize_diagnostic_payload(item)))
+        return collected
+
+    @property
+    def record_errors(self) -> list[dict[str, Any]]:
+        """Return sanitized per-record and variable-level error dicts across polled jobs."""
+        from imednet.utils.job_poller import _extract_record_errors
+
+        collected: list[dict[str, Any]] = []
+        seen_statuses: set[int] = set()
+        for status in self._iter_settled_statuses():
+            seen_statuses.add(id(status))
+            collected.extend(_extract_record_errors(status))
+        if self.poll_summary is not None:
+            for err in self.poll_summary.failures.values():
+                err_status = getattr(err, "status", None)
+                if (
+                    err_status is not None
+                    and id(err_status) in seen_statuses
+                    and getattr(err_status, "results", None) is not None
+                ):
+                    continue
+                explicit_errors = getattr(err, "record_errors", None)
+                if isinstance(explicit_errors, list):
+                    for entry in explicit_errors:
+                        if isinstance(entry, dict):
+                            collected.append(
+                                cast(dict[str, Any], sanitize_diagnostic_payload(entry))
+                            )
+        return collected
+
+    @property
+    def created_record_ids(self) -> list[int]:
+        """Return server-assigned integer ``recordId`` values across successful records."""
+        seen: dict[int, None] = {}
+        for item in self.successful_records:
+            raw_id = (
+                item.get("recordId") if item.get("recordId") is not None else item.get("record_id")
+            )
+            if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+                seen[raw_id] = None
+            elif isinstance(raw_id, str):
+                stripped = raw_id.strip()
+                if stripped.lstrip("-").isdigit():
+                    seen[int(stripped)] = None
+        return list(seen.keys())
+
+    @property
+    def enrolled_subject_keys(self) -> list[str]:
+        """Return sanitized ``subjectKey`` values across successful records."""
+        seen: dict[str, None] = {}
+        for item in self.successful_records:
+            raw_key = item.get("subjectKey") or item.get("subject_key")
+            if isinstance(raw_key, str) and raw_key.strip():
+                sanitized = sanitize_diagnostic_text(raw_key.strip())
+                if sanitized:
+                    seen[sanitized] = None
+        return list(seen.keys())
 
     @property
     def last_job(self) -> Job | None:
@@ -1249,6 +1366,7 @@ class _RecordsBatchOptions(TypedDict, total=False):
     on_progress: JobProgressHandler | None
     dry_run: bool
     collect_errors: bool
+    resolve_results: bool
 
 
 def _bind_study_poller(
@@ -1257,14 +1375,22 @@ def _bind_study_poller(
     enabled: bool,
     interval: float,
     timeout: float,
+    *,
+    resolve_results: bool = True,
 ) -> Callable[..., Any] | None:
     if not enabled or poll_fn is None:
         return None
+    supports_resolve = _accepts_kwarg(poll_fn, "resolve_results")
 
     def _poller(target: Any, *, on_progress: JobProgressHandler | None = None) -> Any:
-        return poll_fn(
-            study_key, target, interval=interval, timeout=timeout, on_progress=on_progress
-        )
+        kwargs: dict[str, Any] = {
+            "interval": interval,
+            "timeout": timeout,
+            "on_progress": on_progress,
+        }
+        if supports_resolve:
+            kwargs["resolve_results"] = resolve_results
+        return poll_fn(study_key, target, **kwargs)
 
     return _poller
 
@@ -1287,6 +1413,7 @@ def _prepare_records_batch_execution(
     wait = options.get("wait_for_completion", False)
     timeout = options.get("timeout", 300.0)
     interval = options.get("interval", 5.0)
+    resolve_results = options.get("resolve_results", True)
     normalized = normalize_records_input(records_data, schema=schema, study_key=study_key)
 
     def _submit_chunk(chunk: list[dict[str, Any]]) -> Any:
@@ -1298,8 +1425,12 @@ def _prepare_records_batch_execution(
         "schema": schema,
         "skip_validation": options.get("skip_validation", False),
         "wait_for_completion": wait,
-        "poll_single": _bind_study_poller(study_key, poll_single_fn, wait, interval, timeout),
-        "poll_many": _bind_study_poller(study_key, poll_many_fn, wait, interval, timeout),
+        "poll_single": _bind_study_poller(
+            study_key, poll_single_fn, wait, interval, timeout, resolve_results=resolve_results
+        ),
+        "poll_many": _bind_study_poller(
+            study_key, poll_many_fn, wait, interval, timeout, resolve_results=resolve_results
+        ),
         "on_progress": options.get("on_progress"),
         "require_batch_id": wait,
         "dry_run": options.get("dry_run", False),
@@ -1378,6 +1509,8 @@ def _facade_poll_kwargs(
     on_progress: JobProgressHandler | None,
     *,
     coerce_float: bool = False,
+    resolve_results: bool = False,
+    target_fn: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "timeout": float(timeout) if coerce_float else timeout,
@@ -1385,6 +1518,8 @@ def _facade_poll_kwargs(
     }
     if on_progress is not None:
         kwargs["on_progress"] = on_progress
+    if resolve_results and (target_fn is None or _accepts_kwarg(target_fn, "resolve_results")):
+        kwargs["resolve_results"] = True
     return kwargs
 
 
@@ -1396,6 +1531,8 @@ def _call_facade_poll_many(
     timeout: float,
     poll_interval: float,
     on_progress: JobProgressHandler | None,
+    *,
+    resolve_results: bool = False,
 ) -> Any:
     poll_jobs_fn = getattr(sdk, attr_name, None)
     if not callable(poll_jobs_fn):
@@ -1403,7 +1540,14 @@ def _call_facade_poll_many(
     return poll_jobs_fn(
         study_key,
         batch_ids,
-        **_facade_poll_kwargs(timeout, poll_interval, on_progress, coerce_float=True),
+        **_facade_poll_kwargs(
+            timeout,
+            poll_interval,
+            on_progress,
+            coerce_float=True,
+            resolve_results=resolve_results,
+            target_fn=poll_jobs_fn,
+        ),
     )
 
 
@@ -1415,10 +1559,20 @@ def poll_facade_single_sync(
     timeout: float,
     poll_interval: float,
     on_progress: JobProgressHandler | None = None,
+    resolve_results: bool = False,
 ) -> Any:
     """Poll a single batch ID via ``sdk.poll_job``, omitting ``on_progress`` when ``None``."""
-    return sdk.poll_job(
-        study_key, batch_id, **_facade_poll_kwargs(timeout, poll_interval, on_progress)
+    poll_job_fn = sdk.poll_job
+    return poll_job_fn(
+        study_key,
+        batch_id,
+        **_facade_poll_kwargs(
+            timeout,
+            poll_interval,
+            on_progress,
+            resolve_results=resolve_results,
+            target_fn=poll_job_fn,
+        ),
     )
 
 
@@ -1430,16 +1584,24 @@ async def poll_facade_single_async(
     timeout: float,
     poll_interval: float,
     on_progress: JobProgressHandler | None = None,
+    resolve_results: bool = False,
 ) -> Any:
     """Asynchronously poll a single batch ID via ``sdk.poll_job``."""
     from imednet.utils.async_bridge import call_async_facade_method
 
+    target_fn = getattr(sdk, "poll_job", None) or getattr(sdk, "async_poll_job", None)
     return await call_async_facade_method(
         sdk,
         "poll_job",
         study_key,
         batch_id,
-        **_facade_poll_kwargs(timeout, poll_interval, on_progress),
+        **_facade_poll_kwargs(
+            timeout,
+            poll_interval,
+            on_progress,
+            resolve_results=resolve_results,
+            target_fn=target_fn if callable(target_fn) else None,
+        ),
     )
 
 
@@ -1451,10 +1613,18 @@ def poll_facade_many_sync(
     timeout: float,
     poll_interval: float,
     on_progress: JobProgressHandler | None = None,
+    resolve_results: bool = False,
 ) -> JobPollSummary:
     """Poll multiple batch IDs via ``sdk.poll_jobs`` with fallback to ``sdk.poll_job``."""
     candidate = _call_facade_poll_many(
-        sdk, "poll_jobs", study_key, batch_ids, timeout, poll_interval, on_progress
+        sdk,
+        "poll_jobs",
+        study_key,
+        batch_ids,
+        timeout,
+        poll_interval,
+        on_progress,
+        resolve_results=resolve_results,
     )
     if isinstance(candidate, JobPollSummary):
         return candidate
@@ -1468,6 +1638,7 @@ def poll_facade_many_sync(
             timeout=timeout,
             poll_interval=poll_interval,
             on_progress=on_progress,
+            resolve_results=resolve_results,
         ),
         raise_on_failure=False,
     )
@@ -1481,6 +1652,7 @@ async def poll_facade_many_async(
     timeout: float,
     poll_interval: float,
     on_progress: JobProgressHandler | None = None,
+    resolve_results: bool = False,
 ) -> JobPollSummary:
     """Asynchronously poll multiple batch IDs via ``sdk.poll_jobs`` with fallback."""
     try:
@@ -1493,7 +1665,14 @@ async def poll_facade_many_async(
     )
     for attr_name in method_order:
         maybe_coro = _call_facade_poll_many(
-            sdk, attr_name, study_key, batch_ids, timeout, poll_interval, on_progress
+            sdk,
+            attr_name,
+            study_key,
+            batch_ids,
+            timeout,
+            poll_interval,
+            on_progress,
+            resolve_results=resolve_results,
         )
         if hasattr(maybe_coro, "__await__"):
             candidate = await maybe_coro
@@ -1509,6 +1688,7 @@ async def poll_facade_many_async(
             timeout=timeout,
             poll_interval=poll_interval,
             on_progress=on_progress,
+            resolve_results=resolve_results,
         ),
         raise_on_failure=False,
     )

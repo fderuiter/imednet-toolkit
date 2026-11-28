@@ -78,6 +78,7 @@ class SensitivityRegistry:
         # Default clinical and CDISC PHI fields
         self._sensitive_keys = {
             "patient_name",
+            "patname",
             "patient_initials",
             "dob",
             "date_of_birth",

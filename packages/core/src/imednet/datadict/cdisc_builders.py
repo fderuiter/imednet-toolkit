@@ -8,19 +8,31 @@ import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from defusedxml import ElementTree as DefusedET
 from defusedxml.common import DefusedXmlException
 from pydantic import ValidationError
 
 from imednet.models.sdtm import (
+    _UNSET_PIPELINE,
+    build_form_sdtm_domain_map,
+    deduplicate_sdtm_rows,
     format_iso8601_dtc,
+    format_nested_variable_name,
     get_sdtm_domain_variables,
+    prefix_colliding_variable_name,
+    resolve_form_sdtm_domain,
     transform_records_to_sdtm_rows,
 )
-from imednet.models.standards import format_variable_name, resolve_sdtm_domain
+from imednet.models.standards import (
+    format_variable_name,
+    normalize_naming_convention,
+    resolve_sdtm_domain,
+)
 from imednet.utils.dates import normalize_iso_date
 from imednet.utils.security import (
     SensitivityRegistry,
@@ -30,14 +42,19 @@ from imednet.utils.security import (
 )
 from imednet.utils.tabular import MASKED_SENTINEL
 
-from .emit import ODM_NS, _allocate_item_oids, _scrub_clinical_free_text
+from .emit import (
+    ODM_NS,
+    _allocate_item_oids,
+    _is_cdisc_identifier_sensitive,
+    _scrub_clinical_free_text,
+)
 from .exchange import (
-    DatasetJsonClinicalData,
+    DatasetJsonBundle,
+    DatasetJsonColumn,
     DatasetJsonEnvelope,
-    DatasetJsonItem,
-    DatasetJsonItemGroup,
     DatasetJsonItemType,
     DatasetJsonScalar,
+    DatasetJsonSourceSystem,
     OdmAdminData,
     OdmAnnotation,
     OdmArchive,
@@ -177,10 +194,19 @@ def _is_birth_variable(key: str) -> bool:
     return bool(cleaned) and (cleaned in _SDTM_BIRTH_DATE_TOKENS or cleaned.endswith("brthdtc"))
 
 
+def _resolve_toolkit_version() -> str:
+    """Resolve the installed ``imednet`` package version with a deterministic fallback."""
+    try:
+        return _pkg_version("imednet")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
 def _mask_scalar_if_sensitive(
     value: Any,
     *,
     var_name: str,
+    item_oid: str | None = None,
     label: str | None = None,
     mask_phi: bool = True,
     registry: SensitivityRegistry | None = None,
@@ -192,10 +218,7 @@ def _mask_scalar_if_sensitive(
     active_reg = global_sensitivity_registry if registry is None else registry
     if as_sdtm and _is_birth_variable(var_name) and not active_reg.is_exempt(var_name):
         return format_iso8601_dtc(value, mask_phi=True)
-    is_sens = active_reg.is_sensitive(var_name) or (
-        bool(label) and not active_reg.is_exempt(var_name) and active_reg.is_sensitive(label)
-    )
-    if is_sens:
+    if _is_cdisc_identifier_sensitive(active_reg, var_name, item_oid, label=label):
         return MASKED_SENTINEL
     if isinstance(value, (dict, list, tuple)):
         return mask_clinical_phi(value, registry=active_reg)
@@ -629,6 +652,9 @@ def map_queries_to_annotations(
         )
         var_raw = _attr_or_key(query, "variable")
         var_name = str(var_raw).strip() if var_raw is not None and str(var_raw).strip() else None
+        var_is_sensitive = bool(
+            mask_phi and var_name and _is_cdisc_identifier_sensitive(reg, var_name)
+        )
         subj_raw = _attr_or_key(query, "subject_key", "subjectKey")
         subj_key = str(subj_raw).strip() if subj_raw is not None and str(subj_raw).strip() else None
         desc_raw = _attr_or_key(query, "description")
@@ -668,11 +694,12 @@ def map_queries_to_annotations(
                 if c_text_raw and str(c_text_raw).strip():
                     parts.append(str(c_text_raw).strip())
                 raw_combined = " - ".join(parts) if parts else f"Query {ann_id_raw}"
-                comment_str = (
-                    _scrub_clinical_free_text(raw_combined, registry=reg)
-                    if mask_phi
-                    else raw_combined
-                )
+                if var_is_sensitive:
+                    comment_str = MASKED_SENTINEL
+                elif mask_phi:
+                    comment_str = _scrub_clinical_free_text(raw_combined, registry=reg)
+                else:
+                    comment_str = raw_combined
                 sponsor_or_site = (
                     "Site" if ann_type_raw and "site" in str(ann_type_raw).lower() else "Sponsor"
                 )
@@ -707,9 +734,12 @@ def map_queries_to_annotations(
                 if desc_raw and str(desc_raw).strip()
                 else f"Query {ann_id_raw}"
             )
-            comment_str = (
-                _scrub_clinical_free_text(raw_desc, registry=reg) if mask_phi else raw_desc
-            )
+            if var_is_sensitive:
+                comment_str = MASKED_SENTINEL
+            elif mask_phi:
+                comment_str = _scrub_clinical_free_text(raw_desc, registry=reg)
+            else:
+                comment_str = raw_desc
             flags = [
                 OdmFlag(
                     flagValue=q_status_str or "Open",
@@ -760,6 +790,52 @@ def _format_odm_item_value(val: Any) -> tuple[str | None, bool]:
     return text, False
 
 
+def _run_enrichment_record_map(
+    enrichment_pipeline: Any,
+    rdata: dict[str, Any],
+    *,
+    mask_phi: bool,
+    form_key: str | None = None,
+) -> dict[str, Any]:
+    """Run an enrichment pipeline on a single record payload dict with graceful signature fallback."""
+    if enrichment_pipeline is None or not callable(getattr(enrichment_pipeline, "process", None)):
+        return rdata
+    try:
+        processed = enrichment_pipeline.process(rdata, mask_phi=mask_phi, form_key=form_key)
+    except TypeError:
+        try:
+            processed = enrichment_pipeline.process(rdata, mask_phi=mask_phi)
+        except TypeError:
+            processed = enrichment_pipeline.process(rdata)
+    return dict(processed) if isinstance(processed, Mapping) else rdata
+
+
+def _collect_renamed_variable_pairs(
+    enrichment_pipeline: Any,
+    *,
+    form_key: str | None = None,
+) -> dict[str, str]:
+    """Return ``{source_var: target_field}`` pairs from *enrichment_pipeline* applicable to *form_key*."""
+    if enrichment_pipeline is None:
+        return {}
+    raw_rules = getattr(enrichment_pipeline, "all_mappings", None)
+    if not isinstance(raw_rules, Sequence):
+        raw_map = getattr(enrichment_pipeline, "mappings", None)
+        raw_rules = list(raw_map.values()) if isinstance(raw_map, Mapping) else []
+    norm_fk = re.sub(r"[^a-z0-9]", "", (form_key or "").lower())
+    renamed: dict[str, str] = {}
+    for rule in raw_rules:
+        src = getattr(rule, "source_variable_name", None)
+        tgt = getattr(rule, "target_field", None)
+        if not src or not tgt or str(src) == str(tgt):
+            continue
+        rule_fk = getattr(rule, "source_form_key", None)
+        if rule_fk and norm_fk and re.sub(r"[^a-z0-9]", "", str(rule_fk).lower()) != norm_fk:
+            continue
+        renamed[str(src)] = str(tgt)
+    return renamed
+
+
 def build_odm_archive(
     study_key: str,
     *,
@@ -779,16 +855,29 @@ def build_odm_archive(
     metadata_version_oid: str = "MDV.001",
     metadata_version_name: str | None = None,
     file_oid: str | None = None,
+    file_type: Literal["Snapshot", "Transactional"] = "Snapshot",
     creation_datetime: str | None = None,
     mask_phi: bool = True,
     custom_phi_keys: Collection[str] | None = None,
+    enrichment_pipeline: Any = None,
     include_deleted: bool = False,
 ) -> OdmArchive:
     """Build a complete, deterministic CDISC ODM 1.3.2 :class:`OdmArchive` snapshot."""
-    reg = build_study_sensitivity_registry(custom_phi_keys)
+    merged_phi_keys: set[str] = set(custom_phi_keys or ())
+    pipe_phi = getattr(enrichment_pipeline, "phi_keys", None)
+    if isinstance(pipe_phi, Iterable) and not isinstance(pipe_phi, (str, bytes)):
+        merged_phi_keys.update(str(k) for k in pipe_phi if k)
+    effective_phi_keys: Collection[str] | None = merged_phi_keys or None
+    reg = build_study_sensitivity_registry(effective_phi_keys)
+    allow_remove = file_type == "Transactional"
     records_list = [
-        rec for rec in records if include_deleted or not bool(_attr_or_key(rec, "deleted"))
+        rec
+        for rec in records
+        if (include_deleted and allow_remove) or not bool(_attr_or_key(rec, "deleted"))
     ]
+    forms_list = list(forms)
+    variables_list = list(variables)
+    intervals_list = list(intervals)
     revisions_list = list(revisions)
     queries_list = list(queries)
     sites_list = list(sites)
@@ -804,9 +893,9 @@ def build_odm_archive(
     )
     dd = data_dictionary or build_datadict_from_sdk_metadata(
         study_key,
-        forms=forms,
-        variables=variables,
-        intervals=intervals,
+        forms=forms_list,
+        variables=variables_list,
+        intervals=intervals_list,
         study_name=str(s_name) if s_name else None,
         study_description=str(s_desc) if s_desc else None,
     )
@@ -821,7 +910,7 @@ def build_odm_archive(
     for f_obj in dd.forms:
         if isinstance(f_obj.formId, int) and not isinstance(f_obj.formId, bool):
             form_id_to_key[f_obj.formId] = f_obj.formKey
-    for raw_f in forms:
+    for raw_f in forms_list:
         fid = _attr_or_key(raw_f, "form_id", "formId")
         fk = _attr_or_key(raw_f, "form_key", "formKey")
         if isinstance(fid, int) and not isinstance(fid, bool) and fk:
@@ -829,6 +918,13 @@ def build_odm_archive(
 
     extra_forms: list[Form] = []
     discovered_vars_by_fk: dict[str, set[str]] = {}
+    enriched_rdata_by_rec_id: dict[int, dict[str, Any]] = {}
+    inherited_sensitive_by_rec_id: dict[int, set[str]] = {}
+    dd_var_labels: dict[tuple[str, str], str | None] = {
+        (f_obj.formKey, v_obj.variableName): v_obj.label
+        for f_obj in dd.forms
+        for v_obj in f_obj.variables
+    }
     for rec in records_list:
         rfk = _attr_or_key(rec, "form_key", "formKey")
         rfid = _attr_or_key(rec, "form_id", "formId")
@@ -838,9 +934,27 @@ def build_odm_archive(
             else (form_id_to_key.get(rfid, f"FORM_{rfid}") if rfid is not None else "FORM_DEFAULT")
         )
         rec_data = _attr_or_key(rec, "record_data", "recordData")
-        if isinstance(rec_data, Mapping):
+        raw_map = dict(rec_data) if isinstance(rec_data, Mapping) else {}
+        renamed_pairs = _collect_renamed_variable_pairs(enrichment_pipeline, form_key=fk_resolved)
+        inherited_sens: set[str] = set()
+        if mask_phi and renamed_pairs:
+            for src_var, tgt_var in renamed_pairs.items():
+                src_lbl = dd_var_labels.get((fk_resolved, src_var))
+                if reg.is_sensitive(src_var) or (
+                    bool(src_lbl) and not reg.is_exempt(src_var) and reg.is_sensitive(src_lbl)
+                ):
+                    inherited_sens.add(tgt_var)
+        enriched_map = _run_enrichment_record_map(
+            enrichment_pipeline,
+            raw_map,
+            mask_phi=mask_phi,
+            form_key=fk_resolved,
+        )
+        enriched_rdata_by_rec_id[id(rec)] = enriched_map
+        inherited_sensitive_by_rec_id[id(rec)] = inherited_sens
+        if enriched_map:
             discovered_vars_by_fk.setdefault(fk_resolved, set()).update(
-                str(k) for k in rec_data if str(k).strip()
+                str(k) for k in enriched_map if str(k).strip()
             )
         if fk_resolved not in existing_form_keys:
             existing_form_keys[fk_resolved] = Form(
@@ -877,24 +991,44 @@ def build_odm_archive(
     sorted_forms = sorted(dd.forms, key=lambda f: f.formKey or "")
     sorted_vars_by_form, oid_by_occ, _ = _allocate_item_oids(sorted_forms)
     item_oid_lookup: dict[tuple[str, str], tuple[str, str | None]] = {}
+    ig_oid_by_form_key: dict[str, str] = {}
     for f_idx, f_model in enumerate(sorted_forms):
+        preserved_ig = f_model.extraAttributes.get("itemGroupOID")
+        ig_oid_by_form_key[f_model.formKey] = (
+            preserved_ig.strip()
+            if isinstance(preserved_ig, str) and preserved_ig.strip()
+            else f"IG_{f_model.formKey}"
+        )
         for v_idx, v_model in enumerate(sorted_vars_by_form[f_idx]):
             item_oid_lookup[(f_model.formKey, v_model.variableName)] = (
                 oid_by_occ[(f_idx, v_idx)],
                 v_model.label,
             )
 
-    # Visit ID -> StudyEventOID lookup
+    # Interval ID & Visit ID -> StudyEventOID lookup
+    interval_oid_by_id: dict[int, str] = {}
+    for iv in intervals_list:
+        iv_id = _attr_or_key(iv, "interval_id", "intervalId")
+        iv_name = _attr_or_key(iv, "interval_name", "intervalName")
+        if isinstance(iv_id, int) and not isinstance(iv_id, bool):
+            interval_oid_by_id[iv_id] = make_study_event_oid(iv_name or iv_id)
+
     visit_oid_by_id: dict[int, tuple[str, str | None]] = {}
     for vis in visits_list:
         vid = _attr_or_key(vis, "visit_id", "visitId")
         iv_name = _attr_or_key(vis, "interval_name", "intervalName")
         iv_id = _attr_or_key(vis, "interval_id", "intervalId")
         if isinstance(vid, int) and not isinstance(vid, bool):
-            visit_oid_by_id[vid] = (
-                make_study_event_oid(iv_name or iv_id or vid),
-                str(vid),
+            resolved_se = (
+                make_study_event_oid(iv_name)
+                if iv_name
+                else (
+                    interval_oid_by_id[iv_id]
+                    if isinstance(iv_id, int) and iv_id in interval_oid_by_id
+                    else make_study_event_oid(iv_id or vid)
+                )
             )
+            visit_oid_by_id[vid] = (resolved_se, str(vid))
 
     # Inferred site & user tokens
     inferred_sites: list[tuple[Any, str | None]] = []
@@ -949,7 +1083,7 @@ def build_odm_archive(
         inferred_user_tokens=inferred_users,
         metadata_version_oid=metadata_version_oid,
         mask_phi=mask_phi,
-        custom_phi_keys=custom_phi_keys,
+        custom_phi_keys=effective_phi_keys,
     )
     default_loc_oid = admin_data.locations[0].oid
 
@@ -958,66 +1092,95 @@ def build_odm_archive(
         default_location_oid=default_loc_oid,
         site_oid_by_record_id=site_oid_by_record_id,
         mask_phi=mask_phi,
-        custom_phi_keys=custom_phi_keys,
+        custom_phi_keys=effective_phi_keys,
     )
     ann_by_rec_var, ann_by_rec, ann_by_subj, unattached_anns = map_queries_to_annotations(
         queries_list,
         mask_phi=mask_phi,
-        custom_phi_keys=custom_phi_keys,
+        custom_phi_keys=effective_phi_keys,
     )
 
     # Group records deterministically:
-    # - Scheduled / visit records: Subject -> (StudyEventOID, RepeatKey) -> FormOID -> [ItemGroupData]
-    # - Subject-level (visitless) records: Subject -> FormOID -> [ItemGroupData]
+    # - Subject-assigned records: Subject -> (StudyEventOID, RepeatKey) -> FormOID -> [ItemGroupData]
+    #   (wrapping visitless subject records in SE.UNSCHEDULED for strict ODM 1.3.2 XSD compliance)
+    # - Unassigned (subjectless) records: ReferenceData -> [ItemGroupData]
     grouped_clinical: dict[
         str, dict[tuple[str, str | None], dict[str, list[OdmItemGroupData]]]
     ] = {}
-    grouped_subject_forms: dict[str, dict[str, list[OdmItemGroupData]]] = {}
+    unassigned_ref_item_groups: list[OdmItemGroupData] = []
     referenced_event_oids: set[str] = set()
+
+    def _resolve_clean_subject_key(r: Any) -> str | None:
+        raw_sk = _attr_or_key(r, "subject_key", "subjectKey", "subject_id", "subjectId")
+        if raw_sk is None or isinstance(raw_sk, bool):
+            return None
+        cleaned = str(raw_sk).strip()
+        return cleaned or None
 
     def _has_event_binding(vid_val: Any, iv_val: Any) -> bool:
         if isinstance(vid_val, int) and not isinstance(vid_val, bool) and vid_val > 0:
             return True
         return iv_val is not None and str(iv_val).strip() not in {"", "0", "-1"}
 
-    def _rec_sort_key(r: Any) -> tuple[str, str, str, int, str]:
-        sk_v = str(
-            _attr_or_key(r, "subject_key", "subjectKey", "subject_id", "subjectId") or "UNKNOWN"
-        )
+    def _resolve_interval_event_oid(r: Any) -> str | None:
+        iv_name_v = _attr_or_key(r, "interval_name", "intervalName")
+        if iv_name_v is not None and str(iv_name_v).strip():
+            return make_study_event_oid(iv_name_v)
+        iv_id_v = _attr_or_key(r, "interval_id", "intervalId")
+        if isinstance(iv_id_v, int) and not isinstance(iv_id_v, bool) and iv_id_v > 0:
+            return interval_oid_by_id.get(iv_id_v) or make_study_event_oid(iv_id_v)
+        if iv_id_v is not None and str(iv_id_v).strip() not in {"", "0", "-1"}:
+            return make_study_event_oid(iv_id_v)
+        return None
+
+    def _rec_sort_key(r: Any) -> tuple[int, str, str, str, int, str]:
+        sk_opt = _resolve_clean_subject_key(r)
         vid_v = _attr_or_key(r, "visit_id", "visitId")
         iv_v = _attr_or_key(r, "interval_name", "intervalName", "interval_id", "intervalId")
-        if _has_event_binding(vid_v, iv_v):
-            se_v = (
-                visit_oid_by_id[vid_v][0]
-                if isinstance(vid_v, int) and vid_v in visit_oid_by_id
-                else make_study_event_oid(iv_v if iv_v is not None else vid_v)
-            )
+        explicit_se_v = _attr_or_key(r, "study_event_oid", "studyEventOid")
+        if sk_opt is not None and explicit_se_v and str(explicit_se_v).strip():
+            se_v = str(explicit_se_v).strip()
+        elif sk_opt is not None and _has_event_binding(vid_v, iv_v):
+            if isinstance(vid_v, int) and not isinstance(vid_v, bool) and vid_v in visit_oid_by_id:
+                se_v = visit_oid_by_id[vid_v][0]
+            else:
+                se_v = _resolve_interval_event_oid(r) or make_study_event_oid(vid_v)
         else:
-            se_v = ""
+            se_v = UNSCHEDULED_EVENT_OID
         fk_v = str(_attr_or_key(r, "form_key", "formKey") or "")
         rid_v = _attr_or_key(r, "record_id", "recordId")
         rid_int = int(rid_v) if isinstance(rid_v, int) and not isinstance(rid_v, bool) else 0
         roid_v = str(_attr_or_key(r, "record_oid", "recordOid") or "")
-        return (sk_v, se_v, fk_v, rid_int, roid_v)
+        return (0 if sk_opt is not None else 1, sk_opt or "", se_v, fk_v, rid_int, roid_v)
 
     for rec in sorted(records_list, key=_rec_sort_key):
-        subj_key = str(
-            _attr_or_key(rec, "subject_key", "subjectKey", "subject_id", "subjectId") or "UNKNOWN"
-        )
+        subj_key = _resolve_clean_subject_key(rec)
         vid = _attr_or_key(rec, "visit_id", "visitId")
         iv_tok = _attr_or_key(rec, "interval_name", "intervalName", "interval_id", "intervalId")
-        has_event = _has_event_binding(vid, iv_tok)
+        explicit_se_oid = _attr_or_key(rec, "study_event_oid", "studyEventOid")
+        explicit_se_rep = _attr_or_key(rec, "study_event_repeat_key", "studyEventRepeatKey")
+        has_event = subj_key is not None and _has_event_binding(vid, iv_tok)
         se_oid: str | None = None
         se_rep: str | None = None
-        if has_event:
-            if isinstance(vid, int) and not isinstance(vid, bool) and vid > 0:
-                if vid in visit_oid_by_id:
-                    se_oid, se_rep = visit_oid_by_id[vid]
+        if subj_key is not None:
+            if explicit_se_oid and str(explicit_se_oid).strip():
+                se_oid = str(explicit_se_oid).strip()
+                if explicit_se_rep is not None and str(explicit_se_rep).strip():
+                    se_rep = str(explicit_se_rep).strip()
+                elif isinstance(vid, int) and not isinstance(vid, bool) and vid > 0:
+                    se_rep = visit_oid_by_id[vid][1] if vid in visit_oid_by_id else str(vid)
+            elif has_event:
+                if isinstance(vid, int) and not isinstance(vid, bool) and vid > 0:
+                    if vid in visit_oid_by_id:
+                        se_oid, se_rep = visit_oid_by_id[vid]
+                    else:
+                        se_oid = _resolve_interval_event_oid(rec) or make_study_event_oid(vid)
+                        se_rep = str(vid)
                 else:
-                    se_oid = make_study_event_oid(iv_tok if iv_tok is not None else vid)
-                    se_rep = str(vid)
+                    se_oid = _resolve_interval_event_oid(rec) or make_study_event_oid(iv_tok)
+                    se_rep = None
             else:
-                se_oid = make_study_event_oid(iv_tok)
+                se_oid = UNSCHEDULED_EVENT_OID
                 se_rep = None
             referenced_event_oids.add(se_oid)
 
@@ -1028,19 +1191,22 @@ def build_odm_archive(
             if rfk
             else (form_id_to_key.get(rfid, f"FORM_{rfid}") if rfid is not None else "FORM_DEFAULT")
         )
-        ig_oid = f"IG_{form_oid}"
+        ig_oid = ig_oid_by_form_key.get(form_oid, f"IG_{form_oid}")
         rid_raw = _attr_or_key(rec, "record_id", "recordId")
         rid_int = (
             int(rid_raw) if isinstance(rid_raw, int) and not isinstance(rid_raw, bool) else None
         )
-        roid_raw = _attr_or_key(rec, "record_oid", "recordOid")
-        ig_repeat_key = (
-            str(rid_int) if rid_int is not None else (str(roid_raw) if roid_raw else None)
+        rid_str = (
+            str(rid_int)
+            if rid_int is not None
+            else (str(rid_raw).strip() if isinstance(rid_raw, str) and rid_raw.strip() else None)
         )
-        tx_type = "Remove" if bool(_attr_or_key(rec, "deleted")) else None
+        roid_raw = _attr_or_key(rec, "record_oid", "recordOid")
+        ig_repeat_key = rid_str if rid_str is not None else (str(roid_raw) if roid_raw else None)
+        tx_type = "Remove" if (allow_remove and bool(_attr_or_key(rec, "deleted"))) else None
 
-        rec_data_raw = _attr_or_key(rec, "record_data", "recordData")
-        rec_data_map = dict(rec_data_raw) if isinstance(rec_data_raw, Mapping) else {}
+        rec_data_map = enriched_rdata_by_rec_id.get(id(rec), {})
+        inherited_sens_vars = inherited_sensitive_by_rec_id.get(id(rec), set())
 
         # Also include any queried variable on this record as IsNull="Yes" if absent from rec_data_map
         queried_vars_for_rec = (
@@ -1050,36 +1216,42 @@ def build_odm_archive(
         )
         all_var_names = sorted(set(rec_data_map.keys()) | queried_vars_for_rec)
 
+        rec_audits = audits_by_rec.get(rid_int, []) if rid_int is not None else []
+        latest_audit_id = rec_audits[-1].id if rec_audits else None
+
         item_objs: list[OdmItemData] = []
         for var_name in all_var_names:
             item_oid, var_label = item_oid_lookup.get((form_oid, var_name), (var_name, None))
             raw_val = rec_data_map.get(var_name)
-            masked_val = _mask_scalar_if_sensitive(
-                raw_val,
-                var_name=var_name,
-                label=var_label,
-                mask_phi=mask_phi,
-                registry=reg,
-            )
-            val_str, is_null = _format_odm_item_value(masked_val)
-            var_anns = (
-                tuple(
-                    ann.model_copy(update={"id": None})
-                    for ann in ann_by_rec_var.get((rid_int, var_name), ())
+            if mask_phi and raw_val is not None and var_name in inherited_sens_vars:
+                masked_val: Any = MASKED_SENTINEL
+            else:
+                masked_val = _mask_scalar_if_sensitive(
+                    raw_val,
+                    var_name=var_name,
+                    item_oid=item_oid,
+                    label=var_label,
+                    mask_phi=mask_phi,
+                    registry=reg,
+                    as_sdtm=False,
                 )
-                if rid_int is not None
-                else ()
+            val_str, is_null = _format_odm_item_value(masked_val)
+            raw_var_anns = (
+                ann_by_rec_var.get((rid_int, var_name), ()) if rid_int is not None else ()
             )
+            latest_ann_id = raw_var_anns[-1].id if raw_var_anns else None
+            var_anns = tuple(ann.model_copy(update={"id": None}) for ann in raw_var_anns)
             item_objs.append(
                 OdmItemData(
                     itemOID=item_oid,
                     value=val_str,
                     isNull=is_null,
+                    auditRecordID=latest_audit_id,
+                    annotationID=latest_ann_id,
                     annotations=var_anns,
                 )
             )
 
-        rec_audits = audits_by_rec.get(rid_int, []) if rid_int is not None else []
         inline_audit = rec_audits[-1].model_copy(update={"id": None}) if rec_audits else None
         rec_anns = (
             tuple(ann.model_copy(update={"id": None}) for ann in ann_by_rec.get(rid_int, ()))
@@ -1095,13 +1267,13 @@ def build_odm_archive(
             annotations=rec_anns,
             items=tuple(item_objs),
         )
-        grouped_clinical.setdefault(subj_key, {})
-        if se_oid is not None:
-            grouped_clinical[subj_key].setdefault((se_oid, se_rep), {}).setdefault(
-                form_oid, []
-            ).append(ig_data)
-        else:
-            grouped_subject_forms.setdefault(subj_key, {}).setdefault(form_oid, []).append(ig_data)
+        if subj_key is None:
+            unassigned_ref_item_groups.append(ig_data)
+            continue
+        assert se_oid is not None
+        grouped_clinical.setdefault(subj_key, {}).setdefault((se_oid, se_rep), {}).setdefault(
+            form_oid, []
+        ).append(ig_data)
 
     # Ensure subjects without records (e.g. subject-level queries or enrolled subjects) appear
     for sk_only in sorted(
@@ -1183,15 +1355,6 @@ def build_odm_archive(
                     forms=tuple(form_models_out),
                 )
             )
-        subj_forms_map = grouped_subject_forms.get(subj_key, {})
-        subj_form_models: list[OdmFormData] = []
-        for form_oid in sorted(subj_forms_map):
-            subj_form_models.append(
-                OdmFormData(
-                    formOID=form_oid,
-                    itemGroups=tuple(subj_forms_map[form_oid]),
-                )
-            )
         subj_anns = tuple(
             ann.model_copy(update={"id": None}) for ann in ann_by_subj.get(subj_key, ())
         )
@@ -1201,7 +1364,7 @@ def build_odm_archive(
                 siteLocationOID=subj_site_oid.get(subj_key, default_loc_oid),
                 annotations=subj_anns,
                 studyEvents=tuple(se_models),
-                forms=tuple(subj_form_models),
+                forms=(),
             )
         )
 
@@ -1235,9 +1398,31 @@ def build_odm_archive(
         else _collect_max_snapshot_datetime(timestamp_candidates)
     )
 
+    final_reference_data: list[OdmReferenceData] = list(reference_data)
+    if unassigned_ref_item_groups:
+        merged_into_existing = False
+        for ref_idx, ref_entry in enumerate(final_reference_data):
+            if (
+                ref_entry.study_oid == study_key
+                and ref_entry.metadata_version_oid == metadata_version_oid
+            ):
+                final_reference_data[ref_idx] = ref_entry.model_copy(
+                    update={"item_groups": (*ref_entry.item_groups, *unassigned_ref_item_groups)}
+                )
+                merged_into_existing = True
+                break
+        if not merged_into_existing:
+            final_reference_data.append(
+                OdmReferenceData(
+                    studyOID=study_key,
+                    metaDataVersionOID=metadata_version_oid,
+                    itemGroups=tuple(unassigned_ref_item_groups),
+                )
+            )
+
     return OdmArchive(
         fileOID=file_oid or f"ODM.{make_oid_slug(study_key)}",
-        fileType="Snapshot",
+        fileType=file_type,
         odmVersion="1.3.2",
         creationDateTime=resolved_creation_dt,
         originator="imednet-toolkit",
@@ -1246,7 +1431,7 @@ def build_odm_archive(
         metaDataVersionName=metadata_version_name or "Study Metadata and Clinical Archive",
         dataDictionary=dd,
         adminData=(admin_data,),
-        referenceData=tuple(reference_data),
+        referenceData=tuple(final_reference_data),
         clinicalData=(clinical_container,),
     )
 
@@ -1282,7 +1467,11 @@ def _coerce_dataset_json_cell(val: Any, target_type: DatasetJsonItemType) -> Dat
     if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
         return None
     if val == MASKED_SENTINEL:
-        return MASKED_SENTINEL if target_type == "string" else None
+        return (
+            MASKED_SENTINEL
+            if target_type in {"string", "date", "time", "datetime", "URI"}
+            else None
+        )
 
     if target_type == "boolean":
         if isinstance(val, bool):
@@ -1328,7 +1517,7 @@ def _coerce_dataset_json_cell(val: Any, target_type: DatasetJsonItemType) -> Dat
     return str(val)
 
 
-def build_dataset_json_envelope(
+def build_dataset_json_bundle(
     study_key: str,
     *,
     records: Iterable[Any] = (),
@@ -1336,8 +1525,9 @@ def build_dataset_json_envelope(
     variables: Sequence[Any] = (),
     visits: Iterable[Any] = (),
     data_dictionary: DataDictionary | None = None,
-    as_sdtm: bool = False,
+    as_sdtm: bool | None = None,
     sdtm_domain: str | None = None,
+    form_key: str | None = None,
     use_labels_as_columns: bool = False,
     variable_whitelist: Collection[str] | None = None,
     form_whitelist: Collection[int] | None = None,
@@ -1346,17 +1536,36 @@ def build_dataset_json_envelope(
     include_deleted: bool = False,
     mask_phi: bool = True,
     custom_phi_keys: Collection[str] | None = None,
-    enrichment_pipeline: Any = None,
+    enrichment_pipeline: Any = _UNSET_PIPELINE,
     metadata_version_oid: str = "MDV.001",
     file_oid: str | None = None,
     creation_datetime: str | None = None,
     source_system_version: str | None = None,
-) -> DatasetJsonEnvelope:
-    """Build a deterministic CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
-    reg = build_study_sensitivity_registry(custom_phi_keys)
-    effective_sdtm = bool(as_sdtm or sdtm_domain)
+    seq_counters: dict[str, int] | None = None,
+    domain_seq_counters: dict[str, dict[str, int]] | None = None,
+    seq_overrides: Mapping[str, int] | None = None,
+    lineage_out: dict[str, dict[str, Any]] | None = None,
+) -> DatasetJsonBundle:
+    """Build a multi-dataset :class:`DatasetJsonBundle` of flat CDISC Dataset-JSON v1.1 envelopes."""
+    if enrichment_pipeline is _UNSET_PIPELINE:
+        from imednet.integrations.enrichment import resolve_enrichment_pipeline
+
+        effective_pipeline = resolve_enrichment_pipeline(study_key)
+    else:
+        effective_pipeline = enrichment_pipeline
+
+    merged_phi_keys: set[str] = set(custom_phi_keys or ())
+    pipe_phi = getattr(effective_pipeline, "phi_keys", None)
+    if isinstance(pipe_phi, Iterable) and not isinstance(pipe_phi, (str, bytes)):
+        merged_phi_keys.update(str(k) for k in pipe_phi if k)
+    effective_phi_keys: Collection[str] | None = merged_phi_keys or None
+    reg = build_study_sensitivity_registry(effective_phi_keys)
+
+    effective_sdtm = bool(sdtm_domain) if as_sdtm is None else bool(as_sdtm)
+    canonical_naming_conv = normalize_naming_convention(naming_convention)
     allowed_form_ids = set(form_whitelist) if form_whitelist is not None else None
     allowed_vars = set(variable_whitelist) if variable_whitelist is not None else None
+    target_form_key = form_key.strip() if isinstance(form_key, str) and form_key.strip() else None
 
     if data_dictionary is not None:
         if not forms:
@@ -1373,6 +1582,7 @@ def build_dataset_json_envelope(
                             "sequence": dv.sequence,
                             "formKey": df.formKey,
                             "formId": df.formId,
+                            "itemOID": dv.extraAttributes.get("itemOID"),
                         }
                     )
             variables = dd_vars
@@ -1419,21 +1629,35 @@ def build_dataset_json_envelope(
         if creation_datetime
         else _collect_max_snapshot_datetime(timestamp_candidates)
     )
+    src_system = DatasetJsonSourceSystem(
+        name="imednet",
+        version=source_system_version or _resolve_toolkit_version(),
+    )
 
     form_name_by_key: dict[str, str] = {}
     form_key_by_id: dict[int, str] = {}
+    form_obj_by_key: dict[str, Any] = {}
+    form_ig_oid_by_key: dict[str, str] = {}
     for raw_f in forms:
         fk = _attr_or_key(raw_f, "form_key", "formKey")
         fid = _attr_or_key(raw_f, "form_id", "formId")
         fname = _attr_or_key(raw_f, "form_name", "formName")
+        f_extra = _attr_or_key(raw_f, "extraAttributes", "extra_attributes")
         if fk:
             fk_s = str(fk).strip()
+            form_obj_by_key[fk_s] = raw_f
             form_name_by_key[fk_s] = str(fname).strip() if fname else fk_s
+            if isinstance(f_extra, Mapping):
+                pres_ig = f_extra.get("itemGroupOID")
+                if isinstance(pres_ig, str) and pres_ig.strip():
+                    form_ig_oid_by_key[fk_s] = pres_ig.strip()
             if isinstance(fid, int) and not isinstance(fid, bool):
                 form_key_by_id[fid] = fk_s
 
-    var_meta_by_form: dict[str, dict[str, tuple[str, DatasetJsonItemType, int | None]]] = {}
-    global_var_meta: dict[str, tuple[str, DatasetJsonItemType, int | None]] = {}
+    var_meta_by_form: dict[
+        str, dict[str, tuple[str, DatasetJsonItemType, int | None, str | None]]
+    ] = {}
+    global_var_meta: dict[str, tuple[str, DatasetJsonItemType, int | None, str | None]] = {}
     for raw_v in variables:
         vn = _attr_or_key(raw_v, "variable_name", "variableName", "name")
         if not vn:
@@ -1454,54 +1678,114 @@ def build_dataset_json_envelope(
             if vfk
             else (form_key_by_id.get(vfid) if isinstance(vfid, int) else None)
         )
-        info = (vlbl, vtype, vseq)
+        raw_item_oid = _attr_or_key(raw_v, "itemOID", "item_oid")
+        if raw_item_oid is None:
+            v_extra = _attr_or_key(raw_v, "extraAttributes", "extra_attributes")
+            if isinstance(v_extra, Mapping):
+                raw_item_oid = v_extra.get("itemOID")
+        pres_item_oid = (
+            str(raw_item_oid).strip()
+            if isinstance(raw_item_oid, str) and raw_item_oid.strip()
+            else None
+        )
+        info = (vlbl, vtype, vseq, pres_item_oid)
         global_var_meta.setdefault(vn_s, info)
         if fk_resolved:
             var_meta_by_form.setdefault(fk_resolved, {})[vn_s] = info
 
-    item_groups: dict[str, DatasetJsonItemGroup] = {}
+    datasets: dict[str, DatasetJsonEnvelope] = {}
 
     if effective_sdtm:
+        study_cfg = getattr(effective_pipeline, "config", None)
+        form_domain_map = build_form_sdtm_domain_map(
+            forms,
+            study_config=study_cfg,
+            study_key=study_key,
+        )
+
+        def _resolve_record_sdtm_domain(rec_item: Any, *, default_dom: str) -> str:
+            rfk_v = _attr_or_key(rec_item, "form_key", "formKey")
+            rfid_v = _attr_or_key(rec_item, "form_id", "formId")
+            fk_cand = (
+                str(rfk_v).strip()
+                if rfk_v
+                else (form_key_by_id.get(rfid_v, "") if isinstance(rfid_v, int) else "")
+            )
+            form_ref = form_obj_by_key.get(fk_cand)
+            if form_ref is None and (fk_cand or rfid_v is not None):
+                form_ref = {
+                    "formKey": fk_cand or None,
+                    "formId": rfid_v,
+                    "formName": form_name_by_key.get(fk_cand),
+                }
+            if form_ref is None:
+                return default_dom
+            resolved_dom = resolve_form_sdtm_domain(
+                form_ref,
+                study_config=study_cfg,
+                study_key=study_key,
+                form_domain_map=form_domain_map,
+                fallback="",
+            )
+            if resolved_dom:
+                return resolved_dom
+            return make_oid_slug(fk_cand, default_dom).upper() if fk_cand else default_dom
+
         target_domains: list[str] = []
         records_by_domain: dict[str, list[Any]] = {}
         if sdtm_domain:
             dom_code = resolve_sdtm_domain(sdtm_domain) or sdtm_domain.strip().upper()
             target_domains.append(dom_code)
             for rec in filtered_records:
-                rfk = _attr_or_key(rec, "form_key", "formKey")
-                rfid = _attr_or_key(rec, "form_id", "formId")
-                fk_cand = str(rfk) if rfk else form_key_by_id.get(rfid, "")  # type: ignore[arg-type]
-                rec_dom = resolve_sdtm_domain(fk_cand) if fk_cand else None
-                if rec_dom is None or rec_dom == dom_code:
+                rec_dom = _resolve_record_sdtm_domain(rec, default_dom="")
+                if not rec_dom or rec_dom == dom_code:
                     records_by_domain.setdefault(dom_code, []).append(rec)
         else:
             for rec in filtered_records:
-                rfk = _attr_or_key(rec, "form_key", "formKey")
-                rfid = _attr_or_key(rec, "form_id", "formId")
-                fk_cand = str(rfk) if rfk else form_key_by_id.get(rfid, "SUPP")  # type: ignore[arg-type]
-                dom_code = resolve_sdtm_domain(fk_cand) or make_oid_slug(fk_cand, "DM").upper()
+                dom_code = _resolve_record_sdtm_domain(rec, default_dom="DM")
                 records_by_domain.setdefault(dom_code, []).append(rec)
             target_domains = sorted(records_by_domain)
             if not target_domains:
-                for fk_s in sorted(form_name_by_key):
-                    dom_code = resolve_sdtm_domain(fk_s) or fk_s.upper()
+                for fk_s, raw_f in sorted(form_obj_by_key.items()):
+                    dom_code = (
+                        resolve_form_sdtm_domain(
+                            raw_f,
+                            study_config=study_cfg,
+                            study_key=study_key,
+                            form_domain_map=form_domain_map,
+                            fallback="",
+                        )
+                        or make_oid_slug(fk_s, "DM").upper()
+                    )
                     if dom_code not in target_domains:
                         target_domains.append(dom_code)
                 if not target_domains:
                     target_domains = ["DM"]
 
-        for dom in sorted(dict.fromkeys(target_domains)):
+        ordered_domains = sorted(dict.fromkeys(target_domains))
+        multi_ds = len(ordered_domains) > 1
+        for dom in ordered_domains:
             dom_recs = records_by_domain.get(dom, [])
-            sdtm_rows = transform_records_to_sdtm_rows(
-                dom_recs,
-                domain=dom,
-                study_key=study_key,
-                include_deleted=include_deleted,
-                mask_phi=mask_phi,
-                phi_keys=custom_phi_keys,
-                registry=reg,
-                enrichment_pipeline=enrichment_pipeline,
-                preserve_record_id=preserve_record_id,
+            dom_counters = (
+                domain_seq_counters.setdefault(dom, {})
+                if domain_seq_counters is not None
+                else seq_counters
+            )
+            sdtm_rows = deduplicate_sdtm_rows(
+                transform_records_to_sdtm_rows(
+                    dom_recs,
+                    domain=dom,
+                    study_key=study_key,
+                    include_deleted=include_deleted,
+                    mask_phi=mask_phi,
+                    seq_counters=dom_counters,
+                    seq_overrides=seq_overrides,
+                    lineage_out=lineage_out,
+                    phi_keys=effective_phi_keys,
+                    registry=reg,
+                    enrichment_pipeline=effective_pipeline,
+                    preserve_record_id=preserve_record_id,
+                )
             )
             columns: list[str] = list(get_sdtm_domain_variables(dom))
             if preserve_record_id and "RECORD_ID" not in columns:
@@ -1509,13 +1793,12 @@ def build_dataset_json_envelope(
             seen_cols = set(columns)
             for r_dict in sdtm_rows:
                 for k in r_dict:
-                    if k not in seen_cols:
+                    if k not in seen_cols and k != "ITEMGROUPDATASEQ":
                         seen_cols.add(k)
                         columns.append(k)
             if allowed_vars is not None:
                 columns = [c for c in columns if c in allowed_vars]
 
-            # Apply SensitivityRegistry masking across SDTM rows
             processed_rows: list[dict[str, Any]] = []
             for r_dict in sdtm_rows:
                 clean_row: dict[str, Any] = {}
@@ -1523,31 +1806,35 @@ def build_dataset_json_envelope(
                     clean_row[col] = _mask_scalar_if_sensitive(
                         r_dict.get(col),
                         var_name=col,
+                        item_oid=f"IT.{dom}.{col}",
                         mask_phi=mask_phi,
                         registry=reg,
                         as_sdtm=True,
                     )
                 processed_rows.append(clean_row)
+            processed_rows = deduplicate_sdtm_rows(processed_rows)
 
-            # Deterministic sort by USUBJID, *SEQ / RECORD_ID
             seq_col = f"{dom}SEQ"
             processed_rows.sort(
                 key=lambda r: (
+                    0 if r.get("USUBJID") else 1,
                     str(r.get("USUBJID") or ""),
                     int(r[seq_col]) if isinstance(r.get(seq_col), int) else 0,
                     str(r.get("RECORD_ID") or ""),
                 )
             )
 
-            seq_item = DatasetJsonItem(
-                OID="ITEMGROUPDATASEQ",
-                name="ITEMGROUPDATASEQ",
-                label="Record Identifier",
-                type="integer",
-            )
-            col_items: list[DatasetJsonItem] = [seq_item]
+            col_items: list[DatasetJsonColumn] = []
             key_seq = 0
-            key_candidates = {"STUDYID", "USUBJID", seq_col, "RECORD_ID"}
+            key_candidates = (
+                {"STUDYID", "DOMAIN", "USUBJID"}
+                if dom == "DM"
+                else {"STUDYID", "USUBJID", seq_col, "RECORD_ID"}
+            )
+            sdtm_meta_candidates = {"STUDYID", "DOMAIN", "USUBJID", seq_col, "RECORD_ID"}
+            used_sdtm_col_lower: set[str] = {"itemgroupdataseq"}
+            used_sdtm_oids: set[str] = {"ITEMGROUPDATASEQ"}
+            sdtm_col_lookup: list[tuple[str, DatasetJsonColumn]] = []
             for col in columns:
                 if col == "ITEMGROUPDATASEQ":
                     continue
@@ -1567,36 +1854,80 @@ def build_dataset_json_envelope(
                 if col in key_candidates:
                     key_seq += 1
                     k_seq = key_seq
-                col_items.append(
-                    DatasetJsonItem(
-                        OID=f"IT.{dom}.{col}",
-                        name=col,
-                        label=col,
-                        type=col_type,
-                        keySequence=k_seq,
+                is_sdtm_meta = col in sdtm_meta_candidates
+                if canonical_naming_conv is not None and canonical_naming_conv != "sdtm":
+                    raw_out_name = format_variable_name(
+                        col,
+                        canonical_naming_conv,
+                        domain=dom,
+                        is_metadata=is_sdtm_meta,
                     )
+                else:
+                    raw_out_name = col
+                if is_sdtm_meta and raw_out_name.lower() not in used_sdtm_col_lower:
+                    used_sdtm_col_lower.add(raw_out_name.lower())
+                    out_col_name = raw_out_name
+                else:
+                    out_col_name = prefix_colliding_variable_name(
+                        raw_out_name,
+                        convention=canonical_naming_conv or "sdtm",
+                        used_lower=used_sdtm_col_lower,
+                    )
+                base_item_oid = f"IT.{dom}.{make_oid_slug(out_col_name, col)}"
+                item_oid = base_item_oid
+                oid_idx = 2
+                while item_oid in used_sdtm_oids:
+                    item_oid = f"{base_item_oid}_{oid_idx}"
+                    oid_idx += 1
+                used_sdtm_oids.add(item_oid)
+                item_obj = DatasetJsonColumn(
+                    itemOID=item_oid,
+                    name=out_col_name,
+                    label=col if use_labels_as_columns else out_col_name,
+                    dataType=col_type,
+                    keySequence=k_seq,
                 )
+                col_items.append(item_obj)
+                sdtm_col_lookup.append((col, item_obj))
 
             tuple_rows = tuple(
-                (
-                    row_idx,
-                    *(
-                        _coerce_dataset_json_cell(r.get(item_def.name), item_def.type)
-                        for item_def in col_items[1:]
-                    ),
+                tuple(
+                    _coerce_dataset_json_cell(r.get(src_col), item_def.data_type)
+                    for src_col, item_def in sdtm_col_lookup
                 )
-                for row_idx, r in enumerate(processed_rows, 1)
+                for r in processed_rows
             )
             ig_oid = f"IG.{dom}"
-            item_groups[ig_oid] = DatasetJsonItemGroup(
+            dom_label = form_name_by_key.get(dom)
+            if not dom_label:
+                for fk_s, fn_s in form_name_by_key.items():
+                    if form_domain_map.get(fk_s) == dom:
+                        dom_label = fn_s
+                        break
+            if not dom_label:
+                dom_label = f"{dom} Domain"
+
+            dom_file_oid = (
+                (f"{file_oid}.{dom}" if multi_ds else file_oid)
+                if file_oid
+                else f"DSJ.{make_oid_slug(study_key)}.{dom}"
+            )
+            datasets[ig_oid] = DatasetJsonEnvelope(
+                datasetJSONCreationDateTime=resolved_creation_dt,
+                datasetJSONVersion="1.1.0",
+                fileOID=dom_file_oid,
+                originator="imednet-toolkit",
+                sourceSystem=src_system,
+                studyOID=study_key,
+                metaDataVersionOID=metadata_version_oid,
+                itemGroupOID=ig_oid,
                 records=len(tuple_rows),
                 name=dom,
-                label=form_name_by_key.get(dom, f"{dom} Domain"),
-                items=tuple(col_items),
-                itemData=tuple_rows,
+                label=dom_label,
+                columns=tuple(col_items),
+                rows=tuple_rows,
             )
     else:
-        # CDASH per-Form itemGroupData datasets
         recs_by_form: dict[str, list[Any]] = {}
         for rec in filtered_records:
             rfk = _attr_or_key(rec, "form_key", "formKey")
@@ -1610,24 +1941,31 @@ def build_dataset_json_envelope(
                     else "FORM_DEFAULT"
                 )
             )
+            if target_form_key is not None and fk_s != target_form_key:
+                continue
             recs_by_form.setdefault(fk_s, []).append(rec)
 
-        all_form_keys = sorted(
-            set(recs_by_form.keys())
-            | (
-                {
-                    fk_s
-                    for fid, fk_s in form_key_by_id.items()
-                    if allowed_form_ids is None or fid in allowed_form_ids
-                }
-                if form_key_by_id
-                else set(form_name_by_key.keys())
+        if target_form_key is not None:
+            all_form_keys = [target_form_key]
+        else:
+            all_form_keys = sorted(
+                set(recs_by_form.keys())
+                | (
+                    {
+                        fk_s
+                        for fid, fk_s in form_key_by_id.items()
+                        if allowed_form_ids is None or fid in allowed_form_ids
+                    }
+                    if form_key_by_id
+                    else set(form_name_by_key.keys())
+                )
             )
-        )
+            if not all_form_keys:
+                all_form_keys = ["FORM_DEFAULT"]
 
         def _fmt_meta_col(raw_col: str) -> str:
-            if naming_convention:
-                return format_variable_name(raw_col, naming_convention, is_metadata=True)
+            if canonical_naming_conv:
+                return format_variable_name(raw_col, canonical_naming_conv, is_metadata=True)
             return raw_col
 
         meta_defs = [
@@ -1638,6 +1976,7 @@ def build_dataset_json_envelope(
             (_fmt_meta_col("formKey"), "Form Key", "string", None),
         ]
 
+        multi_ds = len(all_form_keys) > 1
         for fk_s in all_form_keys:
             form_recs = sorted(
                 recs_by_form.get(fk_s, []),
@@ -1648,9 +1987,43 @@ def build_dataset_json_envelope(
                     else 0,
                 ),
             )
-            form_vmeta = var_meta_by_form.get(fk_s, {})
+            form_vmeta = dict(var_meta_by_form.get(fk_s, {}))
+            renamed_pairs = _collect_renamed_variable_pairs(effective_pipeline, form_key=fk_s)
+            inherited_sens_targets: set[str] = set()
+            for src_var, tgt_var in renamed_pairs.items():
+                src_info = form_vmeta.get(src_var) or global_var_meta.get(src_var)
+                if src_info is not None and tgt_var not in form_vmeta:
+                    form_vmeta[tgt_var] = (tgt_var, src_info[1], src_info[2], None)
+                if mask_phi:
+                    src_lbl = src_info[0] if src_info is not None else None
+                    if reg.is_sensitive(src_var) or (
+                        bool(src_lbl) and not reg.is_exempt(src_var) and reg.is_sensitive(src_lbl)
+                    ):
+                        inherited_sens_targets.add(tgt_var)
+
+            enriched_form_recs: list[tuple[Any, dict[str, Any]]] = []
+            present_enriched_keys: set[str] = set()
+            mapped_away_sources: set[str] = set()
+            for rec in form_recs:
+                rdata_raw = _attr_or_key(rec, "record_data", "recordData")
+                pre_keys = {str(k) for k in rdata_raw} if isinstance(rdata_raw, Mapping) else set()
+                rdata_in = dict(rdata_raw) if isinstance(rdata_raw, Mapping) else {}
+                rdata_out = _run_enrichment_record_map(
+                    effective_pipeline,
+                    rdata_in,
+                    mask_phi=mask_phi,
+                    form_key=fk_s,
+                )
+                post_keys = {str(k) for k in rdata_out}
+                mapped_away_sources.update(pre_keys - post_keys)
+                present_enriched_keys.update(post_keys)
+                enriched_form_recs.append((rec, rdata_out))
+
+            replaced_sources = {
+                src for src in renamed_pairs if src not in present_enriched_keys
+            } | (mapped_away_sources - present_enriched_keys)
             discovered_vars: list[str] = sorted(
-                form_vmeta.keys(),
+                (vn for vn in form_vmeta if vn not in replaced_sources),
                 key=lambda vn: (
                     0 if form_vmeta[vn][2] is not None else 1,
                     form_vmeta[vn][2] or 0,
@@ -1658,14 +2031,12 @@ def build_dataset_json_envelope(
                 ),
             )
             seen_vars = set(discovered_vars)
-            for rec in form_recs:
-                rdata = _attr_or_key(rec, "record_data", "recordData")
-                if isinstance(rdata, Mapping):
-                    for vk in sorted(rdata.keys(), key=str):
-                        vk_s = str(vk)
-                        if vk_s not in seen_vars:
-                            seen_vars.add(vk_s)
-                            discovered_vars.append(vk_s)
+            for _rec, rdata in enriched_form_recs:
+                for vk in sorted(rdata.keys(), key=str):
+                    vk_s = str(vk)
+                    if vk_s and vk_s != "ITEMGROUPDATASEQ" and vk_s not in seen_vars:
+                        seen_vars.add(vk_s)
+                        discovered_vars.append(vk_s)
 
             if allowed_vars is not None:
                 discovered_vars = [
@@ -1673,59 +2044,15 @@ def build_dataset_json_envelope(
                     for vn in discovered_vars
                     if vn in allowed_vars
                     or (
-                        naming_convention
-                        and format_variable_name(vn, naming_convention) in allowed_vars
+                        canonical_naming_conv
+                        and format_nested_variable_name(
+                            vn, canonical_naming_conv, domain=sdtm_domain
+                        )
+                        in allowed_vars
                     )
                 ]
 
-            # Build normalized row dicts
-            row_dicts: list[dict[str, Any]] = []
-            col_name_for_var: dict[str, str] = {}
-            for vn in discovered_vars:
-                lbl = (form_vmeta.get(vn) or global_var_meta.get(vn) or (vn, "string", None))[0]
-                if use_labels_as_columns and lbl:
-                    col_name_for_var[vn] = lbl
-                elif naming_convention:
-                    col_name_for_var[vn] = format_variable_name(vn, naming_convention)
-                else:
-                    col_name_for_var[vn] = vn
-
-            for rec in form_recs:
-                rdata_raw = _attr_or_key(rec, "record_data", "recordData")
-                rdata = dict(rdata_raw) if isinstance(rdata_raw, Mapping) else {}
-                if enrichment_pipeline is not None and callable(
-                    getattr(enrichment_pipeline, "process", None)
-                ):
-                    rdata = enrichment_pipeline.process(rdata, mask_phi=mask_phi)
-                row_map: dict[str, Any] = {
-                    meta_defs[0][0]: _attr_or_key(rec, "study_key", "studyKey") or study_key,
-                    meta_defs[1][0]: _attr_or_key(rec, "subject_key", "subjectKey"),
-                    meta_defs[2][0]: _attr_or_key(rec, "record_id", "recordId"),
-                    meta_defs[3][0]: _attr_or_key(rec, "visit_id", "visitId"),
-                    meta_defs[4][0]: fk_s,
-                }
-                for vn in discovered_vars:
-                    lbl = (form_vmeta.get(vn) or global_var_meta.get(vn) or (vn, "string", None))[0]
-                    target_col = col_name_for_var[vn]
-                    raw_val = rdata.get(vn)
-                    row_map[target_col] = _mask_scalar_if_sensitive(
-                        raw_val,
-                        var_name=vn,
-                        label=lbl,
-                        mask_phi=mask_phi,
-                        registry=reg,
-                    )
-                row_dicts.append(row_map)
-
-            items_out: list[DatasetJsonItem] = [
-                DatasetJsonItem(
-                    OID="ITEMGROUPDATASEQ",
-                    name="ITEMGROUPDATASEQ",
-                    label="Record Identifier",
-                    type="integer",
-                )
-            ]
-            used_col_names: set[str] = {"ITEMGROUPDATASEQ"}
+            active_meta_defs: list[tuple[str, str, str, int | None]] = []
             for m_col, m_lbl, m_type, m_kseq in meta_defs:
                 if (
                     allowed_vars is not None
@@ -1738,24 +2065,118 @@ def build_dataset_json_envelope(
                     }
                 ):
                     continue
-                used_col_names.add(m_col)
+                active_meta_defs.append((m_col, m_lbl, m_type, m_kseq))
+
+            metadata_lower: set[str] = {"itemgroupdataseq"} | {
+                m_col.lower() for m_col, _, _, _ in meta_defs
+            }
+            used_col_lower: set[str] = {"itemgroupdataseq"} | {
+                m_col.lower() for m_col, _, _, _ in active_meta_defs
+            }
+
+            # Build normalized row dicts with disambiguated column names
+            row_dicts: list[dict[str, Any]] = []
+            col_name_for_var: dict[str, str] = {}
+            for vn in discovered_vars:
+                v_info = form_vmeta.get(vn) or global_var_meta.get(vn)
+                lbl = v_info[0] if v_info else vn
+                if use_labels_as_columns and lbl:
+                    raw_col_cand = lbl
+                elif canonical_naming_conv:
+                    raw_col_cand = format_nested_variable_name(
+                        vn, canonical_naming_conv, domain=sdtm_domain
+                    )
+                else:
+                    raw_col_cand = vn
+                col_name_for_var[vn] = prefix_colliding_variable_name(
+                    raw_col_cand,
+                    metadata_lower=metadata_lower,
+                    convention=canonical_naming_conv,
+                    used_lower=used_col_lower,
+                )
+
+            for rec, rdata in enriched_form_recs:
+                row_map: dict[str, Any] = {
+                    meta_defs[0][0]: _attr_or_key(rec, "study_key", "studyKey") or study_key,
+                    meta_defs[1][0]: _attr_or_key(rec, "subject_key", "subjectKey"),
+                    meta_defs[2][0]: _attr_or_key(rec, "record_id", "recordId"),
+                    meta_defs[3][0]: _attr_or_key(rec, "visit_id", "visitId"),
+                    meta_defs[4][0]: fk_s,
+                }
+                for vn in discovered_vars:
+                    v_info = form_vmeta.get(vn) or global_var_meta.get(vn)
+                    lbl = v_info[0] if v_info else vn
+                    pres_oid = v_info[3] if v_info else None
+                    cand_item_oid = pres_oid or f"IT.{fk_s}.{make_oid_slug(vn)}"
+                    target_col = col_name_for_var[vn]
+                    raw_val = rdata.get(vn)
+                    if mask_phi and raw_val is not None and vn in inherited_sens_targets:
+                        row_map[target_col] = MASKED_SENTINEL
+                    else:
+                        row_map[target_col] = _mask_scalar_if_sensitive(
+                            raw_val,
+                            var_name=vn,
+                            item_oid=cand_item_oid,
+                            label=lbl,
+                            mask_phi=mask_phi,
+                            registry=reg,
+                        )
+                row_dicts.append(row_map)
+
+            items_out: list[DatasetJsonColumn] = []
+            metadata_oids_lower: set[str] = {"itemgroupdataseq"} | {
+                f"IT.{fk_s}.{make_oid_slug(m_col)}".lower() for m_col, _, _, _ in meta_defs
+            }
+            used_oids_lower: set[str] = {"itemgroupdataseq"}
+            used_labels_lower: set[str] = set()
+            for m_col, m_lbl, m_type, m_kseq in active_meta_defs:
+                m_oid = f"IT.{fk_s}.{make_oid_slug(m_col)}"
+                used_oids_lower.add(m_oid.lower())
+                used_labels_lower.add(m_lbl.lower())
                 items_out.append(
-                    DatasetJsonItem(
-                        OID=f"IT.{fk_s}.{make_oid_slug(m_col)}",
+                    DatasetJsonColumn(
+                        itemOID=m_oid,
                         name=m_col,
                         label=m_lbl,
-                        type=m_type,  # type: ignore[arg-type]
+                        dataType=m_type,  # type: ignore[arg-type]
                         keySequence=m_kseq,
                     )
                 )
 
             for vn in discovered_vars:
                 target_col = col_name_for_var[vn]
-                if target_col in used_col_names:
-                    continue
-                used_col_names.add(target_col)
                 v_info = form_vmeta.get(vn) or global_var_meta.get(vn)
-                lbl = v_info[0] if v_info else vn
+                raw_lbl = v_info[0] if v_info else vn
+                pres_oid = v_info[3] if v_info else None
+                item_lbl = raw_lbl
+                if item_lbl.lower() in used_labels_lower:
+                    cand_lbl = f"{raw_lbl} ({vn})" if vn and vn != raw_lbl else f"{raw_lbl}_2"
+                    lbl_idx = 2
+                    while cand_lbl.lower() in used_labels_lower:
+                        lbl_idx += 1
+                        cand_lbl = f"{raw_lbl}_{lbl_idx}"
+                    item_lbl = cand_lbl
+                used_labels_lower.add(item_lbl.lower())
+
+                if (
+                    pres_oid
+                    and pres_oid.lower() not in metadata_oids_lower
+                    and pres_oid.lower() not in used_oids_lower
+                ):
+                    item_oid = pres_oid
+                else:
+                    slug = make_oid_slug(vn)
+                    base_oid = f"IT.{fk_s}.{slug}"
+                    if base_oid.lower() in metadata_oids_lower:
+                        var_prefix = "VAR_" if canonical_naming_conv == "sdtm" else "var_"
+                        base_oid = f"IT.{fk_s}.{var_prefix}{slug}"
+                    item_oid = base_oid
+                    oid_idx = 2
+                    while item_oid.lower() in used_oids_lower:
+                        item_oid = f"{base_oid}_{oid_idx}"
+                        oid_idx += 1
+                used_oids_lower.add(item_oid.lower())
+
                 col_vals = [r.get(target_col) for r in row_dicts]
                 declared_type: DatasetJsonItemType = (
                     v_info[1] if v_info else _infer_dataset_json_type_from_values(col_vals)
@@ -1763,48 +2184,126 @@ def build_dataset_json_envelope(
                 if any(v == MASKED_SENTINEL for v in col_vals):
                     declared_type = "string"
                 elif row_dicts and declared_type in {"integer", "float", "boolean"}:
-                    # Fallback to string if actual values are non-coercible strings
                     inferred = _infer_dataset_json_type_from_values(col_vals)
                     if inferred == "string" and any(v is not None for v in col_vals):
                         declared_type = "string"
                 items_out.append(
-                    DatasetJsonItem(
-                        OID=f"IT.{fk_s}.{make_oid_slug(vn)}",
+                    DatasetJsonColumn(
+                        itemOID=item_oid,
                         name=target_col,
-                        label=lbl,
-                        type=declared_type,
+                        label=item_lbl,
+                        dataType=declared_type,
                     )
                 )
 
             tuple_rows = tuple(
-                (
-                    row_idx,
-                    *(_coerce_dataset_json_cell(r.get(it.name), it.type) for it in items_out[1:]),
-                )
-                for row_idx, r in enumerate(row_dicts, 1)
+                tuple(_coerce_dataset_json_cell(r.get(it.name), it.data_type) for it in items_out)
+                for r in row_dicts
             )
-            ig_oid = f"IG.{make_oid_slug(fk_s)}"
-            item_groups[ig_oid] = DatasetJsonItemGroup(
+            ig_oid = form_ig_oid_by_key.get(fk_s, f"IG.{make_oid_slug(fk_s)}")
+            form_slug = make_oid_slug(fk_s)
+            form_file_oid = (
+                (f"{file_oid}.{form_slug}" if multi_ds else file_oid)
+                if file_oid
+                else f"DSJ.{make_oid_slug(study_key)}.{form_slug}"
+            )
+            datasets[ig_oid] = DatasetJsonEnvelope(
+                datasetJSONCreationDateTime=resolved_creation_dt,
+                datasetJSONVersion="1.1.0",
+                fileOID=form_file_oid,
+                originator="imednet-toolkit",
+                sourceSystem=src_system,
+                studyOID=study_key,
+                metaDataVersionOID=metadata_version_oid,
+                itemGroupOID=ig_oid,
                 records=len(tuple_rows),
                 name=fk_s,
                 label=form_name_by_key.get(fk_s, fk_s),
-                items=tuple(items_out),
-                itemData=tuple_rows,
+                columns=tuple(items_out),
+                rows=tuple_rows,
             )
 
-    return DatasetJsonEnvelope(
-        creationDateTime=resolved_creation_dt,
-        datasetJSONVersion="1.1.0",
-        fileOID=file_oid or f"DSJ.{make_oid_slug(study_key)}",
-        originator="imednet-toolkit",
-        sourceSystem="imednet",
-        sourceSystemVersion=source_system_version,
-        clinicalData=DatasetJsonClinicalData(
-            studyOID=study_key,
-            metaDataVersionOID=metadata_version_oid,
-            itemGroupData=dict(sorted(item_groups.items())),
-        ),
+    return DatasetJsonBundle(
+        studyOID=study_key,
+        metaDataVersionOID=metadata_version_oid,
+        datasetJSONCreationDateTime=resolved_creation_dt,
+        datasets=dict(sorted(datasets.items())),
     )
+
+
+def build_dataset_json_envelope(
+    study_key: str,
+    *,
+    records: Iterable[Any] = (),
+    forms: Sequence[Any] = (),
+    variables: Sequence[Any] = (),
+    visits: Iterable[Any] = (),
+    data_dictionary: DataDictionary | None = None,
+    as_sdtm: bool | None = None,
+    sdtm_domain: str | None = None,
+    form_key: str | None = None,
+    use_labels_as_columns: bool = False,
+    variable_whitelist: Collection[str] | None = None,
+    form_whitelist: Collection[int] | None = None,
+    naming_convention: str | None = None,
+    preserve_record_id: bool = False,
+    include_deleted: bool = False,
+    mask_phi: bool = True,
+    custom_phi_keys: Collection[str] | None = None,
+    enrichment_pipeline: Any = _UNSET_PIPELINE,
+    metadata_version_oid: str = "MDV.001",
+    file_oid: str | None = None,
+    creation_datetime: str | None = None,
+    source_system_version: str | None = None,
+    seq_counters: dict[str, int] | None = None,
+    domain_seq_counters: dict[str, dict[str, int]] | None = None,
+    seq_overrides: Mapping[str, int] | None = None,
+    lineage_out: dict[str, dict[str, Any]] | None = None,
+) -> DatasetJsonEnvelope:
+    """Build a flat CDISC Dataset-JSON v1.1 single-dataset envelope."""
+    effective_sdtm = bool(sdtm_domain) if as_sdtm is None else bool(as_sdtm)
+    bundle = build_dataset_json_bundle(
+        study_key,
+        records=records,
+        forms=forms,
+        variables=variables,
+        visits=visits,
+        data_dictionary=data_dictionary,
+        as_sdtm=effective_sdtm,
+        sdtm_domain=sdtm_domain,
+        form_key=form_key,
+        use_labels_as_columns=use_labels_as_columns,
+        variable_whitelist=variable_whitelist,
+        form_whitelist=form_whitelist,
+        naming_convention=naming_convention,
+        preserve_record_id=preserve_record_id,
+        include_deleted=include_deleted,
+        mask_phi=mask_phi,
+        custom_phi_keys=custom_phi_keys,
+        enrichment_pipeline=enrichment_pipeline,
+        metadata_version_oid=metadata_version_oid,
+        file_oid=file_oid,
+        creation_datetime=creation_datetime,
+        source_system_version=source_system_version,
+        seq_counters=seq_counters,
+        domain_seq_counters=domain_seq_counters,
+        seq_overrides=seq_overrides,
+        lineage_out=lineage_out,
+    )
+    if effective_sdtm and sdtm_domain:
+        dom_code = resolve_sdtm_domain(sdtm_domain) or sdtm_domain.strip().upper()
+        if dom_code in bundle:
+            selected = bundle[dom_code]
+            return selected.model_copy(update={"file_oid": file_oid}) if file_oid else selected
+    if form_key and form_key in bundle:
+        selected = bundle[form_key]
+        return selected.model_copy(update={"file_oid": file_oid}) if file_oid else selected
+
+    non_empty = [env for env in bundle.values() if env.records > 0]
+    selected = non_empty[0] if len(non_empty) == 1 else next(iter(bundle.values()))
+    if file_oid and selected.file_oid != file_oid:
+        return selected.model_copy(update={"file_oid": file_oid})
+    return selected
 
 
 def to_dataset_json(envelope: DatasetJsonEnvelope, *, indent: int = 2) -> str:
@@ -1848,7 +2347,7 @@ def get_dataset_json_schema() -> dict[str, Any]:
 def _cell_matches_dataset_json_type(val: Any, item_type: str) -> bool:
     if val is None:
         return True
-    if item_type == "string":
+    if item_type in {"string", "date", "time", "datetime", "URI"}:
         return isinstance(val, str)
     if item_type == "integer":
         return isinstance(val, int) and not isinstance(val, bool)
@@ -1862,7 +2361,7 @@ def _cell_matches_dataset_json_type(val: Any, item_type: str) -> bool:
 def validate_dataset_json(
     target: DatasetJsonEnvelope | Mapping[str, Any] | str | Path,
 ) -> list[str]:
-    """Validate a CDISC Dataset-JSON v1.1 document against JSON Schema and tuple invariants."""
+    """Validate a flat CDISC Dataset-JSON v1.1 document against JSON Schema and tuple invariants."""
     errors: list[str] = []
     data: Any
     if isinstance(target, DatasetJsonEnvelope):
@@ -1879,6 +2378,19 @@ def validate_dataset_json(
     if not isinstance(data, Mapping):
         return ["Dataset-JSON root must be a JSON object"]
 
+    if "clinicalData" in data or "referenceData" in data:
+        errors.append(
+            "Legacy Dataset-JSON v1.0 'clinicalData'/'referenceData' nesting is not valid in flat Dataset-JSON v1.1"
+        )
+
+    raw_cols = data.get("columns")
+    if isinstance(raw_cols, Sequence) and not isinstance(raw_cols, (str, bytes)):
+        for c_idx, raw_col in enumerate(raw_cols):
+            if isinstance(raw_col, Mapping) and ("OID" in raw_col or "type" in raw_col):
+                errors.append(
+                    f"[columns.{c_idx}] Legacy v1.0 column keys ('OID'/'type') must use v1.1 'itemOID' and 'dataType'"
+                )
+
     schema = get_dataset_json_schema()
     try:
         import jsonschema
@@ -1890,6 +2402,9 @@ def validate_dataset_json(
     except ImportError:
         pass
 
+    if errors:
+        return errors
+
     try:
         envelope = DatasetJsonEnvelope.model_validate(data)
     except ValidationError as val_err:
@@ -1898,27 +2413,23 @@ def validate_dataset_json(
             errors.append(f"[{loc}] {verr.get('msg', 'Validation error')}")
         return errors
 
-    for section_name, container in (
-        ("clinicalData", envelope.clinical_data),
-        ("referenceData", envelope.reference_data),
-    ):
-        if container is None:
-            continue
-        for ig_oid, ig in container.item_group_data.items():
-            if ig.items and (
-                ig.items[0].name != "ITEMGROUPDATASEQ" or ig.items[0].type != "integer"
-            ):
+    seen_col_names: set[str] = set()
+    seen_item_oids: set[str] = set()
+    for c_idx, col_def in enumerate(envelope.columns):
+        if col_def.name in seen_col_names:
+            errors.append(f"[columns.{c_idx}.name] Duplicate column name '{col_def.name}'")
+        seen_col_names.add(col_def.name)
+        if col_def.item_oid in seen_item_oids:
+            errors.append(f"[columns.{c_idx}.itemOID] Duplicate itemOID '{col_def.item_oid}'")
+        seen_item_oids.add(col_def.item_oid)
+
+    for r_idx, row in enumerate(envelope.rows):
+        for c_idx, (col_def, cell) in enumerate(zip(envelope.columns, row, strict=True)):
+            if not _cell_matches_dataset_json_type(cell, col_def.data_type):
                 errors.append(
-                    f"[{section_name}.itemGroupData.{ig_oid}.items.0] "
-                    "First item in Dataset-JSON v1.1 must be integer 'ITEMGROUPDATASEQ'"
+                    f"[rows.{r_idx}.{c_idx}] "
+                    f"Value {cell!r} does not match declared dataType '{col_def.data_type}'"
                 )
-            for r_idx, row in enumerate(ig.item_data):
-                for c_idx, (item_def, cell) in enumerate(zip(ig.items, row, strict=True)):
-                    if not _cell_matches_dataset_json_type(cell, item_def.type):
-                        errors.append(
-                            f"[{section_name}.itemGroupData.{ig_oid}.itemData.{r_idx}.{c_idx}] "
-                            f"Value {cell!r} does not match declared type '{item_def.type}'"
-                        )
     return errors
 
 
@@ -1951,6 +2462,15 @@ def validate_odm_xml(source: str | bytes | Path) -> list[str]:
         errors.append(f"Root element must be ODM, got '{root.tag}'")
         return errors
 
+    odm_file_type = root.attrib.get("FileType", "Snapshot")
+    if odm_file_type == "Snapshot":
+        for elem in root.iter():
+            if elem.attrib.get("TransactionType") == "Remove":
+                local_name = elem.tag.rsplit("}", 1)[-1]
+                errors.append(
+                    f'TransactionType="Remove" on <{local_name}> is not permitted when ODM FileType="Snapshot"'
+                )
+
     try:
         from lxml import etree as lxml_etree  # type: ignore[import-untyped]  # nosemgrep
 
@@ -1973,6 +2493,7 @@ __all__ = [
     "ODM_132_XSD_PATH",
     "UNSCHEDULED_EVENT_OID",
     "build_datadict_from_sdk_metadata",
+    "build_dataset_json_bundle",
     "build_dataset_json_envelope",
     "build_odm_archive",
     "get_dataset_json_schema",

@@ -13,16 +13,22 @@ implemented by both :class:`~imednet.validation.cache.BaseSchemaCache`
 SchemaCache vs. DataDictionary
 ------------------------------
 
-``SchemaCache`` and ``DataDictionary`` enforce different levels of Study metadata checks
-because the REST ``/forms`` and ``/variables`` endpoints expose only basic Variable types,
-whereas a :doc:`Data Dictionary </how-to/data_dictionary>` carries full Form constraints,
-Choice codelists, and conditional XML business logic rules.
+``SchemaCache`` and ``DataDictionary`` enforce different scopes of Study metadata checks
+because the REST ``/forms`` and ``/variables`` endpoints expose Form identifiers, scalar
+Variable types, ``required`` policies, and ``deleted`` / ``disabled`` retirement metadata,
+whereas a :doc:`Data Dictionary </how-to/data_dictionary>` additionally carries Choice
+codelists, numeric and length bounds, CDISC ODM ``<RangeCheck>`` definitions, and conditional
+XML business logic rules.
 
-When :func:`~imednet.validation.cache.validate_record_data` receives a ``BaseSchemaCache``
-instance, it verifies Form existence, rejects unknown Variable names, checks scalar Python
-types, and then **returns early**—skipping required-field policies, Choice membership,
-numeric/length bounds, and XML edit checks. Passing a ``DataDictionary`` executes the full
-constraint and rule pipeline:
+When :func:`~imednet.validation.cache.validate_record_data` receives a
+:class:`~imednet.validation.cache.BaseSchemaCache` instance (:class:`~imednet.validation.cache.SchemaCache`
+or :class:`~imednet.validation.cache.AsyncSchemaCache`), it verifies Form existence, rejects
+unknown Variable names, blocks scalar and nested ``***MASKED***`` PHI sentinels
+(``rule_id="masked_phi"``) before type checks, validates scalar Variable types across both
+active and retired Variables, and enforces active Required Variable policies (``Yes`` and
+``Auto Query``)—skipping only Choice membership, numeric/length and ODM ``<RangeCheck>``
+bounds, and XML edit checks. Passing a ``DataDictionary`` executes the full constraint and
+rule pipeline:
 
 .. list-table:: Validation Coverage by Schema Implementation
    :header-rows: 1
@@ -37,21 +43,46 @@ constraint and rule pipeline:
    * - Unknown Variable detection on Form
      - Enforced
      - Enforced
-   * - Scalar Variable data type (``Number``, ``Integer``, ``Float``, ``Date``, ``Text``)
+   * - Masked PHI sentinel rejection (``***MASKED***``, ``rule_id="masked_phi"``)
      - Enforced
      - Enforced
-   * - Required Variable policies (``Yes`` raises error; ``Auto Query`` logs warning)
-     - Skipped
+   * - Scalar Variable data type (``Number``, ``Integer``, ``Float``, ``Date``, ``Text``), including retired (``deleted`` / ``disabled``) Variables
+     - Enforced
+     - Enforced
+   * - Required Variable policies (``Yes`` raises error; ``Auto Query`` logs warning) on active Variables
+     - Enforced
      - Enforced
    * - Choice codelist membership (``Radio``, ``Single Select``, ``Multi Select``, ``Checkbox``, ``Yes/No``)
      - Skipped
      - Enforced
-   * - Numeric (``minValue`` / ``maxValue``) & text length (``minLength`` / ``maxLength``) bounds
+   * - Numeric (``minValue`` / ``maxValue``), text length (``minLength`` / ``maxLength``), & CDISC ODM :class:`~imednet.datadict.RangeCheckConstraint` bounds
      - Skipped
      - Enforced
    * - Conditional XML business logic rules via :class:`~imednet.datadict.logic.LogicTreeEvaluator`
      - Skipped
      - Enforced
+
+Masked PHI Sentinels and Retired Variables
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before running Variable type checks, :func:`~imednet.validation.cache.validate_record_data`
+inspects every submitted value (both scalar strings and nested containers such as lists,
+tuples, sets, and dictionaries) for the ``***MASKED***`` redaction token. Any matching
+Variable fails immediately with ``rule_id="masked_phi"`` (and skips redundant downstream type
+errors for that Variable) so redacted export payloads cannot overwrite clinical data in a
+Study.
+
+When hydrating :class:`~imednet.validation.cache.BaseSchemaCache`, Variables marked
+``deleted`` or ``disabled`` are stored in ``_retired_form_variables`` (while still registering
+the Form in ``_known_forms`` and preserving ``formId`` to ``formKey`` links, even when every
+Variable on a Form is retired). During validation:
+
+* Omitting a ``deleted`` or ``disabled`` Variable never triggers ``required`` or
+  ``required_auto_query`` issues, even if the historical Variable metadata declared
+  ``required=True`` or ``required="Yes"``.
+* Supplying a value for a retired Variable in a historical Record payload does not fail with
+  ``rule_id="unknown_variable"``, and still undergoes ``***MASKED***`` sentinel and scalar
+  data type checks (``rule_id="type"``).
 
 API-Backed Type Checks (``SchemaValidator``)
 --------------------------------------------
@@ -187,23 +218,99 @@ Offline SchemaCache Example
 ---------------------------
 
 ``imednet.testing.fake_data`` provides helpers for generating Form
-metadata and sample Records without an API connection. Combine these
-functions with ``SchemaCache`` to run type-level validation locally::
+metadata and sample Records without an API connection, and ``SchemaCache.populate``
+lets unit tests verify Required Variable policies (``Yes`` and ``Auto Query``),
+``***MASKED***`` sentinel blocking, and retired Variable type checks offline:
+
+.. testcode::
 
     from types import SimpleNamespace
+    from typing import Any, cast
+    from imednet.models.variables import Variable as ApiVariable
     from imednet.testing import fake_data
-    from imednet.validation.cache import SchemaCache
+    from imednet.validation.cache import SchemaCache, validate_record_data
 
     forms = fake_data.fake_forms_for_cache(1, study_key="S")
-    variables = fake_data.fake_variables_for_cache(forms, vars_per_form=2,
-                                                   study_key="S")
+    variables = fake_data.fake_variables_for_cache(
+        forms, vars_per_form=2, study_key="S"
+    )
 
-    forms_ep = SimpleNamespace(list=lambda **_: forms)
-    vars_ep = SimpleNamespace(list=lambda form_id=None, **__: [
-        v for v in variables if form_id is None or v.form_id == form_id
-    ])
+    forms_ep = cast(Any, SimpleNamespace(list=lambda **_: forms))
+    vars_ep = cast(
+        Any,
+        SimpleNamespace(
+            list=lambda form_id=None, **__: [
+                v for v in variables if form_id is None or v.form_id == form_id
+            ]
+        ),
+    )
 
     schema = SchemaCache()
     schema.refresh(forms_ep, vars_ep, study_key="S")
+    sample_record = fake_data.fake_record(schema)
+    assert "recordData" in sample_record
 
-    record = fake_data.fake_record(schema)
+    policy_cache = SchemaCache()
+    policy_cache.populate(
+        [
+            ApiVariable.model_validate(
+                {
+                    "variableName": "V_SUBJ_AGE",
+                    "variableType": "Integer",
+                    "formId": 501,
+                    "formKey": "F_SCREEN",
+                    "required": "Yes",
+                }
+            ),
+            ApiVariable.model_validate(
+                {
+                    "variableName": "V_NOTES",
+                    "variableType": "Multi Select",
+                    "formId": 501,
+                    "formKey": "F_SCREEN",
+                    "required": "Auto Query",
+                }
+            ),
+            ApiVariable.model_validate(
+                {
+                    "variableName": "V_LEGACY_SCORE",
+                    "variableType": "Integer",
+                    "formId": 501,
+                    "formKey": "F_SCREEN",
+                    "deleted": True,
+                    "required": True,
+                }
+            ),
+        ],
+        study_key="STUDY",
+    )
+    assert "V_LEGACY_SCORE" in policy_cache._retired_form_variables[("STUDY", "F_SCREEN")]
+
+    # Missing active 'Yes' raises required error; 'Auto Query' records a warning; retired Variable is not required
+    missing_report = validate_record_data(
+        policy_cache,
+        "F_SCREEN",
+        {},
+        study_key="STUDY",
+        collect_errors=True,
+    )
+    assert [e.rule_id for e in missing_report.errors] == ["required"]
+    assert [w.rule_id for w in missing_report.warnings] == ["required_auto_query"]
+
+    # Scalar/nested '***MASKED***' sentinels fail with 'masked_phi'; retired Variables are still type-checked
+    masked_and_retired = validate_record_data(
+        policy_cache,
+        "F_SCREEN",
+        {
+            "V_SUBJ_AGE": "***MASKED***",
+            "V_NOTES": ["***MASKED***"],
+            "V_LEGACY_SCORE": "not-an-int",
+        },
+        study_key="STUDY",
+        collect_errors=True,
+    )
+    assert [e.rule_id for e in masked_and_retired.errors] == [
+        "masked_phi",
+        "masked_phi",
+        "type",
+    ]

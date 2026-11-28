@@ -126,6 +126,19 @@ def add_write_common_args(
         default=None,
         help="Optional email address or boolean flag for job completion notifications.",
     )
+    parser.add_argument(
+        "--resolve-results",
+        dest="resolve_results",
+        action="store_true",
+        default=True,
+        help="Fetch external resultUrl payloads when --wait is enabled (default).",
+    )
+    parser.add_argument(
+        "--no-resolve-results",
+        dest="resolve_results",
+        action="store_false",
+        help="Skip fetching external resultUrl payloads when --wait is enabled.",
+    )
     add_output_format(parser)
     add_simulation_arg(parser)
 
@@ -194,25 +207,30 @@ def guard_stdin_dash_tty(file_arg: str | None) -> None:
         sys.exit(1)
 
 
-def load_offline_schema(schema_source: str, *, study_key: str) -> ValidationSchemaProtocol:
+def load_offline_schema(
+    schema_source: str | Path,
+    *,
+    study_key: str | None = None,
+) -> DataDictionary:
     """Load an offline :class:`DataDictionary` from JSON, ODM XML, REDCap CSV, ZIP, or CSV dir."""
+    eff_study_key = study_key if study_key else None
     path = Path(schema_source)
     if not path.exists():
         raise ValueError(f"Schema path not found: '{schema_source}'")
     if path.is_dir():
-        return load_from_csv(path, study_key=study_key)
+        return load_from_csv(path, study_key=eff_study_key)
     suffix = path.suffix.lower()
     if suffix == ".zip":
-        return load_from_csv(path, study_key=study_key)
+        return load_from_csv(path, study_key=eff_study_key)
     if suffix == ".json":
         dd = DataDictionary.model_validate_json(path.read_text(encoding="utf-8"))
-        if study_key:
-            dd.metadata.studyKey = study_key
+        if eff_study_key:
+            dd.metadata.studyKey = eff_study_key
         return dd
     if suffix == ".xml":
-        return load_from_cdisc_odm(path, study_key=study_key)
+        return load_from_cdisc_odm(path, study_key=eff_study_key)
     if suffix == ".csv":
-        return load_from_redcap(path, study_key=study_key)
+        return load_from_redcap(path, study_key=eff_study_key)
     raise ValueError(
         f"Unsupported schema file format '{path.suffix}'. "
         "Expected .json, .xml, .csv, .zip, or directory."
@@ -847,6 +865,9 @@ def _summary_to_json_item(summary: BatchSubmissionSummary) -> dict[str, Any]:
         "skippedCount": summary.skipped_count,
         "chunkCount": summary.chunk_count,
         "batchIds": summary.batch_ids,
+        "createdRecordIds": summary.created_record_ids,
+        "enrolledSubjectKeys": summary.enrolled_subject_keys,
+        "recordErrors": summary.record_errors,
         "allSuccessful": summary.all_successful,
         "jobs": sanitized_jobs,
         "validationReport": sanitized_report,

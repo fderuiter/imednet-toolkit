@@ -43,7 +43,7 @@ _MAX_SCROLL_COL_WIDTH = 36
 def _normalize_nested_value(val: Any) -> Any:
     """Recursively normalize Pydantic models and tuples into plain dicts and lists."""
     if isinstance(val, BaseModel):
-        return _normalize_nested_value(val.model_dump(by_alias=False))
+        return _normalize_nested_value(val.model_dump(by_alias=False, warnings=False))
     if isinstance(val, dict):
         return {k: _normalize_nested_value(v) for k, v in val.items()}
     if isinstance(val, (list, tuple)):
@@ -70,7 +70,7 @@ def _collect_search_tokens(val: Any) -> list[str]:
     if isinstance(val, Enum):
         return _collect_search_tokens(val.value)
     if isinstance(val, BaseModel):
-        return _collect_search_tokens(val.model_dump(by_alias=False))
+        return _collect_search_tokens(val.model_dump(by_alias=False, warnings=False))
     if isinstance(val, dict):
         tokens: list[str] = []
         for k, v in val.items():
@@ -159,12 +159,12 @@ def extract_item_details(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
 
     data_dict: dict[str, Any] = {}
     if isinstance(detail, BaseModel):
-        data_dict = detail.model_dump(by_alias=False)
+        data_dict = detail.model_dump(by_alias=False, warnings=False)
     elif isinstance(detail, dict):
         data_dict = dict(detail)
     elif hasattr(detail, "model_dump") and callable(detail.model_dump):
         try:
-            dumped = detail.model_dump(by_alias=False)
+            dumped = detail.model_dump(by_alias=False, warnings=False)
         except TypeError:
             dumped = detail.model_dump()
         if isinstance(dumped, dict):
@@ -178,6 +178,8 @@ def extract_item_details(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
 
     raw_vars = data_dict.pop("record_data", None)
     if raw_vars is None:
+        raw_vars = data_dict.pop("recordData", None)
+    if raw_vars is None:
         raw_vars = data_dict.pop("data", None)
 
     variables: dict[str, Any] = {}
@@ -186,7 +188,11 @@ def extract_item_details(detail: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     elif hasattr(raw_vars, "root") and isinstance(raw_vars.root, dict):
         variables = _normalize_nested_value(dict(raw_vars.root))
     elif hasattr(raw_vars, "model_dump"):
-        variables = _normalize_nested_value(raw_vars.model_dump(by_alias=False))
+        try:
+            dumped_vars = raw_vars.model_dump(by_alias=False, warnings=False)
+        except TypeError:
+            dumped_vars = raw_vars.model_dump(by_alias=False)
+        variables = _normalize_nested_value(dumped_vars)
 
     flattened_vars: dict[str, Any] = {}
     _flatten_variables("", variables, flattened_vars)
@@ -208,6 +214,7 @@ class InteractiveDataGrid:
         status_notice: str | None = None,
         truncated: bool | None = None,
         on_load_all: Callable[[], Any] | None = None,
+        entity_kind: str | None = None,
     ) -> None:
         """Initialize the interactive data grid.
 
@@ -221,6 +228,7 @@ class InteractiveDataGrid:
             status_notice: Optional notice displayed when results are truncated/bounded.
             truncated: Whether initial rows represent a truncated subset of server items.
             on_load_all: Optional callback draining remaining pages on ``[a]``.
+            entity_kind: Optional canonical entity kind (e.g. 'records') for side-panel layout.
         """
         if curses is None:
             raise RuntimeError(
@@ -229,6 +237,7 @@ class InteractiveDataGrid:
         self.stdscr = stdscr
         self.fields = fields
         self.label = label
+        self.entity_kind = entity_kind
         self.status_notice = status_notice
         self.on_load_all = on_load_all
         self.truncated: bool = (
@@ -249,6 +258,7 @@ class InteractiveDataGrid:
             zip(items, detail_list, strict=False)
         )
         self.filtered_entries: list[tuple[dict[str, Any], Any]] = list(self.all_entries)
+        self._search_cache: list[str | None] = [None] * len(self.all_entries)
 
         self.selected_idx: int = 0
         self.top_idx: int = 0
@@ -258,6 +268,16 @@ class InteractiveDataGrid:
 
         self.is_searching: bool = False
         self.search_query: str = ""
+        self._search_start_query: str = ""
+        self._active_query_normalized: str = ""
+        initial_entry = self.filtered_entries[0] if self.filtered_entries else None
+        self._session_anchor: tuple[tuple[dict[str, Any], Any], int, int] | None = (
+            (initial_entry, 0, 0) if initial_entry is not None else None
+        )
+        self._last_match_anchor: tuple[tuple[dict[str, Any], Any], int, int] | None = (
+            self._session_anchor
+        )
+        self._manual_nav_in_filter: bool = False
 
         self.color_attrs: dict[str, int] = {}
         self._setup_curses()
@@ -338,27 +358,102 @@ class InteractiveDataGrid:
             return self.color_attrs[color_name]
         return 0
 
+    def _viewport_height(self, max_y: int | None = None) -> int:
+        """Return visible row capacity for the current terminal height."""
+        if max_y is None:
+            try:
+                max_y, _ = self.stdscr.getmaxyx()
+            except _CURSES_ERROR:
+                return 1
+        return max(1, max_y - 4)
+
+    def _clamp_viewport(self, max_y: int | None = None) -> None:
+        """Clamp selected_idx and top_idx to current filtered rows and viewport capacity."""
+        total = len(self.filtered_entries)
+        if total <= 0:
+            self.selected_idx = 0
+            self.top_idx = 0
+            return
+        self.selected_idx = max(0, min(self.selected_idx, total - 1))
+        viewport_height = self._viewport_height(max_y)
+        if self.selected_idx < self.top_idx:
+            self.top_idx = self.selected_idx
+        elif self.selected_idx >= self.top_idx + viewport_height:
+            self.top_idx = self.selected_idx - viewport_height + 1
+        max_top = max(0, total - viewport_height)
+        self.top_idx = max(0, min(self.top_idx, max_top))
+
+    @staticmethod
+    def _find_entry_index(
+        entries: Sequence[tuple[dict[str, Any], Any]],
+        target: tuple[dict[str, Any], Any],
+    ) -> int | None:
+        """Find index of ``target`` in ``entries`` by object identity."""
+        target_row, target_detail = target
+        for idx, (row_dict, detail_obj) in enumerate(entries):
+            if row_dict is target_row and detail_obj is target_detail:
+                return idx
+        return None
+
+    def _record_manual_anchor(self, max_y: int | None = None) -> None:
+        """Clamp viewport after manual cursor navigation and refresh selection anchors."""
+        self._clamp_viewport(max_y)
+        if self.filtered_entries and 0 <= self.selected_idx < len(self.filtered_entries):
+            entry = self.filtered_entries[self.selected_idx]
+            offset = max(0, self.selected_idx - self.top_idx)
+            self._last_match_anchor = (entry, offset, self.top_idx)
+            if not self.search_query.strip():
+                self._session_anchor = (entry, offset, self.top_idx)
+                self._manual_nav_in_filter = False
+            else:
+                self._manual_nav_in_filter = True
+
+    def _get_search_text(self, idx: int) -> str:
+        """Build and cache normalized lowercase search text once for ``all_entries[idx]``."""
+        if idx >= len(self._search_cache):
+            self._search_cache.extend([None] * (idx + 1 - len(self._search_cache)))
+        cached = self._search_cache[idx]
+        if cached is not None:
+            return cached
+
+        row_dict, detail_obj = self.all_entries[idx]
+        row_tokens: list[str] = []
+        for k, v in row_dict.items():
+            row_tokens.append(self._format_cell(v, key=str(k)))
+            row_tokens.extend(_collect_search_tokens(v))
+        meta, variables = extract_item_details(detail_obj)
+        detail_tokens = _collect_search_tokens(meta) + _collect_search_tokens(variables)
+        normalized = f"{' '.join(row_tokens)}\n{' '.join(detail_tokens)}".lower()
+        self._search_cache[idx] = normalized
+        return normalized
+
     def filter_entries(self) -> None:
         """Filter in-memory entries immediately based on current search query."""
-        if not self.search_query.strip():
+        prev_query = self._active_query_normalized
+        prev_entries = self.filtered_entries
+        if prev_entries and 0 <= self.selected_idx < len(prev_entries):
+            curr_entry = prev_entries[self.selected_idx]
+            curr_offset = max(0, self.selected_idx - self.top_idx)
+            self._last_match_anchor = (curr_entry, curr_offset, self.top_idx)
+            if not prev_query:
+                self._session_anchor = (curr_entry, curr_offset, self.top_idx)
+                self._manual_nav_in_filter = False
+
+        query = self.search_query.strip().lower()
+        self._active_query_normalized = query
+        if not query:
             self.filtered_entries = list(self.all_entries)
         else:
-            query = self.search_query.strip().lower()
-            matches = []
-            for row_dict, detail_obj in self.all_entries:
-                row_tokens: list[str] = []
-                for k, v in row_dict.items():
-                    row_tokens.append(self._format_cell(v, key=str(k)))
-                    row_tokens.extend(_collect_search_tokens(v))
-                if query in " ".join(row_tokens).lower():
-                    matches.append((row_dict, detail_obj))
-                    continue
-
-                meta, variables = extract_item_details(detail_obj)
-                detail_tokens = _collect_search_tokens(meta) + _collect_search_tokens(variables)
-                if query in " ".join(detail_tokens).lower():
-                    matches.append((row_dict, detail_obj))
-
+            cache = self._search_cache
+            if len(cache) < len(self.all_entries):
+                cache.extend([None] * (len(self.all_entries) - len(cache)))
+            matches: list[tuple[dict[str, Any], Any]] = []
+            for idx, entry in enumerate(self.all_entries):
+                text = cache[idx]
+                if text is None:
+                    text = self._get_search_text(idx)
+                if query in text:
+                    matches.append(entry)
             self.filtered_entries = matches
 
         total = len(self.filtered_entries)
@@ -366,8 +461,40 @@ class InteractiveDataGrid:
             self.selected_idx = 0
             self.top_idx = 0
         else:
-            self.selected_idx = max(0, min(self.selected_idx, total - 1))
-            self.top_idx = max(0, min(self.top_idx, total - 1))
+            restored = False
+            candidates = (
+                (self._session_anchor, self._last_match_anchor)
+                if (not query and not self._manual_nav_in_filter)
+                else (self._last_match_anchor, self._session_anchor)
+            )
+            for anchor in candidates:
+                if anchor is None:
+                    continue
+                anchor_entry, anchor_offset, anchor_top = anchor
+                found_idx = self._find_entry_index(self.filtered_entries, anchor_entry)
+                if found_idx is not None:
+                    self.selected_idx = found_idx
+                    if (
+                        not query
+                        and anchor is self._session_anchor
+                        and not self._manual_nav_in_filter
+                    ):
+                        self.top_idx = anchor_top
+                    else:
+                        self.top_idx = max(0, found_idx - anchor_offset)
+                    restored = True
+                    break
+            if not restored and len(prev_entries) == 0:
+                self.selected_idx = 0
+                self.top_idx = 0
+            self._clamp_viewport()
+            if not query:
+                curr_entry = self.filtered_entries[self.selected_idx]
+                curr_offset = max(0, self.selected_idx - self.top_idx)
+                self._session_anchor = (curr_entry, curr_offset, self.top_idx)
+                self._last_match_anchor = self._session_anchor
+                self._manual_nav_in_filter = False
+
         self.side_panel_scroll = 0
         self._side_panel_max_scroll = None
         self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
@@ -408,12 +535,16 @@ class InteractiveDataGrid:
                 if isinstance(entry, dict):
                     new_entries.append((dict(entry), entry))
                 elif hasattr(entry, "model_dump") and not self.fields:
-                    dumped = entry.model_dump()
+                    try:
+                        dumped = entry.model_dump(warnings=False)
+                    except TypeError:
+                        dumped = entry.model_dump()
                     new_entries.append((dumped if isinstance(dumped, dict) else {}, entry))
                 else:
                     new_entries.append(({f: getattr(entry, f, None) for f in self.fields}, entry))
 
         self.all_entries.extend(new_entries)
+        self._search_cache.extend([None] * len(new_entries))
         self.truncated = False
         self.on_load_all = None
         self.status_notice = None
@@ -423,6 +554,19 @@ class InteractiveDataGrid:
     def _format_cell(self, value: Any, key: str | None = None) -> str:
         """Format a single cell value for table display."""
         return _format_cell_value(value, key=key)
+
+    def _is_modal_inspection(self, max_x: int) -> bool:
+        """Return True when inspection renders as a full-width detail modal (24..49 cols)."""
+        return self.side_panel_open and 24 <= max_x < 50
+
+    def _inspection_content_width(self, max_x: int) -> int:
+        """Return wrapped content width for the active detail modal or side panel."""
+        if not self.side_panel_open or max_x < 24:
+            return 0
+        if max_x < 50:
+            return max(10, max_x - 2)
+        _, _, _, panel_width = self._layout_bounds(max_x)
+        return max(10, panel_width - 3) if panel_width > 0 else 0
 
     def _layout_bounds(self, max_x: int) -> tuple[int, int, int, int]:
         """Compute (grid_width, grid_limit, panel_x, panel_width) for terminal width max_x."""
@@ -520,22 +664,28 @@ class InteractiveDataGrid:
             return
 
         total_rows = len(self.filtered_entries)
-        viewport_height = max(1, max_y - 4)
-
-        # Keep selected row visible within viewport
-        if self.selected_idx < self.top_idx:
-            self.top_idx = self.selected_idx
-        elif self.selected_idx >= self.top_idx + viewport_height:
-            self.top_idx = self.selected_idx - viewport_height + 1
+        viewport_height = self._viewport_height(max_y)
+        self._clamp_viewport(max_y)
 
         _, grid_limit, panel_x, panel_width = self._layout_bounds(max_x)
+        modal_open = self._is_modal_inspection(max_x)
 
         # Title / header bar at line 0
-        title = self._format_header_bar(grid_limit, total_rows, panel_width)
+        title = self._format_header_bar(grid_limit, total_rows, panel_width, modal_open=modal_open)
         safe_addstr(self.stdscr, 0, 0, _slice_display_width(title, grid_limit), curses.A_BOLD)
 
         num_cols = len(self.fields)
         max_col_offset = 0
+
+        if modal_open:
+            if num_cols > 0:
+                _, col_widths = self._compute_col_widths(grid_limit)
+                max_col_offset = self._max_offset_for_widths(col_widths, grid_limit)
+                self.col_offset = max(0, min(self.col_offset, max_col_offset))
+            self._draw_detail_modal(max_x, max_y)
+            self._draw_status_bar(max_y - 1, max_x, total_rows, max_col_offset)
+            self.stdscr.refresh()
+            return
 
         if num_cols > 0:
             headers, col_widths = self._compute_col_widths(grid_limit)
@@ -780,7 +930,10 @@ class InteractiveDataGrid:
         if isinstance(value, dict):
             non_empty = {k: v for k, v in value.items() if v is not None and v != ""}
             if not non_empty:
-                lines.extend(self._wrap_panel_line(f"{indent}{display_key}: {{}}", content_w))
+                empty_dict_marker = "{}" if indent == "  " else "-"
+                lines.extend(
+                    self._wrap_panel_line(f"{indent}{display_key}: {empty_dict_marker}", content_w)
+                )
                 return
             lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
             for sub_k, sub_v in non_empty.items():
@@ -811,18 +964,66 @@ class InteractiveDataGrid:
             lines.extend(self._wrap_panel_line(f"{indent}{display_key}:", content_w))
             for entry in value:
                 if isinstance(entry, dict):
-                    entry_pairs = [
-                        f"{ek}: {self._format_panel_scalar(ev, key=str(ek))}"
+                    entry_items = [
+                        (ek, ev)
                         for ek, ev in entry.items()
-                        if ev is not None and ev != ""
+                        if ev is not None and ev not in ("", [], {})
                     ]
-                    item_str = ", ".join(entry_pairs) if entry_pairs else "{}"
-                    lines.extend(
-                        self._wrap_panel_line(
-                            f"{indent}  - {item_str}",
-                            content_w,
-                            cont_indent=indent + "    ",
+                    if not entry_items:
+                        lines.extend(self._wrap_panel_line(f"{indent}  - -", content_w))
+                    elif len(entry_items) <= 4 and all(
+                        isinstance(ev, (str, int, float, bool, Enum, datetime))
+                        for _, ev in entry_items
+                    ):
+                        entry_pairs = [
+                            f"{ek}: {self._format_panel_scalar(ev, key=str(ek))}"
+                            for ek, ev in entry_items
+                        ]
+                        lines.extend(
+                            self._wrap_panel_line(
+                                f"{indent}  - {', '.join(entry_pairs)}",
+                                content_w,
+                                cont_indent=indent + "    ",
+                            )
                         )
+                    else:
+                        first_k, first_v = entry_items[0]
+                        if isinstance(first_v, (dict, list)):
+                            lines.extend(self._wrap_panel_line(f"{indent}  -", content_w))
+                            self._append_panel_value(
+                                lines,
+                                str(first_k),
+                                first_v,
+                                str(first_k),
+                                content_w,
+                                indent=indent + "    ",
+                            )
+                        else:
+                            first_str = self._format_panel_scalar(first_v, key=str(first_k))
+                            lines.extend(
+                                self._wrap_panel_line(
+                                    f"{indent}  - {first_k}: {first_str}",
+                                    content_w,
+                                    cont_indent=indent + "    ",
+                                )
+                            )
+                        for ek, ev in entry_items[1:]:
+                            self._append_panel_value(
+                                lines,
+                                str(ek),
+                                ev,
+                                str(ek),
+                                content_w,
+                                indent=indent + "    ",
+                            )
+                elif isinstance(entry, list):
+                    self._append_panel_value(
+                        lines,
+                        "-",
+                        entry,
+                        "-",
+                        content_w,
+                        indent=indent + "  ",
                     )
                 else:
                     lines.extend(
@@ -843,9 +1044,32 @@ class InteractiveDataGrid:
             )
         )
 
+    @staticmethod
+    def _is_record_detail(detail_obj: Any) -> bool:
+        """Return True if *detail_obj* represents a clinical Record model or mapping."""
+        if detail_obj is None:
+            return False
+        if type(detail_obj).__name__ == "Record" or hasattr(detail_obj, "record_data"):
+            return True
+        if isinstance(detail_obj, dict):
+            return "record_data" in detail_obj or "recordData" in detail_obj
+        return False
+
+    def _is_records_view(self) -> bool:
+        """Return True when the side panel should use clinical Record inspection headers."""
+        if self.entity_kind is not None:
+            return self.entity_kind.strip().lower() == "records"
+        if self.label == "records":
+            return True
+        if self.filtered_entries and 0 <= self.selected_idx < len(self.filtered_entries):
+            return self._is_record_detail(self.filtered_entries[self.selected_idx][1])
+        if self.all_entries:
+            return self._is_record_detail(self.all_entries[0][1])
+        return False
+
     def _build_side_panel_lines(self, content_w: int) -> list[tuple[str, int]]:
         """Build wrapped metadata and variable lines for the selected side-panel entry."""
-        is_records = self.label == "records"
+        is_records = self._is_records_view()
         _, detail_obj = self.filtered_entries[self.selected_idx]
         meta, variables = extract_item_details(detail_obj)
 
@@ -930,43 +1154,47 @@ class InteractiveDataGrid:
         return lines
 
     def _resolve_side_panel_max_scroll(self, max_y: int, max_x: int) -> int:
-        """Return cached or freshly computed maximum side-panel scroll offset."""
+        """Return cached or freshly computed maximum side-panel or detail-modal scroll offset."""
         if self._side_panel_max_scroll is not None:
             return self._side_panel_max_scroll
-        _, _, _, panel_width = self._layout_bounds(max_x)
+        content_w = self._inspection_content_width(max_x)
         if (
             max_y < 5
-            or max_x < 24
-            or panel_width <= 0
+            or content_w <= 0
             or not self.filtered_entries
             or not (0 <= self.selected_idx < len(self.filtered_entries))
         ):
             self._side_panel_max_scroll = 0
             return 0
-        content_w = max(10, panel_width - 3)
         visible_slots = max(1, max_y - 5)
         lines = self._build_side_panel_lines(content_w)
         max_scroll = max(0, len(lines) - visible_slots)
         self._side_panel_max_scroll = max_scroll
         return max_scroll
 
-    def _draw_side_panel(self, panel_x: int, panel_width: int, max_y: int) -> None:
-        """Render the side inspection panel displaying variables and metadata."""
-        viewport_lines = max_y - 3  # Lines from 1 to max_y - 2
-
-        # Blank the entire panel area across title and viewport rows and draw divider
-        safe_addstr(self.stdscr, 0, panel_x, " " * panel_width)
-        blank_row = "│" + (" " * max(0, panel_width - 1))
-        for y in range(1, max_y - 1):
-            safe_addstr(self.stdscr, y, panel_x, blank_row)
-
-        content_x = panel_x + 2
-        content_w = max(10, panel_width - 3)
-
-        is_records = self.label == "records"
-        panel_title = _sanitize_cell_text(
-            " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
-        )
+    def _render_inspection_body(
+        self,
+        content_x: int,
+        content_w: int,
+        max_y: int,
+        *,
+        modal: bool = False,
+    ) -> None:
+        """Render scrollable metadata and variable lines inside a side panel or detail modal."""
+        viewport_lines = max_y - 3
+        is_records = self._is_records_view()
+        if modal:
+            long_title = _sanitize_cell_text(
+                " RECORD DETAIL MODAL " if is_records else f" {self.label.upper()} DETAIL MODAL "
+            )
+            short_title = _sanitize_cell_text(
+                " RECORD DETAILS " if is_records else f" {self.label.upper()} DETAILS "
+            )
+            panel_title = long_title if _display_width(long_title) <= content_w else short_title
+        else:
+            panel_title = _sanitize_cell_text(
+                " RECORD INSPECTION " if is_records else f" {self.label.upper()} DETAILS "
+            )
         safe_addstr(
             self.stdscr,
             1,
@@ -984,7 +1212,6 @@ class InteractiveDataGrid:
 
         lines = self._build_side_panel_lines(content_w)
 
-        # Render lines with scroll offset
         visible_slots = max(1, viewport_lines - 2)
         total_lines = len(lines)
         max_scroll = max(0, total_lines - visible_slots)
@@ -1015,6 +1242,25 @@ class InteractiveDataGrid:
                 curses.A_DIM,
             )
 
+    def _draw_detail_modal(self, max_x: int, max_y: int) -> None:
+        """Render the full-width detail modal for narrow 24..49-column terminal panes."""
+        blank_row = " " * max_x
+        for y in range(1, max_y - 1):
+            safe_addstr(self.stdscr, y, 0, blank_row)
+        content_x = 1
+        content_w = max(10, max_x - 2)
+        self._render_inspection_body(content_x, content_w, max_y, modal=True)
+
+    def _draw_side_panel(self, panel_x: int, panel_width: int, max_y: int) -> None:
+        """Render the side inspection panel displaying variables and metadata."""
+        safe_addstr(self.stdscr, 0, panel_x, " " * panel_width)
+        blank_row = "│" + (" " * max(0, panel_width - 1))
+        for y in range(1, max_y - 1):
+            safe_addstr(self.stdscr, y, panel_x, blank_row)
+        content_x = panel_x + 2
+        content_w = max(10, panel_width - 3)
+        self._render_inspection_body(content_x, content_w, max_y, modal=False)
+
     def _full_truncation_notice(self) -> str:
         """Return a descriptive single-line truncation notice including [a] and --all."""
         raw = _sanitize_cell_text(self.status_notice) if self.status_notice else ""
@@ -1025,12 +1271,24 @@ class InteractiveDataGrid:
             f"(truncated; press [a] or pass --all)"
         )
 
-    def _format_header_bar(self, grid_limit: int, total_rows: int, panel_width: int) -> str:
+    def _format_header_bar(
+        self,
+        grid_limit: int,
+        total_rows: int,
+        panel_width: int,
+        *,
+        modal_open: bool = False,
+    ) -> str:
         """Format line 0 title bar so truncation recovery cues fit narrow 43-col panes."""
         label_title = _sanitize_cell_text(self.label.title())
         mode_str = " [SEARCH MODE]" if self.is_searching else ""
         hc_str = " [HIGH-CONTRAST]" if self.is_high_contrast else ""
-        panel_str = " [SIDE PANEL]" if (self.side_panel_open and panel_width > 0) else ""
+        if modal_open:
+            panel_str = " [DETAIL MODAL]"
+        elif self.side_panel_open and panel_width > 0:
+            panel_str = " [SIDE PANEL]"
+        else:
+            panel_str = ""
         filter_status = (
             _sanitize_cell_text(f' [Filter: "{self.search_query}"]') if self.search_query else ""
         )
@@ -1068,10 +1326,17 @@ class InteractiveDataGrid:
             return candidates[-1]
 
         notice_str = f" [{_sanitize_cell_text(self.status_notice)}]" if self.status_notice else ""
-        return _sanitize_cell_text(
+        header_candidates = [
             f"iMednet {label_title} Review ({total_rows} items)"
-            f"{notice_str}{filter_status}{panel_str}{mode_str}{hc_str}"
-        )
+            f"{notice_str}{filter_status}{panel_str}{mode_str}{hc_str}",
+            f"{label_title} ({total_rows}){notice_str}{filter_status}{panel_str}{mode_str}{hc_str}",
+            f"{label_title} ({total_rows}){panel_str}{mode_str}",
+        ]
+        for candidate in header_candidates:
+            sanitized_cand = _sanitize_cell_text(candidate)
+            if _display_width(sanitized_cand) <= grid_limit:
+                return sanitized_cand
+        return _sanitize_cell_text(header_candidates[0])
 
     def _draw_status_bar(
         self, y: int, max_x: int, total_rows: int, max_col_offset: int = 0
@@ -1126,6 +1391,7 @@ class InteractiveDataGrid:
                     f"[q] Quit  {pos_info}{col_compact}{extra}",
                     f"[↑↓←→] [/] [[/]] Scroll [Esc] Close [q]  {pos_info}{col_compact}{extra}",
                     f"[[/]] Scroll [Esc] Close [q] {pos_info}{extra}",
+                    f"[[/]] [Esc] [q] {pos_info}",
                 ]
             elif self.truncated:
                 full_notice = self._full_truncation_notice()
@@ -1146,6 +1412,8 @@ class InteractiveDataGrid:
                     f"{pos_info}{col_info}{notice_suffix}",
                     f"[↑↓←→] [/] Search [Space] Panel [q] Quit  "
                     f"{pos_info}{col_compact}{notice_suffix}",
+                    f"[/] Search [Space] Inspect [q] Quit {pos_info}{notice_suffix}",
+                    f"[/] [Space] [q] {pos_info}",
                 ]
 
             help_text = candidates[-1]
@@ -1183,6 +1451,12 @@ class InteractiveDataGrid:
 
             if ch == curses.KEY_RESIZE:
                 self._side_panel_max_scroll = None
+                self._clamp_viewport()
+                with contextlib.suppress(*_CURSES_ERROR):
+                    res_y, res_x = self.stdscr.getmaxyx()
+                    if self.side_panel_open and res_y >= 5 and res_x >= 24:
+                        max_scroll = self._resolve_side_panel_max_scroll(res_y, res_x)
+                        self.side_panel_scroll = max(0, min(self.side_panel_scroll, max_scroll))
                 self.col_offset = max(0, min(self.col_offset, self._max_col_offset()))
                 continue
 
@@ -1195,10 +1469,22 @@ class InteractiveDataGrid:
 
     def _handle_search_input(self, ch: int | str) -> None:
         """Handle keystrokes while search input mode is active."""
-        if ch in (10, 13, curses.KEY_ENTER, 27, "\n", "\r", "\x1b"):
+        if ch in (10, 13, curses.KEY_ENTER, "\n", "\r"):
+            self.is_searching = False
+            self._search_start_query = self.search_query
+            with contextlib.suppress(curses.error):
+                curses.curs_set(0)
+        elif ch in (27, "\x1b"):
             self.is_searching = False
             with contextlib.suppress(curses.error):
                 curses.curs_set(0)
+            if self.search_query != self._search_start_query:
+                self.search_query = self._search_start_query
+                self.filter_entries()
+            if not self.filtered_entries and self.search_query:
+                self.search_query = ""
+                self._search_start_query = ""
+                self.filter_entries()
         elif ch in (curses.KEY_BACKSPACE, 127, 8, "\x7f", "\b"):
             if self.search_query:
                 self.search_query = self.search_query[:-1]
@@ -1235,6 +1521,14 @@ class InteractiveDataGrid:
 
         if ch in (ord("/"), "/"):
             self._transient_notice = None
+            if self.filtered_entries and 0 <= self.selected_idx < len(self.filtered_entries):
+                curr_entry = self.filtered_entries[self.selected_idx]
+                curr_offset = max(0, self.selected_idx - self.top_idx)
+                self._last_match_anchor = (curr_entry, curr_offset, self.top_idx)
+                if not self.search_query.strip():
+                    self._session_anchor = (curr_entry, curr_offset, self.top_idx)
+                    self._manual_nav_in_filter = False
+            self._search_start_query = self.search_query
             self.is_searching = True
             return False
 
@@ -1242,7 +1536,7 @@ class InteractiveDataGrid:
             self.action_load_all()
             return False
 
-        if ch in (27, "\x1b"):  # Escape closes open panel first, then clears active filter
+        if ch in (27, "\x1b"):  # Escape closes open panel/modal first, then clears active filter
             self._transient_notice = None
             if self.side_panel_open:
                 self.side_panel_open = False
@@ -1252,6 +1546,7 @@ class InteractiveDataGrid:
                 return False
             if self.search_query:
                 self.search_query = ""
+                self._search_start_query = ""
                 self.filter_entries()
             return False
 
@@ -1260,12 +1555,14 @@ class InteractiveDataGrid:
                 self.selected_idx -= 1
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
+                self._record_manual_anchor(max_y)
 
         elif ch in (curses.KEY_DOWN, ord("j"), "j"):
             if total > 0 and self.selected_idx < total - 1:
                 self.selected_idx += 1
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
+                self._record_manual_anchor(max_y)
 
         elif ch in (curses.KEY_LEFT, ord("h"), "h"):
             if self.col_offset > 0:
@@ -1283,24 +1580,28 @@ class InteractiveDataGrid:
                 self.selected_idx = max(0, self.selected_idx - viewport_height)
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
+                self._record_manual_anchor(max_y)
 
         elif ch == curses.KEY_NPAGE:  # Page Down
             if total > 0:
                 self.selected_idx = min(total - 1, self.selected_idx + viewport_height)
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
+                self._record_manual_anchor(max_y)
 
         elif ch in (curses.KEY_HOME, 362):  # Home
             if total > 0:
                 self.selected_idx = 0
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
+                self._record_manual_anchor(max_y)
 
         elif ch in (curses.KEY_END, 385):  # End
             if total > 0:
                 self.selected_idx = total - 1
                 self.side_panel_scroll = 0
                 self._side_panel_max_scroll = None
+                self._record_manual_anchor(max_y)
 
         elif (
             ch in (ord("["), ord("]"), ord("{"), ord("}"), "[", "]", "{", "}")
@@ -1326,6 +1627,7 @@ def run_interactive_grid(
     status_notice: str | None = None,
     truncated: bool | None = None,
     on_load_all: Callable[[], Any] | None = None,
+    entity_kind: str | None = None,
 ) -> bool:
     """Launch the curses interactive data grid.
 
@@ -1338,6 +1640,7 @@ def run_interactive_grid(
         status_notice: Optional truncation/status notice to render in the grid bars.
         truncated: Whether initial rows represent a truncated subset of server items.
         on_load_all: Optional callback draining remaining pages on ``[a]``.
+        entity_kind: Optional canonical entity kind (e.g. 'records') for side-panel layout.
 
     Returns:
         True if the interactive grid ran and exited normally, False if curses
@@ -1362,6 +1665,7 @@ def run_interactive_grid(
                 status_notice=status_notice,
                 truncated=truncated,
                 on_load_all=on_load_all,
+                entity_kind=entity_kind,
             )
             grid.run()
 

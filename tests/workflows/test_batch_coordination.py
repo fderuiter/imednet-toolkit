@@ -615,7 +615,9 @@ def test_uat_workflow_skips_result_url_and_flags_batch_failures() -> None:
             )
         if request.method == "GET" and path.endswith("/results"):
             result_url_calls.append(str(request.url))
-            return httpx.Response(500, json={"error": "resultUrl should not be polled"})
+            if "/jobs/B1/" in path:
+                return httpx.Response(200, json=[])
+            return httpx.Response(500, json={"error": "B2 resultUrl should not be polled"})
         return httpx.Response(404)
 
     sdk = ImednetSDK(
@@ -631,12 +633,14 @@ def test_uat_workflow_skips_result_url_and_flags_batch_failures() -> None:
         assert len(submitted_batches) == 2
         # Phase 1 registration omitted subjectKey
         assert all("subjectKey" not in rec for rec in submitted_batches[0])
-        # Phase 2 resolved server-assigned Subject keys via EDC endpoints without resultUrl
+        # Phase 2 resolved server-assigned Subject keys via EDC endpoints when resultUrl is empty
         assert [rec["subjectKey"] for rec in submitted_batches[1]] == [
             "ASSIGNED-101",
             "ASSIGNED-102",
         ]
-        assert result_url_calls == []
+        assert result_url_calls == [
+            "https://mock.imednet.test/api/v1/edc/studies/S/jobs/B1/results"
+        ]
         # Because B2 reached FAILED terminal state, overall_success is False
         assert res.overall_success is False
         assert res.poll_summary.all_successful is False

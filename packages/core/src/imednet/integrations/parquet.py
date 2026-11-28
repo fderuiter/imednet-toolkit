@@ -58,6 +58,24 @@ from .sink_base import (
     validate_max_buffered_records,
 )
 
+_HIVE_RAW_PARTITION_COLS: tuple[str, ...] = (
+    "study_key",
+    "studyKey",
+    "STUDYID",
+    "STUDY_KEY",
+    "form_key",
+    "formKey",
+    "FORM_KEY",
+    "FORMKEY",
+)
+
+
+def _drop_hive_partition_columns(df: Any, *, as_sdtm: bool = False) -> Any:
+    """Drop Hive directory partition columns from an in-memory partition DataFrame."""
+    candidates = ("study_key", "form_key") if as_sdtm else _HIVE_RAW_PARTITION_COLS
+    present = [col for col in candidates if col in df.columns]
+    return df.drop(columns=present) if present else df
+
 
 def _ensure_pyarrow() -> ModuleType:
     """Ensure PyArrow is installed and return the module.
@@ -180,9 +198,7 @@ def _write_hive_form_rows(
         df, _ = _dedupe_df_by_record_id(df, study_key=study_key)
         if skip_empty and df.empty:
             return 0
-    for part_col in ("study_key", "form_key"):
-        if part_col in df.columns:
-            df = df.drop(columns=[part_col])
+    df = _drop_hive_partition_columns(df, as_sdtm=False)
     table = pyarrow_module.Table.from_pandas(df, preserve_index=False)
     storage_engine.write_form_table(
         table,
@@ -211,6 +227,7 @@ def _prune_hive_partition_record_ids(
     base_dir: str,
     study_key: str,
     form_key: str,
+    as_sdtm: bool = False,
 ) -> None:
     """Prune superseded or voided record IDs from pre-existing Hive partition Parquet files."""
     if not files or not excluded_ids:
@@ -229,9 +246,7 @@ def _prune_hive_partition_record_ids(
         if len(filtered_df) == len(existing_df):
             continue
         if not filtered_df.empty:
-            for part_col in ("study_key", "form_key"):
-                if part_col in filtered_df.columns:
-                    filtered_df = filtered_df.drop(columns=[part_col])
+            filtered_df = _drop_hive_partition_columns(filtered_df, as_sdtm=as_sdtm)
             replacement_table = pyarrow_module.Table.from_pandas(
                 filtered_df.reset_index(drop=True),
                 preserve_index=False,
@@ -278,9 +293,7 @@ def _prune_hive_partition_sdtm_keys(
         if len(filtered_df) == len(existing_df):
             continue
         if not filtered_df.empty:
-            for part_col in ("study_key", "form_key"):
-                if part_col in filtered_df.columns:
-                    filtered_df = filtered_df.drop(columns=[part_col])
+            filtered_df = _drop_hive_partition_columns(filtered_df, as_sdtm=True)
             replacement_table = pyarrow_module.Table.from_pandas(
                 filtered_df.reset_index(drop=True),
                 preserve_index=False,
@@ -489,7 +502,23 @@ def export_to_hive_parquet(
                             p for p in sorted(part_dir.rglob("*.parquet")) if p not in pre_set
                         ]
                         if current_run_files:
-                            if overlap_ids:
+                            overlap_dm_keys = {sk for sk in overlap_in_run if sk[1] == "DM"}
+                            if overlap_dm_keys:
+                                _prune_hive_partition_sdtm_keys(
+                                    current_run_files,
+                                    overlap_dm_keys,
+                                    pyarrow_module=pyarrow_module,
+                                    storage_engine=storage_engine,
+                                    base_dir=base_dir,
+                                    study_key=study_key,
+                                    form_key=ctx.form_key,
+                                )
+                                current_run_files = [
+                                    p
+                                    for p in sorted(part_dir.rglob("*.parquet"))
+                                    if p not in pre_set
+                                ]
+                            if overlap_ids and current_run_files:
                                 _prune_hive_partition_record_ids(
                                     current_run_files,
                                     overlap_ids,
@@ -499,7 +528,7 @@ def export_to_hive_parquet(
                                     study_key=study_key,
                                     form_key=ctx.form_key,
                                 )
-                            elif overlap_in_run:
+                            elif overlap_in_run and current_run_files:
                                 _prune_hive_partition_sdtm_keys(
                                     current_run_files,
                                     overlap_in_run,
@@ -643,27 +672,47 @@ def export_to_hive_parquet(
                     base_dir=base_dir,
                     study_key=study_key,
                     form_key=fk,
+                    as_sdtm=config.as_sdtm,
                 )
                 if config.as_sdtm and superseded_sdtm_keys[fk]:
-                    legacy_sdtm_files = [
-                        pf
-                        for pf in pre_files
-                        if pf.exists()
-                        and _find_df_record_id_col(pandas_module.read_parquet(pf, engine="pyarrow"))
-                        is None
-                    ]
-                    if legacy_sdtm_files:
-                        _prune_hive_partition_sdtm_keys(
-                            legacy_sdtm_files,
-                            superseded_sdtm_keys[fk],
-                            pyarrow_module=pyarrow_module,
-                            storage_engine=storage_engine,
-                            base_dir=base_dir,
-                            study_key=study_key,
-                            form_key=fk,
-                        )
-                needs_run_dedup = any(cnt > 1 for cnt in active_id_counts[fk].values()) or bool(
-                    voided_ids[fk] & set(active_id_counts[fk])
+                    dm_skeys = {sk for sk in superseded_sdtm_keys[fk] if sk[1] == "DM"}
+                    if dm_skeys:
+                        existing_pre = [pf for pf in pre_files if pf.exists()]
+                        if existing_pre:
+                            _prune_hive_partition_sdtm_keys(
+                                existing_pre,
+                                dm_skeys,
+                                pyarrow_module=pyarrow_module,
+                                storage_engine=storage_engine,
+                                base_dir=base_dir,
+                                study_key=study_key,
+                                form_key=fk,
+                            )
+                    non_dm_skeys = {sk for sk in superseded_sdtm_keys[fk] if sk[1] != "DM"}
+                    if non_dm_skeys:
+                        legacy_sdtm_files = [
+                            pf
+                            for pf in pre_files
+                            if pf.exists()
+                            and _find_df_record_id_col(
+                                pandas_module.read_parquet(pf, engine="pyarrow")
+                            )
+                            is None
+                        ]
+                        if legacy_sdtm_files:
+                            _prune_hive_partition_sdtm_keys(
+                                legacy_sdtm_files,
+                                non_dm_skeys,
+                                pyarrow_module=pyarrow_module,
+                                storage_engine=storage_engine,
+                                base_dir=base_dir,
+                                study_key=study_key,
+                                form_key=fk,
+                            )
+                needs_run_dedup = (
+                    any(cnt > 1 for cnt in active_id_counts[fk].values())
+                    or bool(voided_ids[fk] & set(active_id_counts[fk]))
+                    or (config.as_sdtm and any(sk[1] == "DM" for sk in superseded_sdtm_keys[fk]))
                 )
                 if needs_run_dedup:
                     part_dir = Path(base_dir) / f"study_key={study_key}" / f"form_key={fk}"
@@ -682,9 +731,10 @@ def export_to_hive_parquet(
                             exclude_ids=voided_ids[fk],
                             study_key=study_key,
                         )
-                        for part_col in ("study_key", "form_key"):
-                            if part_col in dedup_run.columns:
-                                dedup_run = dedup_run.drop(columns=[part_col])
+                        dedup_run = _drop_hive_partition_columns(
+                            dedup_run,
+                            as_sdtm=config.as_sdtm,
+                        )
                         if not dedup_run.empty:
                             storage_engine.write_form_table(
                                 pyarrow_module.Table.from_pandas(
@@ -812,6 +862,8 @@ def export_to_hive_parquet(
                 study_key=study_key,
                 form_key=form_key,
                 skip_empty=True,
+                naming_convention=config.naming_convention,
+                sdtm_domain=config.sdtm_domain,
                 manifest_path=config.manifest_path,
                 batch_id=f"{study_key}/{form_key}/{batch_idx}",
             )
@@ -874,6 +926,8 @@ def export_to_hive_parquet(
                     study_key=study_key,
                     form_key=spec["form_key"],
                     skip_empty=True,
+                    naming_convention=config.naming_convention,
+                    sdtm_domain=config.sdtm_domain,
                     manifest_path=config.manifest_path,
                     batch_id=f"{study_key}/{spec['form_key']}/{batch_idx}",
                 )
@@ -903,6 +957,8 @@ def export_to_hive_parquet(
             study_key=study_key,
             form_key=spec["form_key"],
             skip_empty=False,
+            naming_convention=config.naming_convention,
+            sdtm_domain=config.sdtm_domain,
             manifest_path=config.manifest_path,
             batch_id=f"{study_key}/{spec['form_key']}/0",
         )

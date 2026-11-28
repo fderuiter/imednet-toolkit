@@ -378,6 +378,17 @@ class _PreloadedSdkShim:
             self.get_records = lambda *_a, **_kw: records
 
 
+def _callable_accepts_kwarg(fn: Any, kwarg: str) -> bool:
+    """Return True if *fn* accepts *kwarg* explicitly or via ``**kwargs``."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return kwarg in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
 class BulkRecordSubmissionWorkflow:
     """Two-phase bulk record submission for UAT scenarios.
 
@@ -408,6 +419,7 @@ class BulkRecordSubmissionWorkflow:
         registration_timeout: float = 600.0,
         skip_existing_subjects: bool = True,
         registration_poll_interval: float | None = None,
+        resolve_results: bool = True,
     ) -> None:
         """Initialize the workflow."""
         self.sdk = sdk
@@ -416,6 +428,7 @@ class BulkRecordSubmissionWorkflow:
         self.registration_timeout = registration_timeout
         self.skip_existing_subjects = skip_existing_subjects
         self.registration_poll_interval = registration_poll_interval
+        self.resolve_results = resolve_results
         self._phase: SubmissionPhase = SubmissionPhase.PENDING
         self._initial_subjects_snapshot: _PreExistingSubjectsSnapshot | None = None
         self._ordered_existing_uat_keys: list[str] = []
@@ -448,6 +461,7 @@ class BulkRecordSubmissionWorkflow:
         email_notify: bool | str | None = None,
         keyword_tag: str = "UAT",
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool | None = None,
     ) -> SubmissionResult:
         """Execute the two-phase submission synchronously."""
         return run_sync_over_async(
@@ -457,6 +471,7 @@ class BulkRecordSubmissionWorkflow:
                 email_notify=email_notify,
                 keyword_tag=keyword_tag,
                 schema=schema,
+                resolve_results=resolve_results,
             )
         )
 
@@ -468,6 +483,7 @@ class BulkRecordSubmissionWorkflow:
         email_notify: bool | str | None = None,
         keyword_tag: str = "UAT",
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool | None = None,
     ) -> SubmissionResult:
         """Execute the two-phase submission.
 
@@ -643,11 +659,18 @@ class BulkRecordSubmissionWorkflow:
             poll_summary: JobPollSummary | None = None
             if self.await_registration and result.registration_batches:
                 self.transition_to(SubmissionPhase.AWAITING_REGISTRATION)
-                poll_summary = await _await_if_needed(
+                poll_call = (
                     self._poll_and_validate_registration_batches(
                         study_key, result.registration_batches
                     )
+                    if resolve_results is None
+                    else self._poll_and_validate_registration_batches(
+                        study_key,
+                        result.registration_batches,
+                        resolve_results=resolve_results,
+                    )
                 )
+                poll_summary = await _await_if_needed(poll_call)
                 if batch_item_groups:
                     must_correlate = self._requires_phase2_correlation(data_sets, poll_summary)
                     enrolled_keys, correlation_error = await _await_if_needed(
@@ -762,8 +785,15 @@ class BulkRecordSubmissionWorkflow:
             job=job,
         )
 
-    def _poll_registration_batches(self, study_key: str, batch_ids: list[str]) -> JobPollSummary:
+    def _poll_registration_batches(
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        resolve_results: bool | None = None,
+    ) -> JobPollSummary:
         """Poll Phase 1 batches via facade poll_jobs with mock fallback."""
+        effective_resolve = self.resolve_results if resolve_results is None else resolve_results
         poll_kwargs: dict[str, Any] = {
             "timeout": float(self.registration_timeout),
             "fail_fast": False,
@@ -773,13 +803,30 @@ class BulkRecordSubmissionWorkflow:
 
         poll_jobs_fn = getattr(self.sdk, "poll_jobs", None)
         if callable(poll_jobs_fn):
+            facade_kwargs = dict(poll_kwargs)
+            if effective_resolve and _callable_accepts_kwarg(poll_jobs_fn, "resolve_results"):
+                facade_kwargs["resolve_results"] = True
             candidate = poll_jobs_fn(
+                study_key,
+                batch_ids,
+                **facade_kwargs,
+            )
+            if isinstance(candidate, JobPollSummary):
+                return candidate
+
+        jobs_ep = getattr(self.sdk, "jobs", None)
+        fetch_result_fn = getattr(jobs_ep, "fetch_result", None) if jobs_ep is not None else None
+        if (
+            effective_resolve
+            and callable(fetch_result_fn)
+            and not _is_unconfigured_mock_method(fetch_result_fn)
+        ):
+            poller = JobPoller(get_job=self.sdk.get_job, fetch_result=fetch_result_fn)
+            return poller.poll_many(
                 study_key,
                 batch_ids,
                 **poll_kwargs,
             )
-            if isinstance(candidate, JobPollSummary):
-                return candidate
 
         poller = JobPoller(get_job=self.sdk.get_job)
         return poller.poll_many(
@@ -789,7 +836,11 @@ class BulkRecordSubmissionWorkflow:
         )
 
     def _poll_and_validate_registration_batches(
-        self, study_key: str, batches: list[BatchSubmission]
+        self,
+        study_key: str,
+        batches: list[BatchSubmission],
+        *,
+        resolve_results: bool | None = None,
     ) -> JobPollSummary | None:
         """Poll Phase 1 batches to terminal state and raise BulkSubmissionError on failure."""
         batches_to_poll = [b for b in batches if b.job.batch_id]
@@ -797,7 +848,12 @@ class BulkRecordSubmissionWorkflow:
             return None
 
         batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
-        summary = self._poll_registration_batches(study_key, batch_ids)
+        if resolve_results is None:
+            summary = self._poll_registration_batches(study_key, batch_ids)
+        else:
+            summary = self._poll_registration_batches(
+                study_key, batch_ids, resolve_results=resolve_results
+            )
         return self._finalize_polled_batches(batches_to_poll, summary)
 
     @staticmethod
@@ -1307,6 +1363,7 @@ class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
         registration_timeout: float = 600.0,
         skip_existing_subjects: bool = True,
         registration_poll_interval: float | None = None,
+        resolve_results: bool = True,
     ) -> None:
         """Initialize the async bulk record submission workflow."""
         super().__init__(
@@ -1316,6 +1373,7 @@ class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
             registration_timeout=registration_timeout,
             skip_existing_subjects=skip_existing_subjects,
             registration_poll_interval=registration_poll_interval,
+            resolve_results=resolve_results,
         )
 
     def _has_sdk_method(self, canonical_name: str) -> bool:
@@ -1348,6 +1406,7 @@ class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
         email_notify: bool | str | None = None,
         keyword_tag: str = "UAT",
         schema: ValidationSchemaProtocol | None = None,
+        resolve_results: bool | None = None,
     ) -> SubmissionResult:
         """Asynchronously execute the two-phase submission."""
         return await self._execute_submit_async(
@@ -1356,6 +1415,7 @@ class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
             email_notify=email_notify,
             keyword_tag=keyword_tag,
             schema=schema,
+            resolve_results=resolve_results,
         )
 
     async def _submit_batch(  # type: ignore[override]
@@ -1383,8 +1443,13 @@ class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
         )
 
     async def _poll_registration_batches(  # type: ignore[override]
-        self, study_key: str, batch_ids: list[str]
+        self,
+        study_key: str,
+        batch_ids: list[str],
+        *,
+        resolve_results: bool | None = None,
     ) -> JobPollSummary:
+        effective_resolve = self.resolve_results if resolve_results is None else resolve_results
         poll_kwargs: dict[str, Any] = {
             "timeout": float(self.registration_timeout),
             "fail_fast": False,
@@ -1392,24 +1457,53 @@ class AsyncBulkRecordSubmissionWorkflow(BulkRecordSubmissionWorkflow):
         if self.registration_poll_interval is not None:
             poll_kwargs["interval"] = float(self.registration_poll_interval)
         if self._has_sdk_method("poll_jobs"):
+            facade_kwargs = dict(poll_kwargs)
+            target_poll = getattr(self.sdk, "poll_jobs", None) or getattr(
+                self.sdk, "async_poll_jobs", None
+            )
+            if effective_resolve and _callable_accepts_kwarg(target_poll, "resolve_results"):
+                facade_kwargs["resolve_results"] = True
             candidate = await call_async_facade_method(
-                self.sdk, "poll_jobs", study_key, batch_ids, **poll_kwargs
+                self.sdk, "poll_jobs", study_key, batch_ids, **facade_kwargs
             )
             if isinstance(candidate, JobPollSummary):
                 return candidate
+        jobs_ep = getattr(self.sdk, "jobs", None)
+        fetch_result_fn = getattr(jobs_ep, "fetch_result", None) if jobs_ep is not None else None
+        if (
+            effective_resolve
+            and callable(fetch_result_fn)
+            and not _is_unconfigured_mock_method(fetch_result_fn)
+        ):
+            poller = AsyncJobPoller(
+                get_job=functools.partial(call_async_facade_method, self.sdk, "get_job"),
+                fetch_result=fetch_result_fn,
+            )
+            return await poller.async_poll_many(study_key, batch_ids, **poll_kwargs)
         poller = AsyncJobPoller(
             get_job=functools.partial(call_async_facade_method, self.sdk, "get_job")
         )
         return await poller.async_poll_many(study_key, batch_ids, **poll_kwargs)
 
     async def _poll_and_validate_registration_batches(  # type: ignore[override]
-        self, study_key: str, batches: list[BatchSubmission]
+        self,
+        study_key: str,
+        batches: list[BatchSubmission],
+        *,
+        resolve_results: bool | None = None,
     ) -> JobPollSummary | None:
         batches_to_poll = [b for b in batches if b.job.batch_id]
         if not batches_to_poll:
             return None
         batch_ids = [b.job.batch_id for b in batches_to_poll if b.job.batch_id is not None]
-        summary = await _await_if_needed(self._poll_registration_batches(study_key, batch_ids))
+        if resolve_results is None:
+            summary = await _await_if_needed(self._poll_registration_batches(study_key, batch_ids))
+        else:
+            summary = await _await_if_needed(
+                self._poll_registration_batches(
+                    study_key, batch_ids, resolve_results=resolve_results
+                )
+            )
         return self._finalize_polled_batches(batches_to_poll, summary)
 
     async def _snapshot_existing_subjects(  # type: ignore[override]

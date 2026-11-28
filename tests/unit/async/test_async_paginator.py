@@ -51,7 +51,8 @@ async def test_async_paginator_bounds_and_tracks_has_more() -> None:
     )
     paginator = AsyncPaginator(client, "/items", params={"size": 500}, page_size=100)
     assert paginator.page_size == 500
-    assert paginator.has_more is False
+    assert paginator.cursor is None
+    assert paginator.has_more is True
 
     with pytest.raises(ValueError, match="between 1 and 500"):
         AsyncPaginator(client, "/items", page_size=0)

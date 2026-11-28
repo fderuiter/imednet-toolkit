@@ -11,7 +11,8 @@ from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
 from typing import Any
 
-_IGNORED_PREFIXES = ("docs/", "examples/", ".agents/")
+_QUALITY_IGNORED_PREFIXES = ("docs/", ".agents/")
+_IGNORED_PREFIXES = (*_QUALITY_IGNORED_PREFIXES, "examples/")
 _WORKFLOW_UNIT_TESTS = frozenset(
     {
         "tests/integration/test_sync_worker_integration.py",
@@ -49,6 +50,11 @@ _SINK_AND_WORKFLOW_TESTS = frozenset(
         "tests/unit/test_sink_phi_resolution_unification.py",
     }
 )
+_CORE_ONLY_TESTS = frozenset(
+    {
+        "tests/unit/test_export_sinks_and_schema_caches.py",
+    }
+)
 _SHARED_TEST_PREFIXES = ("tests/fixtures/", "tests/utils/", "tests/typing/")
 _SHARED_TEST_FILES = frozenset({"tests/__init__.py", "tests/conftest.py"})
 
@@ -59,6 +65,12 @@ def _normalize_path(file_path: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
+
+
+def is_quality_ignored_path(file_path: str) -> bool:
+    """Return True when a changed path requires no workspace quality or typing run."""
+    normalized = _normalize_path(file_path)
+    return normalized.startswith(_QUALITY_IGNORED_PREFIXES) or normalized.endswith(".md")
 
 
 def is_ignored_path(file_path: str) -> bool:
@@ -123,6 +135,13 @@ def _owners_for_top_level_test(
             name_to_dir,
         )
 
+    if normalized in _CORE_ONLY_TESTS:
+        return _resolve_package_dirs(
+            [("core", "imednet")],
+            packages,
+            name_to_dir,
+        )
+
     if fnmatchcase(normalized, "tests/unit/test_airflow*.py") or "airflow" in normalized:
         return _resolve_package_dirs(
             [("providers-airflow", "apache-airflow-providers-imednet")],
@@ -173,19 +192,21 @@ def _owners_for_top_level_test(
 def plan_ci_impact(
     changed_files: Sequence[str],
     packages: Mapping[str, Mapping[str, Any]],
-) -> dict[str, list[str]]:
-    """Determine which monorepo packages must build and test for changed paths."""
+) -> dict[str, Any]:
+    """Determine which monorepo packages and workspace gates must run for changed paths."""
     cleaned_files = [line.strip() for line in changed_files if line.strip()]
 
-    def fallback() -> dict[str, list[str]]:
+    def fallback() -> dict[str, Any]:
         all_pkgs = list(packages.keys())
-        return {"test": all_pkgs, "build": list(all_pkgs)}
+        return {"test": all_pkgs, "build": list(all_pkgs), "quality": True}
 
     if not cleaned_files:
         return fallback()
 
+    run_quality = not all(is_quality_ignored_path(path) for path in cleaned_files)
+
     if all(is_ignored_path(path) for path in cleaned_files):
-        return {"test": [], "build": []}
+        return {"test": [], "build": [], "quality": run_quality}
 
     name_to_dir = {
         str(info["name"]): dir_name for dir_name, info in packages.items() if info.get("name")
@@ -234,7 +255,7 @@ def plan_ci_impact(
     test_impacted = behavior_changed.union(test_only_impacted)
     ordered_build = [pkg for pkg in packages if pkg in build_impacted]
     ordered_test = [pkg for pkg in packages if pkg in test_impacted]
-    return {"build": ordered_build, "test": ordered_test}
+    return {"build": ordered_build, "test": ordered_test, "quality": run_quality}
 
 
 def main() -> None:

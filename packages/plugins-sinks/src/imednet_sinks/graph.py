@@ -261,7 +261,7 @@ def _build_convention_cypher(
                 f"Neo4j Cypher property {prop_name} contains invalid characters: {prop_val!r}"
             )
     lineage_block = (
-        f"FOREACH (_su IN CASE WHEN row.{subject_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
+        f"FOREACH (_su IN CASE WHEN row.{subject_prop} IS NOT NULL AND row.{subject_prop} <> '' THEN [1] ELSE [] END |\n"
         f"    MERGE (su:Subject {{{subject_prop}: row.{subject_prop}, {study_prop}: row.{study_prop}}})\n"
         "    MERGE (s)-[:HAS_SUBJECT]->(su)\n"
         f"    FOREACH (_ IN CASE WHEN row.{visit_prop} IS NOT NULL THEN [1] ELSE [] END |\n"
@@ -273,7 +273,7 @@ def _build_convention_cypher(
         "        MERGE (su)-[:HAS_RECORD]->(r)\n"
         "    )\n"
         ")\n"
-        f"FOREACH (_no_su IN CASE WHEN row.{subject_prop} IS NULL THEN [1] ELSE [] END |\n"
+        f"FOREACH (_no_su IN CASE WHEN row.{subject_prop} IS NULL OR row.{subject_prop} = '' THEN [1] ELSE [] END |\n"
         "    MERGE (s)-[:HAS_RECORD]->(r)\n"
         ")\n"
     )
@@ -299,6 +299,7 @@ def _build_sdtm_cypher(
     has_visit: bool,
     *,
     has_record_id: bool = False,
+    include_usubjid_key: bool = True,
 ) -> tuple[str, str]:
     """Build MERGE and CREATE Cypher statements for SDTM domain rows."""
     if seq_prop is not None and (
@@ -309,6 +310,12 @@ def _build_sdtm_cypher(
         )
     if has_record_id:
         record_key_props = "STUDYID: row.STUDYID, RECORD_ID: row.RECORD_ID"
+    elif not include_usubjid_key:
+        record_key_props = (
+            f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, {seq_prop}: row.{seq_prop}"
+            if seq_prop
+            else "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN"
+        )
     elif seq_prop:
         record_key_props = (
             f"STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID, "
@@ -317,36 +324,43 @@ def _build_sdtm_cypher(
     else:
         record_key_props = "STUDYID: row.STUDYID, DOMAIN: row.DOMAIN, USUBJID: row.USUBJID"
     if has_visit:
-        visit_block = (
-            "FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
-            "    MERGE (v:Visit {VISITNUM: row.VISITNUM, USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
-            "    MERGE (su)-[:HAS_VISIT]->(v)\n"
-            "    MERGE (v)-[:HAS_RECORD]->(r)\n"
-            ")\n"
-            "FOREACH (_ IN CASE WHEN row.VISITNUM IS NULL THEN [1] ELSE [] END |\n"
-            "    MERGE (su)-[:HAS_RECORD]->(r)\n"
-            ")\n"
+        subject_visit_block = (
+            "    FOREACH (_ IN CASE WHEN row.VISITNUM IS NOT NULL THEN [1] ELSE [] END |\n"
+            "        MERGE (v:Visit {VISITNUM: row.VISITNUM, USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+            "        MERGE (su)-[:HAS_VISIT]->(v)\n"
+            "        MERGE (v)-[:HAS_RECORD]->(r)\n"
+            "    )\n"
+            "    FOREACH (_ IN CASE WHEN row.VISITNUM IS NULL THEN [1] ELSE [] END |\n"
+            "        MERGE (su)-[:HAS_RECORD]->(r)\n"
+            "    )\n"
         )
     else:
-        visit_block = "MERGE (su)-[:HAS_RECORD]->(r)\n"
+        subject_visit_block = "    MERGE (su)-[:HAS_RECORD]->(r)\n"
+
+    lineage_block = (
+        "FOREACH (_su IN CASE WHEN row.USUBJID IS NOT NULL AND row.USUBJID <> '' THEN [1] ELSE [] END |\n"
+        "    MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
+        "    MERGE (s)-[:HAS_SUBJECT]->(su)\n"
+        f"{subject_visit_block}"
+        ")\n"
+        "FOREACH (_no_su IN CASE WHEN row.USUBJID IS NULL OR row.USUBJID = '' THEN [1] ELSE [] END |\n"
+        "    MERGE (s)-[:HAS_RECORD]->(r)\n"
+        ")\n"
+    )
 
     merge_cypher = (
         "UNWIND $rows AS row\n"
         "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
-        "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
         f"MERGE (r:Record   {{{record_key_props}}})\n"
         "SET r += row\n"
-        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        f"{visit_block}"
+        f"{lineage_block}"
     )
     create_cypher = (
         "UNWIND $rows AS row\n"
         "MERGE (s:Study   {STUDYID: row.STUDYID})\n"
-        "MERGE (su:Subject {USUBJID: row.USUBJID, STUDYID: row.STUDYID})\n"
         "CREATE (r:Record)\n"
         "SET r = row\n"
-        "MERGE (s)-[:HAS_SUBJECT]->(su)\n"
-        f"{visit_block}"
+        f"{lineage_block}"
     )
     return merge_cypher, create_cypher
 
@@ -586,9 +600,19 @@ class _Neo4jSinkCoreMixin:
                 raw_sdtm_rows = mapper.map_batch(records, study_key=self._study_key)
                 if raw_sdtm_rows and any("RECORD_ID" in r for r in raw_sdtm_rows):
                     dedup_by_rec: dict[tuple[Any, Any], int] = {}
+                    dedup_dm_by_subj: dict[tuple[str, str], int] = {}
                     staged_rows: list[dict[str, Any] | None] = []
                     without_rid: list[dict[str, Any]] = []
                     for r_row in raw_sdtm_rows:
+                        r_dom = str(r_row.get("DOMAIN") or "").strip().upper()
+                        r_usub = str(r_row.get("USUBJID") or "").strip()
+                        if r_dom == "DM" and r_usub:
+                            dm_key = (str(r_row.get("STUDYID") or ""), r_usub)
+                            if dm_key in dedup_dm_by_subj:
+                                staged_rows[dedup_dm_by_subj[dm_key]] = None
+                            dedup_dm_by_subj[dm_key] = len(staged_rows)
+                            staged_rows.append(r_row)
+                            continue
                         if "RECORD_ID" not in r_row or r_row.get("RECORD_ID") is None:
                             without_rid.append(r_row)
                             continue
@@ -615,10 +639,24 @@ class _Neo4jSinkCoreMixin:
         cypher_batches: list[tuple[str, list[dict[str, Any]]]] = []
         if self.config.as_sdtm:
             rows_with_rid = [
-                r for r in mapped_rows if "RECORD_ID" in r and r.get("RECORD_ID") is not None
+                r
+                for r in mapped_rows
+                if "RECORD_ID" in r
+                and r.get("RECORD_ID") is not None
+                and not (
+                    str(r.get("DOMAIN") or "").strip().upper() == "DM"
+                    and bool(str(r.get("USUBJID") or "").strip())
+                )
             ]
             rows_without_rid = [
-                r for r in mapped_rows if "RECORD_ID" not in r or r.get("RECORD_ID") is None
+                r
+                for r in mapped_rows
+                if "RECORD_ID" not in r
+                or r.get("RECORD_ID") is None
+                or (
+                    str(r.get("DOMAIN") or "").strip().upper() == "DM"
+                    and bool(str(r.get("USUBJID") or "").strip())
+                )
             ]
             if rows_with_rid:
                 for dom, seq_prop, part_rows in _partition_sdtm_graph_rows(rows_with_rid):
@@ -645,10 +683,26 @@ class _Neo4jSinkCoreMixin:
                     )
             if rows_without_rid:
                 for _dom, seq_prop, part_rows in _partition_sdtm_graph_rows(rows_without_rid):
-                    has_visit = any("VISITNUM" in r for r in part_rows)
-                    merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
-                    part_cypher = merge_cypher if self.config.idempotent else create_cypher
-                    cypher_batches.append((part_cypher, part_rows))
+                    assigned = [r for r in part_rows if bool(str(r.get("USUBJID") or "").strip())]
+                    unassigned = [
+                        r for r in part_rows if not bool(str(r.get("USUBJID") or "").strip())
+                    ]
+                    if assigned:
+                        has_visit = any("VISITNUM" in r for r in assigned)
+                        merge_cypher, create_cypher = _build_sdtm_cypher(seq_prop, has_visit)
+                        part_cypher = merge_cypher if self.config.idempotent else create_cypher
+                        cypher_batches.append((part_cypher, assigned))
+                    if unassigned:
+                        has_visit_un = any("VISITNUM" in r for r in unassigned)
+                        merge_cypher_un, create_cypher_un = _build_sdtm_cypher(
+                            seq_prop,
+                            has_visit_un,
+                            include_usubjid_key=False,
+                        )
+                        part_cypher_un = (
+                            merge_cypher_un if self.config.idempotent else create_cypher_un
+                        )
+                        cypher_batches.append((part_cypher_un, unassigned))
         else:
             if self.config.naming_convention == "camelCase":
                 merge_cypher, create_cypher = _build_convention_cypher(

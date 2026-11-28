@@ -24,7 +24,7 @@ from ..utils.write_helpers import (
 
 
 def _subject_view_model(s: Any) -> dict[str, Any]:
-    keywords_str = ", ".join(k.keyword_name for k in s.keywords)
+    keywords_str = ", ".join(k.keyword_name for k in (s.keywords or ()))
     return {
         "subject_key": s.subject_key,
         "status": s.subject_status,
@@ -80,6 +80,12 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         help="Registration form key (formKey) for inline registration or file default.",
     )
     register_parser.add_argument(
+        "--form-id",
+        type=int,
+        default=None,
+        help="Registration form ID (formId) for inline registration or file default.",
+    )
+    register_parser.add_argument(
         "--site-name",
         default=None,
         help="Enrollment site name (siteName) for inline registration or file default.",
@@ -99,6 +105,16 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         "--subject-oid",
         default=None,
         help="Subject OID (subjectOid) for inline registration.",
+    )
+    register_parser.add_argument(
+        "--record-status",
+        default=None,
+        help="Target record status (recordStatus) for inline registration or file override.",
+    )
+    register_parser.add_argument(
+        "--reason-for-change",
+        default=None,
+        help="Audit reason for record creation or modification (reasonForChange).",
     )
     register_parser.add_argument(
         "-d",
@@ -140,6 +156,7 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
             normalized_pairs = normalize_subject_registration_inputs(
                 raw_inputs,
                 default_form_key=args.form_key,
+                default_form_id=args.form_id,
                 default_site_name=args.site_name,
                 default_site_id=args.site_id,
                 schema=resolved_schema,
@@ -173,10 +190,13 @@ def setup_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignor
         if (
             not args.input_file
             and not args.json_payload
-            and (not args.form_key or (not args.site_name and args.site_id is None))
+            and (
+                (not args.form_key and args.form_id is None)
+                or (not args.site_name and args.site_id is None)
+            )
         ):
             print_error(
-                "Error: Provide --file, --json, or both --form-key and --site-name to register subjects."
+                "Error: Provide --file, --json, or both --form-key/--form-id and --site-name/--site-id to register subjects."
             )
             sys.exit(1)
         with simulation_mode_context(bool(getattr(args, "simulation", False))):
