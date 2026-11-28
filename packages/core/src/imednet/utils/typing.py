@@ -28,9 +28,6 @@ class DataFrameLike(Protocol):
         """Convert tabular rows into Python dictionaries."""
 
 
-_TabularDataFrameLike = DataFrameLike
-
-
 if TYPE_CHECKING:
     import pandas as pd
 

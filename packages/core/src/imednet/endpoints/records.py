@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from unittest.mock import NonCallableMock
 
+from imednet.core.context import get_study_context, sdk_governance_context
 from imednet.core.endpoint.dispatch import execute_operation
 from imednet.core.endpoint.edc_mixin import EdcAsyncListGetEndpoint, EdcSyncListGetEndpoint
 from imednet.core.endpoint.operations.record_create import RecordCreateOperation
@@ -188,8 +189,15 @@ class RecordsEndpoint(RecordsOperationDef, EdcSyncListGetEndpoint[Record]):  # t
         from imednet.utils.pandas import check_pandas, records_to_dataframe
 
         check_pandas("records_to_dataframe")
-        records = list(self.list(study_key=study_key, **filters))
-        return records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)
+        with sdk_governance_context(self):
+            resolved_study_key = study_key or get_study_context()
+            records = list(self.list(study_key=study_key, **filters))
+            return records_to_dataframe(
+                records,
+                flatten=flatten,
+                mask_phi=mask_phi,
+                study_key=resolved_study_key,
+            )
 
 
 class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record]):  # type: ignore[misc]
@@ -272,5 +280,12 @@ class AsyncRecordsEndpoint(RecordsOperationDef, EdcAsyncListGetEndpoint[Record])
         from imednet.utils.pandas import check_pandas, records_to_dataframe
 
         check_pandas("records_to_dataframe")
-        records = [record async for record in self.list(study_key=study_key, **filters)]
-        return records_to_dataframe(records, flatten=flatten, mask_phi=mask_phi)
+        with sdk_governance_context(self):
+            resolved_study_key = study_key or get_study_context()
+            records = [record async for record in self.list(study_key=study_key, **filters)]
+            return records_to_dataframe(
+                records,
+                flatten=flatten,
+                mask_phi=mask_phi,
+                study_key=resolved_study_key,
+            )

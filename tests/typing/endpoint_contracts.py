@@ -1210,3 +1210,134 @@ def mixed_alias_and_narrowed_type_contracts() -> None:
     assert_type(Subject(study_key='S', subjectStatus='Enrolled'), Subject)
     assert_type(Variable(study_key='S', variableOid='VAR_AGE'), Variable)
     assert_type(Visit(study_key='S', visitId=1), Visit)
+
+
+async def unified_record_request_and_dataframe_contracts(
+    sdk: ImednetSDK,
+    async_sdk: AsyncImednetSDK,
+) -> None:
+    from imednet.models.records import RecordStatus
+    from imednet.utils.pandas import (
+        forms_to_dataframe,
+        intervals_to_dataframe,
+        queries_to_dataframe,
+        records_to_dataframe,
+        sites_to_dataframe,
+        subjects_to_dataframe,
+        users_to_dataframe,
+        variables_to_dataframe,
+        visits_to_dataframe,
+    )
+
+    base_req = BaseRecordRequest(
+        formId=301,
+        subjectId=201,
+        subjectOid='SUBJ-OID-1',
+        intervalId=501,
+        visitId=701,
+        recordId=601,
+        recordOid='REC-OID-1',
+        recordStatus=RecordStatus.VERIFIED,
+        reasonForChange='Audit update',
+        data={'V_AGE': 45},
+    )
+    reg_req = RegisterSubjectRequest(
+        form_id=301,
+        site_id=101,
+        subject_oid='SUBJ-OID-2',
+        record_status='Complete',
+        reason_for_change='Initial enrollment',
+        data={'V_AGE': 30},
+    )
+    sched_req = UpdateScheduledRecordRequest(
+        formId=302,
+        subjectId=201,
+        intervalId=501,
+        visitId=701,
+        recordId=602,
+        recordOid='REC-OID-2',
+        recordStatus='Verified',
+        reasonForChange='Scheduled visit update',
+        data={'V_WEIGHT': 71.5},
+    )
+    unsched_req = CreateNewRecordRequest(
+        form_id=302,
+        subject_id=201,
+        subject_oid='SUBJ-OID-1',
+        record_status=RecordStatus.COMPLETE,
+        reason_for_change='Unscheduled follow-up',
+        data={'V_WEIGHT': 72.0},
+    )
+    req_batch = [base_req, reg_req, sched_req, unsched_req]
+    req_tuple = (base_req, reg_req, sched_req, unsched_req)
+
+    # Sync & async record write methods accept BaseRecordRequest subclasses directly
+    assert_type(sdk.records.create('S', req_batch), Job)
+    assert_type(sdk.records.create_batch('S', req_tuple), BatchSubmissionSummary)
+    assert_type(sdk.create_record('S', [reg_req]), Job)
+    assert_type(sdk.create_records_batch('S', [sched_req, unsched_req]), BatchSubmissionSummary)
+    assert_type(sdk.workflows.record_update.create_or_update_records('S', req_batch), Job)
+    assert_type(
+        sdk.workflows.record_update.create_or_update_records_batch('S', req_tuple),
+        BatchSubmissionSummary,
+    )
+
+    assert_type(await async_sdk.records.create('S', req_batch), Job)
+    assert_type(await async_sdk.records.create_batch('S', req_tuple), BatchSubmissionSummary)
+    assert_type(await async_sdk.create_record('S', [reg_req]), Job)
+    assert_type(
+        await async_sdk.create_records_batch('S', [sched_req, unsched_req]),
+        BatchSubmissionSummary,
+    )
+    assert_type(
+        await async_sdk.workflows.record_update.create_or_update_records('S', req_batch),
+        Job,
+    )
+    assert_type(
+        await async_sdk.workflows.record_update.create_or_update_records_batch('S', req_tuple),
+        BatchSubmissionSummary,
+    )
+
+    # All 12 sync and async endpoints accept mask_phi=True on .to_dataframe()
+    assert_type(sdk.codings.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.forms.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.intervals.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.queries.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.record_revisions.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.records.to_dataframe('S', flatten=True, mask_phi=True), pd.DataFrame)
+    assert_type(sdk.sites.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.studies.to_dataframe(mask_phi=True), pd.DataFrame)
+    assert_type(sdk.subjects.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.users.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.variables.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(sdk.visits.to_dataframe('S', mask_phi=True), pd.DataFrame)
+
+    assert_type(await async_sdk.codings.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.forms.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.intervals.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.queries.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.record_revisions.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(
+        await async_sdk.records.to_dataframe('S', flatten=True, mask_phi=True),
+        pd.DataFrame,
+    )
+    assert_type(await async_sdk.sites.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.studies.to_dataframe(mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.subjects.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.users.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.variables.to_dataframe('S', mask_phi=True), pd.DataFrame)
+    assert_type(await async_sdk.visits.to_dataframe('S', mask_phi=True), pd.DataFrame)
+
+    # All 9 imednet.utils.pandas converters accept mask_phi and study_key
+    assert_type(queries_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(variables_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(subjects_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(forms_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(visits_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(intervals_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(sites_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(users_to_dataframe([], mask_phi=True, study_key='S'), pd.DataFrame)
+    assert_type(
+        records_to_dataframe([], flatten=True, mask_phi=True, study_key='S'),
+        pd.DataFrame,
+    )

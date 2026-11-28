@@ -164,6 +164,13 @@ def register_list_command(
     add_output_format(list_parser)
     add_no_interactive(list_parser)
     add_simulation_arg(list_parser)
+    list_parser.add_argument(
+        "--mask-phi",
+        dest="mask_phi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Mask sensitive clinical PHI fields with ***MASKED*** (default: enabled).",
+    )
 
     def _add_export_args(target_parser: argparse.ArgumentParser) -> None:
         if export_filename_prefix is None:
@@ -174,13 +181,6 @@ def register_list_command(
             dest="output",
             default=None,
             help=f"Save {name} to a CSV or JSON file (csv, json, or a .csv/.json path).",
-        )
-        target_parser.add_argument(
-            "--mask-phi",
-            dest="mask_phi",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help="Mask sensitive clinical PHI fields with ***MASKED*** (default: enabled).",
         )
 
     def _prepare_query(
@@ -266,18 +266,36 @@ def register_list_command(
                     output,
                     study_key=study_key,
                     mask_phi=mask_phi,
+                    sdk=sdk,
                 )
                 return
 
-            if export_filename_prefix is not None and mask_phi:
-                from .export import mask_cli_models
+            if mask_phi:
+                from .export import mask_cli_models, resolve_cli_phi_fields
 
-                items = mask_cli_models(items, study_key=study_key, mask_phi=True)
+                custom_phi_fields = (
+                    resolve_cli_phi_fields(study_key, sdk=sdk)
+                    if items or load_remaining is not None
+                    else None
+                )
+                items = mask_cli_models(
+                    items,
+                    study_key=study_key,
+                    mask_phi=True,
+                    sdk=sdk,
+                    custom_phi_fields=custom_phi_fields,
+                )
                 orig_loader = load_remaining
                 if orig_loader is not None:
 
                     def _masked_loader() -> list[Any]:
-                        return mask_cli_models(orig_loader(), study_key=study_key, mask_phi=True)
+                        return mask_cli_models(
+                            orig_loader(),
+                            study_key=study_key,
+                            mask_phi=True,
+                            sdk=sdk,
+                            custom_phi_fields=custom_phi_fields,
+                        )
 
                     load_remaining = _masked_loader
 
@@ -355,6 +373,7 @@ def register_list_command(
             limit: int | None = None,
             fetch_all: bool = False,
             no_interactive: bool = False,
+            mask_phi: bool = True,
             _prepared_query: tuple[dict[str, Any], int | None] | None = None,
             _extra_kwargs: Mapping[str, Any] | None = None,
         ) -> None:
@@ -378,6 +397,18 @@ def register_list_command(
                     getattr(sdk, attr).list(**call_kwargs),
                     effective_limit,
                 )
+            if mask_phi:
+                from .export import mask_cli_models
+
+                items = mask_cli_models(items, mask_phi=True, sdk=sdk)
+                orig_loader_no_study = load_remaining
+                if orig_loader_no_study is not None:
+
+                    def _masked_loader_no_study() -> list[Any]:
+                        return mask_cli_models(orig_loader_no_study(), mask_phi=True, sdk=sdk)
+
+                    load_remaining = _masked_loader_no_study
+
             _render_list_results(
                 items,
                 name=name,
@@ -393,6 +424,7 @@ def register_list_command(
 
         def _dispatch_no_study_list(args: argparse.Namespace) -> None:
             no_interactive = getattr(args, "no_interactive", False)
+            mask_phi = bool(getattr(args, "mask_phi", True))
             resolved_format = resolve_output_format(args.output_format)
             filter_values = getattr(args, filter_dest, None) if include_filter else None
             extra_kwargs = dict(extra_kwargs_fn(args)) if extra_kwargs_fn is not None else None
@@ -417,6 +449,7 @@ def register_list_command(
                     limit=args.limit,
                     fetch_all=args.fetch_all,
                     no_interactive=no_interactive,
+                    mask_phi=mask_phi,
                     _prepared_query=prepared,
                     _extra_kwargs=extra_kwargs,
                 )

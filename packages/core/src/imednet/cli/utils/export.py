@@ -34,6 +34,34 @@ from .output import print_error
 _MASKED_VALUE = "***MASKED***"
 _ORIG_RESOLVE_STUDY_CONFIG = resolve_study_configuration
 _ORIG_RESOLVE_PIPELINE = resolve_enrichment_pipeline
+_QUERY_MAPPING_KEYS = frozenset(
+    {
+        "query_comments",
+        "queryComments",
+        "annotation_id",
+        "annotationId",
+        "annotation_type",
+        "annotationType",
+    }
+)
+
+
+def _is_query_mapping(mapping: Mapping[Any, Any]) -> bool:
+    """Return True if *mapping* represents a serialized Query payload."""
+    return any(k in mapping for k in _QUERY_MAPPING_KEYS)
+
+
+def _is_diagnostic_text_model_field(
+    fname: str,
+    model_obj: Any,
+    model_fields: Mapping[str, Any],
+) -> bool:
+    """Return True if *fname* on *model_obj* holds clinical diagnostic/comment free text."""
+    if fname in {"reason_for_change", "comment"}:
+        return True
+    if fname == "description":
+        return type(model_obj).__name__ == "Query" or "query_comments" in model_fields
+    return False
 
 
 class Model(Protocol):
@@ -70,16 +98,26 @@ def _prepare_export_row(
     study_key: str | None,
     mask_phi: bool,
     pipelines: dict[str, Any],
+    phi_cache: dict[str, set[str]] | None = None,
+    sdk: Any = None,
 ) -> dict[str, Any]:
     """Apply optional PHI masking and ``recordData`` flattening to a dumped model row."""
     row = dict(raw_row)
     effective_study = study_key or row.get("studyKey") or row.get("study_key")
     active_pipeline: Any = None
+    resolved_phi_keys: set[str] = set()
     if isinstance(effective_study, str) and effective_study.strip():
         sk = effective_study.strip()
         if sk not in pipelines:
             pipelines[sk] = resolve_enrichment_pipeline(sk)
         active_pipeline = pipelines[sk]
+        if mask_phi:
+            if phi_cache is not None:
+                if sk not in phi_cache:
+                    phi_cache[sk] = resolve_cli_phi_fields(sk, sdk=sdk)
+                resolved_phi_keys = set(phi_cache[sk])
+            else:
+                resolved_phi_keys = resolve_cli_phi_fields(sk, sdk=sdk)
 
     record_data_key: str | None = None
     if "recordData" in row and (
@@ -99,6 +137,10 @@ def _prepare_export_row(
             rec_dict = mask_clinical_phi(rec_dict, registry=global_sensitivity_registry)
             if active_pipeline is not None:
                 rec_dict = active_pipeline.process(rec_dict, mask_phi=True)
+            if resolved_phi_keys:
+                masked_rec = mask_custom_phi_recursive(rec_dict, resolved_phi_keys)
+                if isinstance(masked_rec, dict):
+                    rec_dict = masked_rec
         elif not mask_phi and rec_dict and active_pipeline is not None:
             rec_dict = active_pipeline.process(rec_dict, mask_phi=False)
         if rec_dict:
@@ -106,9 +148,9 @@ def _prepare_export_row(
 
     if mask_phi:
         row = mask_clinical_phi(row, registry=global_sensitivity_registry)
-        custom_phi_keys: set[str] = (
-            set(active_pipeline.phi_keys) if active_pipeline is not None else set()
-        )
+        custom_phi_keys: set[str] = set(resolved_phi_keys)
+        if active_pipeline is not None and getattr(active_pipeline, "phi_keys", None):
+            custom_phi_keys.update(_normalize_custom_phi_keys(active_pipeline.phi_keys))
         study_registry = build_study_sensitivity_registry(custom_phi_keys)
         if custom_phi_keys:
             for key, val in list(row.items()):
@@ -118,10 +160,24 @@ def _prepare_export_row(
                     row[key] = _MASKED_VALUE
                 elif isinstance(val, (Mapping, list, tuple)):
                     row[key] = mask_custom_phi_recursive(val, custom_phi_keys)
-        for reason_key in ("reasonForChange", "reason_for_change"):
-            reason_val = row.get(reason_key)
-            if isinstance(reason_val, str) and reason_val != _MASKED_VALUE:
-                row[reason_key] = sanitize_diagnostic_text(reason_val, registry=study_registry)
+        diag_keys = ["reasonForChange", "reason_for_change", "comment"]
+        if _is_query_mapping(row):
+            diag_keys.append("description")
+        for diag_key in diag_keys:
+            diag_val = row.get(diag_key)
+            if isinstance(diag_val, str) and diag_val != _MASKED_VALUE:
+                row[diag_key] = sanitize_diagnostic_text(diag_val, registry=study_registry)
+        for qc_key in ("queryComments", "query_comments"):
+            qc_val = row.get(qc_key)
+            if isinstance(qc_val, list):
+                row[qc_key] = [
+                    _mask_record_tree(
+                        entry,
+                        custom_phi_keys=custom_phi_keys,
+                        active_registry=study_registry,
+                    )
+                    for entry in qc_val
+                ]
 
     for var_key, var_val in flat_record_data.items():
         target_key = f"recordData.{var_key}" if var_key in row else var_key
@@ -137,6 +193,7 @@ def export_list_to_file(
     *,
     study_key: str | None = None,
     mask_phi: bool = True,
+    sdk: Any = None,
 ) -> None:
     """Export a list of Pydantic models to a CSV or JSON file."""
     resolved = resolve_records_export_target(output_format, filename_prefix)
@@ -150,16 +207,26 @@ def export_list_to_file(
     fmt, path = resolved
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _dump_export_item(item: Any) -> dict[str, Any]:
+        try:
+            return item.model_dump(by_alias=True, warnings=False)  # type: ignore[no-any-return]
+        except TypeError:
+            return item.model_dump(by_alias=True)  # type: ignore[no-any-return]
+
     pipelines: dict[str, Any] = {}
-    data = [
-        _prepare_export_row(
-            item.model_dump(by_alias=True),
-            study_key=study_key,
-            mask_phi=mask_phi,
-            pipelines=pipelines,
-        )
-        for item in items
-    ]
+    phi_cache: dict[str, set[str]] = {}
+    with sdk_governance_context(sdk):
+        data = [
+            _prepare_export_row(
+                _dump_export_item(item),
+                study_key=study_key,
+                mask_phi=mask_phi,
+                pipelines=pipelines,
+                phi_cache=phi_cache,
+                sdk=sdk,
+            )
+            for item in items
+        ]
 
     if fmt == "csv":
         if data:
@@ -216,7 +283,7 @@ def resolve_cli_phi_fields(
         if resolve_enrichment_pipeline is not _ORIG_RESOLVE_PIPELINE:
             pipe = resolve_enrichment_pipeline(sk)
             if pipe is not None and getattr(pipe, "phi_keys", None):
-                return set(pipe.phi_keys)
+                return _normalize_custom_phi_keys(pipe.phi_keys)
     return set()
 
 
@@ -235,7 +302,10 @@ def _copy_model_with_masked_extra(
         cand = mask_clinical_phi(extra, registry=active_registry)
         if custom_phi_keys:
             cand = mask_custom_phi_recursive(cand, custom_phi_keys)
-        for rkey in ("reasonForChange", "reason_for_change"):
+        diag_keys = ["reasonForChange", "reason_for_change", "comment"]
+        if type(item).__name__ == "Query" or _is_query_mapping(extra):
+            diag_keys.append("description")
+        for rkey in diag_keys:
             rval = cand.get(rkey)
             if isinstance(rval, str) and rval != _MASKED_VALUE:
                 cand[rkey] = sanitize_diagnostic_text(rval, registry=active_registry)
@@ -282,15 +352,20 @@ def _mask_record_tree(
     if isinstance(value, Mapping):
         rebuilt: dict[Any, Any] = {}
         changed = False
+        is_query_map = _is_query_mapping(value)
         for k, v in value.items():
             key_str = str(k)
-            if global_sensitivity_registry.is_sensitive(key_str) or _matches_custom_phi_key(
-                key_str, custom_phi_keys
+            if not active_registry.is_exempt(key_str) and (
+                active_registry.is_sensitive(key_str)
+                or _matches_custom_phi_key(key_str, custom_phi_keys)
             ):
                 rebuilt[k] = _MASKED_VALUE
                 if type(v) is not str or v != _MASKED_VALUE:
                     changed = True
-            elif isinstance(v, str) and key_str in {"reason_for_change", "reasonForChange"}:
+            elif isinstance(v, str) and (
+                key_str in {"reason_for_change", "reasonForChange", "comment"}
+                or (key_str == "description" and is_query_map)
+            ):
                 scrubbed = sanitize_diagnostic_text(v, registry=active_registry)
                 rebuilt[k] = scrubbed
                 if scrubbed != v:
@@ -330,17 +405,24 @@ def _mask_record_tree(
     updates: dict[str, Any] = {}
     for fname, finfo in model_fields.items():
         raw_val = getattr(value, fname, None)
-        if raw_val is None or active_registry.is_exempt(fname):
+        alias = getattr(finfo, "alias", None)
+        if (
+            raw_val is None
+            or active_registry.is_exempt(fname)
+            or (isinstance(alias, str) and active_registry.is_exempt(alias))
+        ):
             continue
         if _is_field_phi_sensitive(
             fname,
-            getattr(finfo, "alias", None),
+            alias,
             active_registry=active_registry,
             custom_phi_keys=custom_phi_keys,
         ):
-            if isinstance(raw_val, str) and raw_val != _MASKED_VALUE:
+            if raw_val != _MASKED_VALUE:
                 updates[fname] = _MASKED_VALUE
-        elif fname == "reason_for_change" and isinstance(raw_val, str):
+        elif isinstance(raw_val, str) and _is_diagnostic_text_model_field(
+            fname, value, model_fields
+        ):
             scrubbed = sanitize_diagnostic_text(raw_val, registry=active_registry)
             if scrubbed != raw_val:
                 updates[fname] = scrubbed
@@ -362,7 +444,7 @@ def _mask_record_tree(
     )
 
 
-def mask_cli_records(
+def _mask_cli_items(
     items: Sequence[Any],
     *,
     study_key: str | None = None,
@@ -370,7 +452,7 @@ def mask_cli_records(
     sdk: Any = None,
     custom_phi_fields: Collection[str] | None = None,
 ) -> list[Any]:
-    """Return non-flattened PHI-masked copies of ``Record`` items when *mask_phi* is True."""
+    """Mask PHI across model, mapping, or sequence *items* under *sdk* governance context."""
     if not mask_phi or not items:
         return list(items)
 
@@ -387,7 +469,11 @@ def mask_cli_records(
                 phi_keys = precomputed
                 active_registry = build_study_sensitivity_registry(phi_keys)
             else:
-                eff_study = study_key or getattr(item, "study_key", None)
+                eff_study = study_key or (
+                    (item.get("study_key") or item.get("studyKey"))
+                    if isinstance(item, Mapping)
+                    else getattr(item, "study_key", None)
+                )
                 phi_keys = set()
                 active_registry = global_sensitivity_registry
                 if isinstance(eff_study, str) and eff_study.strip():
@@ -410,67 +496,37 @@ def mask_cli_records(
     return out
 
 
+def mask_cli_records(
+    items: Sequence[Any],
+    *,
+    study_key: str | None = None,
+    mask_phi: bool = True,
+    sdk: Any = None,
+    custom_phi_fields: Collection[str] | None = None,
+) -> list[Any]:
+    """Return non-flattened PHI-masked copies of ``Record`` items when *mask_phi* is True."""
+    return _mask_cli_items(
+        items,
+        study_key=study_key,
+        mask_phi=mask_phi,
+        sdk=sdk,
+        custom_phi_fields=custom_phi_fields,
+    )
+
+
 def mask_cli_models(
     items: Sequence[Any],
     *,
     study_key: str | None = None,
     mask_phi: bool = True,
+    sdk: Any = None,
+    custom_phi_fields: Collection[str] | None = None,
 ) -> list[Any]:
     """Return PHI-masked copies of model items for terminal rendering when *mask_phi* is True."""
-    if not mask_phi or not items:
-        return list(items)
-
-    pipelines: dict[str, Any] = {}
-    registries: dict[str, SensitivityRegistry] = {}
-    out: list[Any] = []
-
-    for item in items:
-        model_fields = getattr(type(item), "model_fields", None)
-        model_copy = getattr(item, "model_copy", None)
-        if not isinstance(model_fields, Mapping) or not callable(model_copy):
-            out.append(item)
-            continue
-
-        eff_study = study_key or getattr(item, "study_key", None)
-        custom_phi_keys: set[str] = set()
-        active_registry = global_sensitivity_registry
-        if isinstance(eff_study, str) and eff_study.strip():
-            sk = eff_study.strip()
-            if sk not in pipelines:
-                pipelines[sk] = resolve_enrichment_pipeline(sk)
-            pipe = pipelines[sk]
-            if pipe is not None and pipe.phi_keys:
-                custom_phi_keys = set(pipe.phi_keys)
-                if sk not in registries:
-                    registries[sk] = build_study_sensitivity_registry(custom_phi_keys)
-                active_registry = registries[sk]
-
-        updates: dict[str, Any] = {}
-        for fname, finfo in model_fields.items():
-            raw_val = getattr(item, fname, None)
-            if raw_val is None or active_registry.is_exempt(fname):
-                continue
-            if _is_field_phi_sensitive(
-                fname,
-                getattr(finfo, "alias", None),
-                active_registry=active_registry,
-                custom_phi_keys=custom_phi_keys,
-            ):
-                if isinstance(raw_val, str) and raw_val != _MASKED_VALUE:
-                    updates[fname] = _MASKED_VALUE
-            elif fname == "reason_for_change" and isinstance(raw_val, str):
-                scrubbed = sanitize_diagnostic_text(raw_val, registry=active_registry)
-                if scrubbed != raw_val:
-                    updates[fname] = scrubbed
-
-        out.append(
-            _copy_model_with_masked_extra(
-                item,
-                model_copy,
-                updates,
-                active_registry=active_registry,
-                custom_phi_keys=custom_phi_keys,
-            )
-        )
-
-    return out
+    return _mask_cli_items(
+        items,
+        study_key=study_key,
+        mask_phi=mask_phi,
+        sdk=sdk,
+        custom_phi_fields=custom_phi_fields,
+    )

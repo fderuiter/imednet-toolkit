@@ -16,6 +16,7 @@ from imednet.models.sites import (
 )
 from imednet.models.subjects import Subject, SubjectStatus, normalize_subject_status
 from imednet.utils.tabular import (
+    _READ_ONLY_RECORD_COLUMNS,
     _is_dataframe_instance,
     _lookup_form_key_from_id,
     csv_to_records,
@@ -23,6 +24,19 @@ from imednet.utils.tabular import (
     ensure_no_masked_sentinel,
 )
 from imednet.utils.typing import JsonDict
+
+_READ_ONLY_REGISTRATION_DICT_KEYS: frozenset[str] = _READ_ONLY_RECORD_COLUMNS | frozenset(
+    {
+        "subject_status",
+        "subjectStatus",
+        "enrollment_start_date",
+        "enrollmentStartDate",
+        "site_enrollment_status",
+        "siteEnrollmentStatus",
+        "interval_name",
+        "intervalName",
+    }
+)
 
 if TYPE_CHECKING:
     from imednet.validation.cache import ValidationSchemaProtocol
@@ -199,6 +213,16 @@ def normalize_subject_registration_inputs(
             normalized_raw = model_subj
         elif isinstance(raw_subj, Mapping):
             raw_dict = dict(raw_subj)
+            ensure_no_masked_sentinel([raw_dict])
+            for ro_key in _READ_ONLY_REGISTRATION_DICT_KEYS:
+                raw_dict.pop(ro_key, None)
+            if "data" not in raw_dict:
+                if isinstance(raw_dict.get("recordData"), Mapping):
+                    raw_dict["data"] = dict(raw_dict["recordData"])
+                elif isinstance(raw_dict.get("record_data"), Mapping):
+                    raw_dict["data"] = dict(raw_dict["record_data"])
+            raw_dict.pop("recordData", None)
+            raw_dict.pop("record_data", None)
             has_fk = bool(raw_dict.get("formKey") or raw_dict.get("form_key"))
             raw_fid = raw_dict.get("formId")
             if raw_fid is None:

@@ -22,7 +22,6 @@ import imednet.spi.sinks as spi_sinks
 import imednet_sinks.document as doc_mod
 import imednet_sinks.graph as graph_mod
 import imednet_sinks.warehouse as wh_mod
-from apache_airflow_providers_imednet.operators.export import ImednetExportOperator
 from imednet.cli import app as cli_app
 from imednet.datadict import cdisc_builders, to_dataset_json, to_odm_file, to_odm_xml
 from imednet.datadict.cdisc_builders import (
@@ -409,8 +408,10 @@ def test_incremental_only_preserve_record_id_and_explicit_as_sdtm_false(
     assert "IG.VS" in dj_env.clinical_data.item_group_data
 
     # Airflow ImednetExportOperator honors explicit as_sdtm=False when sdtm_domain="AE"
+    import apache_airflow_providers_imednet.operators.export as airflow_export_mod
+
     airflow_csv = tmp_path / "airflow.csv"
-    op = ImednetExportOperator(
+    op = airflow_export_mod.ImednetExportOperator(
         task_id="export_raw_domain",
         study_key="S1",
         destination="csv",
@@ -423,7 +424,8 @@ def test_incremental_only_preserve_record_id_and_explicit_as_sdtm_false(
     fake_hook = MagicMock()
     fake_hook.get_sdk_client.return_value = sdk
     monkeypatch.setattr(
-        "apache_airflow_providers_imednet.operators.export.ImednetHook",
+        airflow_export_mod,
+        "ImednetHook",
         lambda *_a, **_kw: fake_hook,
     )
     op.execute({})

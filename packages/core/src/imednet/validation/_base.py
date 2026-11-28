@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def _extract_form_ref(
-    record: Mapping[str, Any] | BaseRecordRequest | Any,
+    record: BaseRecordRequest | Mapping[str, Any] | Any,
 ) -> tuple[str | None, Any]:
     """Extract (form_key, form_id) from a record payload or BaseRecordRequest without coalescing None to 0."""
     if isinstance(record, Mapping):
@@ -37,7 +37,7 @@ class _ValidatorMixin:
 
     def _resolve_form_key(
         self,
-        record: Mapping[str, Any] | BaseRecordRequest,
+        record: BaseRecordRequest | Mapping[str, Any],
         study_key: str | None = None,
     ) -> str | None:
         """Resolve the form key from a record payload.
