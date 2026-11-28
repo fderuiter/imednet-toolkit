@@ -219,7 +219,6 @@
       </xs:element>
       <xs:element name="Annotation" type="odm:annotationType" minOccurs="0" maxOccurs="unbounded"/>
       <xs:element name="StudyEventData" type="odm:studyEventDataType" minOccurs="0" maxOccurs="unbounded"/>
-      <xs:element name="FormData" type="odm:formDataType" minOccurs="0" maxOccurs="unbounded"/>
     </xs:sequence>
     <xs:attribute name="SubjectKey" type="xs:string" use="required"/>
     <xs:attribute name="TransactionType" type="odm:transactionType" use="optional"/>

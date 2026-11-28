@@ -489,12 +489,13 @@ class AsyncQueryManagementWorkflow(_QueryManagementBase):
                     self._sdk, "get_queries", study_key, **filters, **kwargs
                 )
             )
-        return self._queries_to_odm_annotations(
-            study_key,
-            queries,
-            mask_phi=mask_phi,
-            phi_keys=phi_keys,
-        )
+        with sdk_governance_context(self._sdk):
+            return self._queries_to_odm_annotations(
+                study_key,
+                queries,
+                mask_phi=mask_phi,
+                phi_keys=phi_keys,
+            )
 
 
 class QueryManagementWorkflow(_QueryManagementBase):
@@ -676,23 +677,25 @@ class QueryManagementWorkflow(_QueryManagementBase):
                 include_answered=include_answered,
                 **kwargs,
             )
-            return self._queries_to_odm_annotations(
-                study_key,
-                queries,
-                mask_phi=mask_phi,
-                phi_keys=phi_keys,
+            with sdk_governance_context(self._sdk):
+                return self._queries_to_odm_annotations(
+                    study_key,
+                    queries,
+                    mask_phi=mask_phi,
+                    phi_keys=phi_keys,
+                )
+        with sdk_governance_context(self._sdk):
+            return run_sync_over_async(
+                lambda: self._async_core.extract_odm_annotations(
+                    study_key,
+                    additional_filter=additional_filter,
+                    open_only=open_only,
+                    include_answered=include_answered,
+                    mask_phi=mask_phi,
+                    phi_keys=phi_keys,
+                    **kwargs,
+                )
             )
-        return run_sync_over_async(
-            lambda: self._async_core.extract_odm_annotations(
-                study_key,
-                additional_filter=additional_filter,
-                open_only=open_only,
-                include_answered=include_answered,
-                mask_phi=mask_phi,
-                phi_keys=phi_keys,
-                **kwargs,
-            )
-        )
 
 
 # Integration:

@@ -563,8 +563,16 @@ def _unwrap_scoped_oid(raw_oid: str, f_oid: str, ig_oid: str | None) -> str:
     prefixes: list[str] = []
     if f_oid:
         prefixes.extend([f"IT.{f_oid}.", f"{f_oid}."])
+        for f_lead in ("F.", "F_", "FORM.", "FORM_"):
+            if f_oid.startswith(f_lead) and len(f_oid) > len(f_lead):
+                f_stem = f_oid[len(f_lead) :]
+                prefixes.extend([f"IT.{f_stem}.", f"{f_stem}."])
     if ig_oid:
         prefixes.append(f"{ig_oid}.")
+        for ig_lead in ("IG.", "IG_"):
+            if ig_oid.startswith(ig_lead) and len(ig_oid) > len(ig_lead):
+                ig_stem = ig_oid[len(ig_lead) :]
+                prefixes.extend([f"IT.{ig_stem}.", f"{ig_stem}."])
 
     for prefix in prefixes:
         if raw_oid.startswith(prefix):
@@ -1323,6 +1331,7 @@ def load_from_cdisc_odm(
             sibling_refs=sibling_refs,
             item_def_elems=item_def_elems,
         )
+        raw_item_oid = (_get_attr(it_def, "OID") or it_oid).strip()
 
         method_oid = (_get_attr(item_ref, "MethodOID") or "").strip()
         if method_oid:
@@ -1408,7 +1417,7 @@ def load_from_cdisc_odm(
             imednet_variable_type=imednet_var_type,
         )
 
-        return Variable(
+        built_var = Variable(
             variableName=var_name,
             label=var_label,
             variableType=var_type,
@@ -1420,8 +1429,12 @@ def load_from_cdisc_odm(
             choices=var_choices,
             extraAttributes=it_extra,
         )
+        if raw_item_oid:
+            raw_oid_by_var_id[id(built_var)] = raw_item_oid
+        return built_var
 
     # 5. Parse Forms and nested ItemGroups/Items
+    raw_oid_by_var_id: dict[int, str] = {}
     forms: list[Form] = []
     forms_by_oid: dict[str, Form] = {}
 
@@ -1489,6 +1502,9 @@ def load_from_cdisc_odm(
                 )
                 continue
 
+            if ig_oid and ig_oid != f"IG_{f_oid}" and "itemGroupOID" not in f_extra:
+                f_extra["itemGroupOID"] = ig_oid
+
             ig_extra = _extract_unmapped_attributes(
                 ig_def,
                 KNOWN_ITEM_GROUP_ATTRIBUTES,
@@ -1554,6 +1570,18 @@ def load_from_cdisc_odm(
         forms.append(form)
         if f_oid:
             forms_by_oid[f_oid] = form
+
+    if forms and raw_oid_by_var_id:
+        from ..emit import _allocate_item_oids
+
+        sorted_loaded_forms = sorted(forms, key=lambda f: f.formKey or "")
+        sorted_vars_by_f, default_oid_by_occ, _ = _allocate_item_oids(sorted_loaded_forms)
+        for f_idx, loaded_vars in enumerate(sorted_vars_by_f):
+            for v_idx, loaded_var in enumerate(loaded_vars):
+                raw_oid_val = raw_oid_by_var_id.get(id(loaded_var))
+                default_oid_val = default_oid_by_occ.get((f_idx, v_idx))
+                if raw_oid_val and raw_oid_val != default_oid_val:
+                    loaded_var.extraAttributes.setdefault("itemOID", raw_oid_val)
 
     standalone_role_cls: list[dict[str, Any]] = []
     for rcl_oid in referenced_role_codelists:

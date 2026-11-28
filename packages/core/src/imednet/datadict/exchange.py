@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import ItemsView, Iterator, KeysView, ValuesView
 from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
@@ -9,7 +10,19 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from .models import DataDictionary
 
 DatasetJsonScalar = str | int | float | bool | None
-DatasetJsonItemType = Literal["string", "integer", "float", "double", "decimal", "boolean"]
+DatasetJsonItemType = Literal[
+    "string",
+    "integer",
+    "float",
+    "double",
+    "decimal",
+    "boolean",
+    "date",
+    "time",
+    "datetime",
+    "URI",
+]
+DatasetJsonTargetDataType = Literal["integer", "decimal"]
 
 
 class _FrozenExchangeModel(BaseModel):
@@ -227,80 +240,88 @@ class OdmArchive(_FrozenExchangeModel):
     validation_warnings: tuple[str, ...] = Field(default=(), alias="validationWarnings")
 
 
-class DatasetJsonItem(_FrozenExchangeModel):
-    """CDISC Dataset-JSON v1.1 column definition inside ``itemGroupData``."""
+class DatasetJsonSourceSystem(_FrozenExchangeModel):
+    """CDISC Dataset-JSON v1.1 ``sourceSystem`` metadata descriptor."""
 
-    oid: str = Field(
-        alias="OID",
-        validation_alias=AliasChoices("OID", "oid", "itemOID"),
-        serialization_alias="OID",
+    name: str
+    version: str
+
+
+class DatasetJsonColumn(_FrozenExchangeModel):
+    """CDISC Dataset-JSON v1.1 column definition inside top-level ``columns``."""
+
+    item_oid: str = Field(
+        alias="itemOID",
+        validation_alias=AliasChoices("itemOID", "item_oid", "OID", "oid"),
+        serialization_alias="itemOID",
     )
     name: str
     label: str
-    type: DatasetJsonItemType = Field(
-        alias="type",
-        validation_alias=AliasChoices("type", "dataType"),
-        serialization_alias="type",
+    data_type: DatasetJsonItemType = Field(
+        alias="dataType",
+        validation_alias=AliasChoices("dataType", "data_type", "type"),
+        serialization_alias="dataType",
     )
-    length: int | None = None
+    target_data_type: DatasetJsonTargetDataType | None = Field(default=None, alias="targetDataType")
+    length: int | None = Field(default=None, ge=1)
     display_format: str | None = Field(default=None, alias="displayFormat")
-    key_sequence: int | None = Field(default=None, alias="keySequence")
+    key_sequence: int | None = Field(default=None, alias="keySequence", ge=1)
+
+    @property
+    def oid(self) -> str:
+        """Return ``item_oid`` for ergonomic Python inspection."""
+        return self.item_oid
+
+    @property
+    def type(self) -> DatasetJsonItemType:
+        """Return ``data_type`` for ergonomic Python inspection."""
+        return self.data_type
 
 
-class DatasetJsonItemGroup(_FrozenExchangeModel):
-    """CDISC Dataset-JSON v1.1 dataset container inside ``itemGroupData``."""
-
-    records: int
-    name: str
-    label: str
-    items: tuple[DatasetJsonItem, ...] = ()
-    item_data: tuple[tuple[DatasetJsonScalar, ...], ...] = Field(default=(), alias="itemData")
-
-    @model_validator(mode="after")
-    def _validate_records_and_arity(self) -> DatasetJsonItemGroup:  # noqa: N804
-        if self.records != len(self.item_data):
-            raise ValueError(
-                f"Dataset-JSON itemGroup '{self.name}' records ({self.records}) "
-                f"does not match itemData length ({len(self.item_data)})"
-            )
-        expected_cols = len(self.items)
-        for row_idx, row in enumerate(self.item_data):
-            if len(row) != expected_cols:
-                raise ValueError(
-                    f"Dataset-JSON itemGroup '{self.name}' row {row_idx} length ({len(row)}) "
-                    f"does not match items count ({expected_cols})"
-                )
-        return self
-
-
-class DatasetJsonClinicalData(_FrozenExchangeModel):
-    """CDISC Dataset-JSON v1.1 ``clinicalData`` / ``referenceData`` payload."""
-
-    study_oid: str = Field(alias="studyOID")
-    metadata_version_oid: str = Field(alias="metaDataVersionOID")
-    metadata_ref: str | None = Field(default=None, alias="metaDataRef")
-    item_group_data: dict[str, DatasetJsonItemGroup] = Field(
-        default_factory=dict, alias="itemGroupData"
-    )
+DatasetJsonItem = DatasetJsonColumn
 
 
 class DatasetJsonEnvelope(_FrozenExchangeModel):
-    """Canonical read-only CDISC Dataset-JSON v1.1 exchange envelope."""
+    """Canonical read-only flat CDISC Dataset-JSON v1.1 single-dataset envelope."""
 
-    creation_datetime: str = Field(alias="creationDateTime")
-    dataset_json_version: str = Field(default="1.1.0", alias="datasetJSONVersion")
+    dataset_json_creation_datetime: str = Field(
+        alias="datasetJSONCreationDateTime",
+        serialization_alias="datasetJSONCreationDateTime",
+    )
+    dataset_json_version: Literal["1.1.0"] = Field(
+        default="1.1.0",
+        alias="datasetJSONVersion",
+        serialization_alias="datasetJSONVersion",
+    )
     file_oid: str | None = Field(default=None, alias="fileOID")
-    as_of_datetime: str | None = Field(default=None, alias="asOfDateTime")
+    db_last_modified_datetime: str | None = Field(default=None, alias="dbLastModifiedDateTime")
     originator: str | None = None
-    source_system: str | None = Field(default=None, alias="sourceSystem")
-    source_system_version: str | None = Field(default=None, alias="sourceSystemVersion")
-    clinical_data: DatasetJsonClinicalData | None = Field(default=None, alias="clinicalData")
-    reference_data: DatasetJsonClinicalData | None = Field(default=None, alias="referenceData")
+    source_system: DatasetJsonSourceSystem | None = Field(default=None, alias="sourceSystem")
+    study_oid: str | None = Field(default=None, alias="studyOID")
+    metadata_version_oid: str | None = Field(default=None, alias="metaDataVersionOID")
+    metadata_ref: str | None = Field(default=None, alias="metaDataRef")
+    item_group_oid: str = Field(alias="itemGroupOID")
+    is_reference_data: bool | None = Field(default=None, alias="isReferenceData")
+    records: int = Field(ge=0)
+    name: str
+    label: str
+    columns: tuple[DatasetJsonColumn, ...] = ()
+    rows: tuple[tuple[DatasetJsonScalar, ...], ...] = ()
 
     @model_validator(mode="after")
-    def _validate_payload_presence(self) -> DatasetJsonEnvelope:  # noqa: N804
-        if self.clinical_data is None and self.reference_data is None:
-            raise ValueError("DatasetJsonEnvelope requires either clinicalData or referenceData")
+    def _validate_records_and_arity(self) -> DatasetJsonEnvelope:  # noqa: N804
+        if self.records != len(self.rows):
+            raise ValueError(
+                f"Dataset-JSON dataset '{self.name}' records ({self.records}) "
+                f"does not match rows length ({len(self.rows)})"
+            )
+        expected_cols = len(self.columns)
+        for row_idx, row in enumerate(self.rows):
+            if len(row) != expected_cols:
+                raise ValueError(
+                    f"Dataset-JSON dataset '{self.name}' row {row_idx} length ({len(row)}) "
+                    f"does not match columns count ({expected_cols})"
+                )
         return self
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -308,13 +329,76 @@ class DatasetJsonEnvelope(_FrozenExchangeModel):
         return self.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
+class DatasetJsonBundle(_FrozenExchangeModel):
+    """Typed multi-dataset Python bundle mapping ``itemGroupOID`` keys to v1.1 envelopes."""
+
+    study_oid: str = Field(alias="studyOID")
+    metadata_version_oid: str = Field(default="MDV.001", alias="metaDataVersionOID")
+    dataset_json_creation_datetime: str = Field(alias="datasetJSONCreationDateTime")
+    datasets: dict[str, DatasetJsonEnvelope] = Field(default_factory=dict)
+
+    def _resolve_key(self, key: str) -> str | None:
+        if key in self.datasets:
+            return key
+        prefixed = f"IG.{key}"
+        if prefixed in self.datasets:
+            return prefixed
+        upper_prefixed = f"IG.{key.upper()}"
+        if upper_prefixed in self.datasets:
+            return upper_prefixed
+        for k, env in self.datasets.items():
+            if env.name == key or env.name.upper() == key.upper():
+                return k
+        return None
+
+    def __getitem__(self, key: str) -> DatasetJsonEnvelope:
+        """Look up a dataset envelope by ``itemGroupOID`` (``IG.DM``) or dataset name (``DM``)."""
+        resolved = self._resolve_key(key)
+        if resolved is None:
+            raise KeyError(key)
+        return self.datasets[resolved]
+
+    def get(
+        self, key: str, default: DatasetJsonEnvelope | None = None
+    ) -> DatasetJsonEnvelope | None:
+        """Return dataset envelope for *key* if present, else *default*."""
+        resolved = self._resolve_key(key)
+        return self.datasets[resolved] if resolved is not None else default
+
+    def __contains__(self, key: object) -> bool:
+        """Return True when *key* matches an ``itemGroupOID`` or dataset name in the bundle."""
+        return isinstance(key, str) and self._resolve_key(key) is not None
+
+    def __iter__(self) -> Iterator[str]:  # type: ignore[override]
+        """Iterate over ``itemGroupOID`` keys in deterministic insertion order."""
+        return iter(self.datasets)
+
+    def __len__(self) -> int:
+        """Return the number of dataset envelopes in the bundle."""
+        return len(self.datasets)
+
+    def keys(self) -> KeysView[str]:
+        """Return view of ``itemGroupOID`` keys."""
+        return self.datasets.keys()
+
+    def values(self) -> ValuesView[DatasetJsonEnvelope]:
+        """Return view of :class:`DatasetJsonEnvelope` values."""
+        return self.datasets.values()
+
+    def items(self) -> ItemsView[str, DatasetJsonEnvelope]:
+        """Return view of ``(itemGroupOID, DatasetJsonEnvelope)`` pairs."""
+        return self.datasets.items()
+
+
 __all__ = [
-    "DatasetJsonClinicalData",
+    "DatasetJsonBundle",
+    "DatasetJsonColumn",
     "DatasetJsonEnvelope",
     "DatasetJsonItem",
-    "DatasetJsonItemGroup",
     "DatasetJsonItemType",
     "DatasetJsonScalar",
+    "DatasetJsonSourceSystem",
+    "DatasetJsonTargetDataType",
     "OdmAdminData",
     "OdmAnnotation",
     "OdmArchive",

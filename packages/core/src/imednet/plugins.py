@@ -64,7 +64,13 @@ from typing_extensions import deprecated
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .datadict import DataDictionary, DatasetJsonEnvelope, OdmAnnotation, OdmAuditRecord
+    from .datadict import (
+        DataDictionary,
+        DatasetJsonBundle,
+        DatasetJsonEnvelope,
+        OdmAnnotation,
+        OdmAuditRecord,
+    )
     from .integrations.sink_base import AsyncExportSink, ExportSink
     from .models.forms import Form
     from .models.intervals import Interval
@@ -620,6 +626,28 @@ class RecordMapperProtocol(Protocol):
         """Emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
         ...
 
+    def to_dataset_json_bundle(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | None = None,
+    ) -> DatasetJsonBundle:
+        """Emit a multi-dataset CDISC Dataset-JSON v1.1 bundle for CDASH Forms or SDTM domains."""
+        ...
+
     def sdtm_dataset_json(
         self,
         study_key: str,
@@ -752,6 +780,28 @@ class AsyncRecordMapperProtocol(Protocol):
         records: Iterable[Any] | AsyncIterable[Any] | None = None,
     ) -> DatasetJsonEnvelope:
         """Asynchronously emit a CDISC Dataset-JSON v1.1 envelope for CDASH Forms or SDTM domains."""
+        ...
+
+    async def to_dataset_json_bundle(
+        self,
+        study_key: str,
+        visit_key: str | None = None,
+        use_labels_as_columns: bool = False,
+        variable_whitelist: list[str] | None = None,
+        form_whitelist: list[int] | None = None,
+        *,
+        as_sdtm: bool = False,
+        domain: str | None = None,
+        naming_convention: str | None = None,
+        preserve_record_id: bool = False,
+        mask_phi: bool | None = None,
+        include_deleted: bool | None = None,
+        metadata_version_oid: str = "MDV.001",
+        file_oid: str | None = None,
+        creation_datetime: str | None = None,
+        records: Iterable[Any] | AsyncIterable[Any] | None = None,
+    ) -> DatasetJsonBundle:
+        """Asynchronously emit a multi-dataset CDISC Dataset-JSON v1.1 bundle."""
         ...
 
     async def sdtm_dataset_json(

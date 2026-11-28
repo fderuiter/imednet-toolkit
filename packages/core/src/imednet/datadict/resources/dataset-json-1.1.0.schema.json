@@ -1,136 +1,112 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://www.cdisc.org/schemas/dataset-json/v1.1/dataset.schema.json",
-  "title": "CDISC Dataset-JSON v1.1 Envelope Schema",
+  "$id": "https://www.cdisc.org/ns/Dataset-JSON/v1.1/dataset-json-1.1.0.schema.json",
+  "title": "CDISC Dataset-JSON v1.1.0 Dataset Schema",
+  "description": "Bundled offline CDISC Dataset-JSON v1.1.0 flat single-dataset schema for CDASH Form and SDTM domain exchange.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "creationDateTime",
-    "datasetJSONVersion"
-  ],
-  "anyOf": [
-    {
-      "required": ["clinicalData"]
-    },
-    {
-      "required": ["referenceData"]
-    }
+    "datasetJSONCreationDateTime",
+    "datasetJSONVersion",
+    "itemGroupOID",
+    "records",
+    "name",
+    "label",
+    "columns",
+    "rows"
   ],
   "properties": {
-    "creationDateTime": {
+    "datasetJSONCreationDateTime": {
       "type": "string",
-      "minLength": 10
+      "minLength": 1,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
     },
     "datasetJSONVersion": {
       "type": "string",
-      "pattern": "^1\\.1(\\.0)?$"
+      "const": "1.1.0"
     },
     "fileOID": {
       "type": "string",
       "minLength": 1
     },
-    "asOfDateTime": {
+    "dbLastModifiedDateTime": {
       "type": "string",
-      "minLength": 10
+      "minLength": 1,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
     },
     "originator": {
       "type": "string"
     },
     "sourceSystem": {
+      "$ref": "#/$defs/SourceSystem"
+    },
+    "studyOID": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metaDataVersionOID": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metaDataRef": {
       "type": "string"
     },
-    "sourceSystemVersion": {
+    "itemGroupOID": {
+      "type": "string",
+      "minLength": 1
+    },
+    "isReferenceData": {
+      "type": "boolean"
+    },
+    "records": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "label": {
       "type": "string"
     },
-    "clinicalData": {
-      "$ref": "#/$defs/dataContainer"
+    "columns": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Column"
+      }
     },
-    "referenceData": {
-      "$ref": "#/$defs/dataContainer"
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": ["string", "number", "integer", "boolean", "null"]
+        }
+      }
     }
   },
   "$defs": {
-    "dataContainer": {
+    "SourceSystem": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "studyOID",
-        "metaDataVersionOID",
-        "itemGroupData"
-      ],
+      "required": ["name", "version"],
       "properties": {
-        "studyOID": {
-          "type": "string",
-          "minLength": 1
-        },
-        "metaDataVersionOID": {
-          "type": "string",
-          "minLength": 1
-        },
-        "metaDataRef": {
-          "type": "string"
-        },
-        "itemGroupData": {
-          "type": "object",
-          "additionalProperties": false,
-          "patternProperties": {
-            "^[A-Za-z0-9_.-]+$": {
-              "$ref": "#/$defs/itemGroupDataset"
-            }
-          }
-        }
-      }
-    },
-    "itemGroupDataset": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "records",
-        "name",
-        "label",
-        "items",
-        "itemData"
-      ],
-      "properties": {
-        "records": {
-          "type": "integer",
-          "minimum": 0
-        },
         "name": {
           "type": "string",
           "minLength": 1
         },
-        "label": {
-          "type": "string"
-        },
-        "items": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/itemDefinition"
-          }
-        },
-        "itemData": {
-          "type": "array",
-          "items": {
-            "type": "array",
-            "items": {
-              "type": ["string", "integer", "number", "boolean", "null"]
-            }
-          }
+        "version": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
-    "itemDefinition": {
+    "Column": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "OID",
-        "name",
-        "label",
-        "type"
-      ],
+      "required": ["itemOID", "name", "label", "dataType"],
       "properties": {
-        "OID": {
+        "itemOID": {
           "type": "string",
           "minLength": 1
         },
@@ -141,7 +117,7 @@
         "label": {
           "type": "string"
         },
-        "type": {
+        "dataType": {
           "type": "string",
           "enum": [
             "string",
@@ -149,8 +125,16 @@
             "float",
             "double",
             "decimal",
-            "boolean"
+            "boolean",
+            "date",
+            "time",
+            "datetime",
+            "URI"
           ]
+        },
+        "targetDataType": {
+          "type": "string",
+          "enum": ["integer", "decimal"]
         },
         "length": {
           "type": "integer",
