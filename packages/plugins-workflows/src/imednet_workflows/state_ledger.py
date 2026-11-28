@@ -899,6 +899,7 @@ class FileStateProvider(BaseStateProvider):
                     "new_timestamp": None,
                     "records_processed": 0,
                     "metadata": copy.deepcopy(prior_meta),
+                    "_lineage_hydrated": True,
                 }
 
             if stale_failures:

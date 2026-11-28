@@ -3843,6 +3843,8 @@ class _TabularTransformSink(ExportSink):
         self._domain_seq_counters: dict[str, dict[str, int]] = {}
         self._seq_counters: dict[str, int] = {}
         self._record_seqs: dict[str, int] = {}
+        self._sdtm_lineage_session: dict[tuple[str, str, int], Any] = {}
+        self._synced_sdtm_session_id: int | None = None
         self._form_domain_map: dict[Any, str] = dict(form_domain_map) if form_domain_map else {}
         self._meta_cols = {name for name, _ in _RECORD_META_CONTRACT_TYPES}
 
@@ -3890,6 +3892,7 @@ class _TabularTransformSink(ExportSink):
             "_active_form_domain_map",
             "_sdtm_lineage",
             "_sdtm_seq_watermarks",
+            "_sdtm_lineage_session",
         ):
             if hasattr(self, attr):
                 with contextlib.suppress(Exception):
@@ -3925,10 +3928,27 @@ class _TabularTransformSink(ExportSink):
                 else records
             )
             rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
-            for dom_code, subj_map in rehydrated_counters.items():
-                local_map = self._domain_seq_counters.setdefault(dom_code, {})
-                for subj_key, wm_val in subj_map.items():
-                    local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
+            session_id = id(rehydrated_counters)
+            is_new_session = self._synced_sdtm_session_id != session_id
+            has_active_tx = isinstance(getattr(self, "_active_tx", None), dict)
+            if is_new_session:
+                if self._domain_seq_counters:
+                    for dom_code, subj_map in self._domain_seq_counters.items():
+                        live_map = rehydrated_counters.setdefault(dom_code, {})
+                        for subj_key, wm_val in subj_map.items():
+                            live_map[subj_key] = max(live_map.get(subj_key, 0), wm_val)
+                if self._cfg.sdtm_domain:
+                    explicit_dom = resolve_sdtm_domain(self._cfg.sdtm_domain, fallback="AE")
+                    if explicit_dom != "DM":
+                        dom_live = rehydrated_counters.setdefault(explicit_dom, {})
+                        if dom_live is not self._seq_counters:
+                            for subj_key, wm_val in dom_live.items():
+                                self._seq_counters[subj_key] = max(
+                                    self._seq_counters.get(subj_key, 0),
+                                    wm_val,
+                                )
+                            rehydrated_counters[explicit_dom] = self._seq_counters
+                self._synced_sdtm_session_id = session_id
 
             grouped_by_domain: dict[str, list[Any]] = {}
             for rec in batch_records:
@@ -3936,16 +3956,20 @@ class _TabularTransformSink(ExportSink):
                 grouped_by_domain.setdefault(dom, []).append(rec)
 
             single_explicit_domain = bool(self._cfg.sdtm_domain) or (
-                len(grouped_by_domain) == 1
-                and len(self._domain_seq_counters) <= 1
-                and not rehydrated_counters
+                len(grouped_by_domain) == 1 and len(rehydrated_counters) <= 1
             )
             preserve_rec_id = should_preserve_sdtm_record_id(self._cfg)
             domain_frames: list[pd.DataFrame] = []
             lineage_out: dict[str, dict[str, Any]] = {}
             for dom, dom_records in grouped_by_domain.items():
-                dom_counters = self._domain_seq_counters.setdefault(dom, {})
-                if single_explicit_domain and self._seq_counters and dom != "DM":
+                dom_counters = rehydrated_counters.setdefault(dom, {})
+                if (
+                    is_new_session
+                    and single_explicit_domain
+                    and self._seq_counters
+                    and dom != "DM"
+                    and dom_counters is not self._seq_counters
+                ):
                     for subj_key, wm_val in self._seq_counters.items():
                         dom_counters[subj_key] = max(dom_counters.get(subj_key, 0), wm_val)
                 dom_df = transform_records_to_sdtm(
@@ -3962,12 +3986,21 @@ class _TabularTransformSink(ExportSink):
                     seq_overrides=seq_overrides,
                     lineage_out=lineage_out,
                 )
-                if (self._cfg.sdtm_domain or len(self._domain_seq_counters) == 1) and dom != "DM":
-                    for subj_key, wm_val in dom_counters.items():
-                        self._seq_counters[subj_key] = max(
-                            self._seq_counters.get(subj_key, 0),
-                            wm_val,
-                        )
+                if not dom_df.empty and "USUBJID" in dom_df.columns and dom != "DM":
+                    batch_subjects = [str(s) for s in dom_df["USUBJID"].unique() if s is not None]
+                    if (
+                        self._cfg.sdtm_domain or len(rehydrated_counters) == 1
+                    ) and dom_counters is not self._seq_counters:
+                        for subj_key in batch_subjects:
+                            wm_val = dom_counters.get(subj_key, 0)
+                            if wm_val > self._seq_counters.get(subj_key, 0):
+                                self._seq_counters[subj_key] = wm_val
+                    if not has_active_tx:
+                        local_dom_map = self._domain_seq_counters.setdefault(dom, {})
+                        for subj_key in batch_subjects:
+                            wm_val = dom_counters.get(subj_key, 0)
+                            if wm_val > local_dom_map.get(subj_key, 0):
+                                local_dom_map[subj_key] = wm_val
                 if not dom_df.empty:
                     domain_frames.append(dom_df)
 
@@ -6095,6 +6128,8 @@ class _FormExportContext:
     _active_form_domain_map: dict[Any, str] = field(default_factory=dict)
     _sdtm_lineage: dict[str, dict[str, Any]] = field(default_factory=dict)
     _sdtm_seq_watermarks: dict[str, int] = field(default_factory=dict)
+    _sdtm_lineage_session: dict[tuple[str, str, int], Any] = field(default_factory=dict)
+    _synced_sdtm_session_id: int | None = None
 
 
 def _build_form_export_contexts(
@@ -6227,258 +6262,301 @@ def _stream_records_across_forms(
             else get_state_provider(ledger_path=opts["ledger_path"])
         )
 
-    with contextlib.ExitStack() as tx_stack:
-        batch_tx_fn = getattr(provider, "batch_transaction", None) if provider is not None else None
-        inst_dict = getattr(provider, "__dict__", {}) if provider is not None else {}
-        has_custom_instance_tx = "transaction" in inst_dict and "batch_transaction" not in inst_dict
-        if provider is not None and callable(batch_tx_fn) and not has_custom_instance_tx:
-            tx_map = tx_stack.enter_context(
-                batch_tx_fn(
-                    study_key,
-                    [ctx.stream_name for ctx in contexts],
-                    fallback_timestamp=opts["modified_since"],
-                )
+    stream_failed = False
+    try:
+        with contextlib.ExitStack() as tx_stack:
+            batch_tx_fn = (
+                getattr(provider, "batch_transaction", None) if provider is not None else None
             )
-            for ctx in contexts:
-                ctx.tx = tx_map[ctx.stream_name]
-        elif provider is not None:
-            for ctx in contexts:
-                ctx.tx = tx_stack.enter_context(
-                    provider.transaction(
+            inst_dict = getattr(provider, "__dict__", {}) if provider is not None else {}
+            has_custom_instance_tx = (
+                "transaction" in inst_dict and "batch_transaction" not in inst_dict
+            )
+            if provider is not None and callable(batch_tx_fn) and not has_custom_instance_tx:
+                tx_map = tx_stack.enter_context(
+                    batch_tx_fn(
                         study_key,
-                        ctx.stream_name,
+                        [ctx.stream_name for ctx in contexts],
                         fallback_timestamp=opts["modified_since"],
                     )
                 )
+                for ctx in contexts:
+                    ctx.tx = tx_map[ctx.stream_name]
+            elif provider is not None:
+                for ctx in contexts:
+                    ctx.tx = tx_stack.enter_context(
+                        provider.transaction(
+                            study_key,
+                            ctx.stream_name,
+                            fallback_timestamp=opts["modified_since"],
+                        )
+                    )
 
-        for ctx in contexts:
-            if ctx.tx is not None:
-                raw_last = ctx.tx.get("last_timestamp")
-                ctx.watermark = (
-                    normalize_watermark_datetime(raw_last)
-                    if isinstance(raw_last, (datetime, str))
-                    else None
-                ) or opts["modified_since"]
-                raw_meta = ctx.tx.get("metadata")
-                if isinstance(raw_meta, dict):
-                    ctx_meta = raw_meta
+            for ctx in contexts:
+                if ctx.tx is not None:
+                    raw_last = ctx.tx.get("last_timestamp")
+                    ctx.watermark = (
+                        normalize_watermark_datetime(raw_last)
+                        if isinstance(raw_last, (datetime, str))
+                        else None
+                    ) or opts["modified_since"]
+                    raw_meta = ctx.tx.get("metadata")
+                    if isinstance(raw_meta, dict):
+                        ctx_meta = raw_meta
+                    else:
+                        ctx_meta = {}
+                        ctx.tx["metadata"] = ctx_meta
+                    if config.as_sdtm:
+                        bind_sdtm_stream_metadata(ctx_meta, ctx.seq_counters, ctx.record_seqs)
+                    if ctx.sink is not None and hasattr(ctx.sink, "bind_stream_metadata"):
+                        ctx.sink.bind_stream_metadata(ctx_meta)
                 else:
-                    ctx_meta = {}
-                    ctx.tx["metadata"] = ctx_meta
-                if config.as_sdtm:
-                    bind_sdtm_stream_metadata(ctx_meta, ctx.seq_counters, ctx.record_seqs)
-                if ctx.sink is not None and hasattr(ctx.sink, "bind_stream_metadata"):
-                    ctx.sink.bind_stream_metadata(ctx_meta)
-            else:
-                ctx.watermark = opts["modified_since"]
+                    ctx.watermark = opts["modified_since"]
 
-            ctx._active_state_provider = provider
-            ctx._active_stream_name = ctx.stream_name
-            ctx._active_study_key = study_key
-            ctx._active_tx = ctx.tx
-            ctx._active_form_domain_map = build_form_sdtm_domain_map(
-                [ctx.form],
-                study_key=study_key,
+                ctx._active_state_provider = provider
+                ctx._active_stream_name = ctx.stream_name
+                ctx._active_study_key = study_key
+                ctx._active_tx = ctx.tx
+                ctx._active_form_domain_map = build_form_sdtm_domain_map(
+                    [ctx.form],
+                    study_key=study_key,
+                )
+                if ctx.sink is not None:
+                    for target_obj in (ctx.sink, getattr(ctx.sink, "_inner", None)):
+                        if target_obj is not None:
+                            with contextlib.suppress(Exception):
+                                target_obj._active_state_provider = provider
+                                target_obj._active_stream_name = ctx.stream_name
+                                target_obj._active_study_key = study_key
+                                target_obj._active_tx = ctx.tx
+                                target_obj._active_form_domain_map = ctx._active_form_domain_map
+
+            if all(ctx.watermark is not None for ctx in contexts):
+                study_watermark: datetime | None = min(
+                    cast(datetime, ctx.watermark) for ctx in contexts
+                )
+            else:
+                study_watermark = None
+
+            any_reconcile_voided = any(
+                (not opts["include_deleted"])
+                and opts["idempotent"]
+                and (use_checkpoint or ctx.watermark is not None)
+                for ctx in contexts
             )
+            exclude_deleted_upstream = (not opts["include_deleted"]) and (not any_reconcile_voided)
+
+            by_form_id = {ctx.form_id: ctx for ctx in contexts}
+            by_form_key = {ctx.form_key: ctx for ctx in contexts}
+
+            def _resolve_ctx(record: Any) -> _FormExportContext | None:
+                fid, fk = extract_record_form_ref(record)
+                if fid is not None and fid in by_form_id:
+                    return by_form_id[fid]
+                if fk is not None and fk in by_form_key:
+                    return by_form_key[fk]
+                return None
+
+            effective_form_whitelist = (
+                [ctx.form_id for ctx in contexts]
+                if (
+                    config.form_whitelist is not None
+                    or (config.as_sdtm and config.sdtm_domain is not None)
+                )
+                else None
+            )
+            merged_filter = _merge_form_whitelist_into_filter(
+                opts["record_filter"], effective_form_whitelist
+            )
+            sdtm_sort = _SDTM_RECORDS_SORT if config.as_sdtm else None
+            raw_records = iter_filtered_sdk_records(
+                sdk,
+                study_key,
+                watermark=study_watermark,
+                record_filter=merged_filter,
+                record_data_filter=opts["record_data_filter"],
+                exclude_deleted_upstream=exclude_deleted_upstream,
+                sort=sdtm_sort,
+            )
+
+            check_standards = (
+                opts["standards_profile"] is not None or opts["min_standards_score"] is not None
+            )
+
+            def _handle_active_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
+                ctx = by_form_key[fk]
+                if check_standards and batch:
+                    _enforce_batch_standards_readiness(
+                        batch,
+                        batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}",
+                        study_key=study_key,
+                        config=config,
+                        standards_profile=opts["standards_profile"],
+                        min_standards_score=opts["min_standards_score"],
+                        sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
+                        form_domain_map=ctx._active_form_domain_map or None,
+                    )
+                written = on_active_batch(ctx, batch, batch_idx)
+                ctx.total_written += written
+                if written > 0:
+                    ctx.wrote_any = True
+
+            def _handle_voided_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
+                if on_voided_batch is None:
+                    return
+                ctx = by_form_key[fk]
+                ctx.total_reconciled += on_voided_batch(ctx, batch, batch_idx)
+
+            router = BoundedFormBufferRouter(
+                [ctx.form_key for ctx in contexts],
+                batch_size=opts["batch_size"],
+                max_buffered_records=opts["max_buffered_records"],
+                on_flush_active=_handle_active_flush,
+                on_flush_voided=_handle_voided_flush if any_reconcile_voided else None,
+            )
+
+            def _pop_form_accepted_candidate(ctx: _FormExportContext, rec: Any) -> None:
+                bucket = ctx.pending_gate.get(id(rec))
+                if bucket:
+                    bucket.pop(0)
+                    if not bucket:
+                        del ctx.pending_gate[id(rec)]
+                    return
+                rec_id = extract_record_id(rec)
+                if rec_id is None:
+                    return
+                for obj_id, candidate_bucket in list(ctx.pending_gate.items()):
+                    for idx, (cand_rec, _) in enumerate(candidate_bucket):
+                        if extract_record_id(cand_rec) == rec_id:
+                            candidate_bucket.pop(idx)
+                            if not candidate_bucket:
+                                del ctx.pending_gate[obj_id]
+                            return
+
+            def _observe_and_route() -> Iterator[Any]:
+                for rec in raw_records:
+                    ctx = _resolve_ctx(rec)
+                    if ctx is None:
+                        continue
+                    rec_ts = extract_record_timestamp(rec)
+                    if ctx.watermark is not None:
+                        if rec_ts is not None:
+                            if rec_ts < ctx.watermark:
+                                continue
+                        elif study_watermark is None or study_watermark < ctx.watermark:
+                            continue
+
+                    if not opts["include_deleted"] and is_record_deleted(rec):
+                        if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
+                            if rec_ts is not None:
+                                ctx.exported_timestamps.append(rec_ts)
+                            router.add_voided(ctx.form_key, rec)
+                        continue
+
+                    ctx.pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
+                    yield rec
+
+            if apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
+                gated_records: Iterable[Any] = apply_quality_gate(
+                    sdk,
+                    study_key,
+                    _observe_and_route(),
+                    config,
+                    variables=all_variables,
+                    forms=[ctx.form for ctx in contexts],
+                )
+            else:
+                gated_records = apply_quality_gate(
+                    sdk,
+                    study_key,
+                    _observe_and_route(),
+                    config,
+                )
+
+            if config.as_sdtm:
+                combined_form_map: dict[Any, str] = {}
+                for ctx in contexts:
+                    combined_form_map.update(ctx._active_form_domain_map)
+                gated_records = iter_subject_ordered_sdtm_records(
+                    gated_records,
+                    study_key=study_key,
+                    sdtm_domain=opts["sdtm_domain"],
+                    form_domain_map=combined_form_map or None,
+                    mask_phi=config.mask_phi,
+                    source_is_ordered=_is_bound_real_records_endpoint(sdk),
+                )
+
+            for rec in gated_records:
+                matched_ctx = _resolve_ctx(rec)
+                if matched_ctx is not None:
+                    _pop_form_accepted_candidate(matched_ctx, rec)
+                    rec_ts = extract_record_timestamp(rec)
+                    if rec_ts is not None:
+                        matched_ctx.exported_timestamps.append(rec_ts)
+                    router.add_active(matched_ctx.form_key, rec)
+            router.flush_all()
+
+            for ctx in contexts:
+                rejected_timestamps = [
+                    rec_ts for bucket in ctx.pending_gate.values() for _, rec_ts in bucket
+                ]
+                ctx.pending_gate.clear()
+                if rejected_timestamps:
+                    if any(rec_ts is None for rec_ts in rejected_timestamps):
+                        ctx.max_ts = None
+                    else:
+                        min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
+                        eligible_ts = [
+                            ts for ts in ctx.exported_timestamps if ts <= min_rejected_ts
+                        ]
+                        ctx.max_ts = max(eligible_ts) if eligible_ts else None
+                elif ctx.exported_timestamps:
+                    ctx.max_ts = max(ctx.exported_timestamps)
+                ctx.exported_timestamps.clear()
+
+            if on_before_checkpoints is not None:
+                on_before_checkpoints()
+
+            for ctx in contexts:
+                if ctx.tx is not None:
+                    ctx.tx["records_processed"] = ctx.total_written + ctx.total_reconciled
+                    if ctx.max_ts is not None:
+                        ctx.tx["new_timestamp"] = ctx.max_ts
+    except BaseException:
+        stream_failed = True
+        raise
+    finally:
+        for ctx in contexts:
+            ctx.tx = None
+            ctx._active_tx = None
+            ctx._active_state_provider = None
+            ctx._active_stream_name = None
+            ctx._active_study_key = None
+            ctx._active_form_domain_map.clear()
+            ctx._synced_sdtm_session_id = None
+            if stream_failed:
+                ctx.seq_counters.clear()
+                ctx.record_seqs.clear()
             if ctx.sink is not None:
                 for target_obj in (ctx.sink, getattr(ctx.sink, "_inner", None)):
                     if target_obj is not None:
-                        with contextlib.suppress(Exception):
-                            target_obj._active_state_provider = provider
-                            target_obj._active_stream_name = ctx.stream_name
-                            target_obj._active_study_key = study_key
-                            target_obj._active_tx = ctx.tx
-                            target_obj._active_form_domain_map = ctx._active_form_domain_map
-
-        if all(ctx.watermark is not None for ctx in contexts):
-            study_watermark: datetime | None = min(
-                cast(datetime, ctx.watermark) for ctx in contexts
-            )
-        else:
-            study_watermark = None
-
-        any_reconcile_voided = any(
-            (not opts["include_deleted"])
-            and opts["idempotent"]
-            and (use_checkpoint or ctx.watermark is not None)
-            for ctx in contexts
-        )
-        exclude_deleted_upstream = (not opts["include_deleted"]) and (not any_reconcile_voided)
-
-        by_form_id = {ctx.form_id: ctx for ctx in contexts}
-        by_form_key = {ctx.form_key: ctx for ctx in contexts}
-
-        def _resolve_ctx(record: Any) -> _FormExportContext | None:
-            fid, fk = extract_record_form_ref(record)
-            if fid is not None and fid in by_form_id:
-                return by_form_id[fid]
-            if fk is not None and fk in by_form_key:
-                return by_form_key[fk]
-            return None
-
-        effective_form_whitelist = (
-            [ctx.form_id for ctx in contexts]
-            if (
-                config.form_whitelist is not None
-                or (config.as_sdtm and config.sdtm_domain is not None)
-            )
-            else None
-        )
-        merged_filter = _merge_form_whitelist_into_filter(
-            opts["record_filter"], effective_form_whitelist
-        )
-        sdtm_sort = _SDTM_RECORDS_SORT if config.as_sdtm else None
-        raw_records = iter_filtered_sdk_records(
-            sdk,
-            study_key,
-            watermark=study_watermark,
-            record_filter=merged_filter,
-            record_data_filter=opts["record_data_filter"],
-            exclude_deleted_upstream=exclude_deleted_upstream,
-            sort=sdtm_sort,
-        )
-
-        check_standards = (
-            opts["standards_profile"] is not None or opts["min_standards_score"] is not None
-        )
-
-        def _handle_active_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
-            ctx = by_form_key[fk]
-            if check_standards and batch:
-                _enforce_batch_standards_readiness(
-                    batch,
-                    batch_id=f"{study_key}/{ctx.form_key}/{batch_idx}",
-                    study_key=study_key,
-                    config=config,
-                    standards_profile=opts["standards_profile"],
-                    min_standards_score=opts["min_standards_score"],
-                    sdtm_domain=ctx.sdtm_domain or opts["sdtm_domain"],
-                    form_domain_map=ctx._active_form_domain_map or None,
-                )
-            written = on_active_batch(ctx, batch, batch_idx)
-            ctx.total_written += written
-            if written > 0:
-                ctx.wrote_any = True
-
-        def _handle_voided_flush(fk: str, batch: list[Any], batch_idx: int) -> None:
-            if on_voided_batch is None:
-                return
-            ctx = by_form_key[fk]
-            ctx.total_reconciled += on_voided_batch(ctx, batch, batch_idx)
-
-        router = BoundedFormBufferRouter(
-            [ctx.form_key for ctx in contexts],
-            batch_size=opts["batch_size"],
-            max_buffered_records=opts["max_buffered_records"],
-            on_flush_active=_handle_active_flush,
-            on_flush_voided=_handle_voided_flush if any_reconcile_voided else None,
-        )
-
-        def _pop_form_accepted_candidate(ctx: _FormExportContext, rec: Any) -> None:
-            bucket = ctx.pending_gate.get(id(rec))
-            if bucket:
-                bucket.pop(0)
-                if not bucket:
-                    del ctx.pending_gate[id(rec)]
-                return
-            rec_id = extract_record_id(rec)
-            if rec_id is None:
-                return
-            for obj_id, candidate_bucket in list(ctx.pending_gate.items()):
-                for idx, (cand_rec, _) in enumerate(candidate_bucket):
-                    if extract_record_id(cand_rec) == rec_id:
-                        candidate_bucket.pop(idx)
-                        if not candidate_bucket:
-                            del ctx.pending_gate[obj_id]
-                        return
-
-        def _observe_and_route() -> Iterator[Any]:
-            for rec in raw_records:
-                ctx = _resolve_ctx(rec)
-                if ctx is None:
-                    continue
-                rec_ts = extract_record_timestamp(rec)
-                if ctx.watermark is not None:
-                    if rec_ts is not None:
-                        if rec_ts < ctx.watermark:
-                            continue
-                    elif study_watermark is None or study_watermark < ctx.watermark:
-                        continue
-
-                if not opts["include_deleted"] and is_record_deleted(rec):
-                    if opts["idempotent"] and (use_checkpoint or ctx.watermark is not None):
-                        if rec_ts is not None:
-                            ctx.exported_timestamps.append(rec_ts)
-                        router.add_voided(ctx.form_key, rec)
-                    continue
-
-                ctx.pending_gate.setdefault(id(rec), []).append((rec, rec_ts))
-                yield rec
-
-        if apply_quality_gate is _DEFAULT_APPLY_QUALITY_GATE:
-            gated_records: Iterable[Any] = apply_quality_gate(
-                sdk,
-                study_key,
-                _observe_and_route(),
-                config,
-                variables=all_variables,
-                forms=[ctx.form for ctx in contexts],
-            )
-        else:
-            gated_records = apply_quality_gate(
-                sdk,
-                study_key,
-                _observe_and_route(),
-                config,
-            )
-
-        if config.as_sdtm:
-            combined_form_map: dict[Any, str] = {}
-            for ctx in contexts:
-                combined_form_map.update(ctx._active_form_domain_map)
-            gated_records = iter_subject_ordered_sdtm_records(
-                gated_records,
-                study_key=study_key,
-                sdtm_domain=opts["sdtm_domain"],
-                form_domain_map=combined_form_map or None,
-                mask_phi=config.mask_phi,
-                source_is_ordered=_is_bound_real_records_endpoint(sdk),
-            )
-
-        for rec in gated_records:
-            matched_ctx = _resolve_ctx(rec)
-            if matched_ctx is not None:
-                _pop_form_accepted_candidate(matched_ctx, rec)
-                rec_ts = extract_record_timestamp(rec)
-                if rec_ts is not None:
-                    matched_ctx.exported_timestamps.append(rec_ts)
-                router.add_active(matched_ctx.form_key, rec)
-        router.flush_all()
-
-        for ctx in contexts:
-            rejected_timestamps = [
-                rec_ts for bucket in ctx.pending_gate.values() for _, rec_ts in bucket
-            ]
-            ctx.pending_gate.clear()
-            if rejected_timestamps:
-                if any(rec_ts is None for rec_ts in rejected_timestamps):
-                    ctx.max_ts = None
-                else:
-                    min_rejected_ts = min(ts for ts in rejected_timestamps if ts is not None)
-                    eligible_ts = [ts for ts in ctx.exported_timestamps if ts <= min_rejected_ts]
-                    ctx.max_ts = max(eligible_ts) if eligible_ts else None
-            elif ctx.exported_timestamps:
-                ctx.max_ts = max(ctx.exported_timestamps)
-            ctx.exported_timestamps.clear()
-
-        if on_before_checkpoints is not None:
-            on_before_checkpoints()
-
-        for ctx in contexts:
-            if ctx.tx is not None:
-                ctx.tx["records_processed"] = ctx.total_written + ctx.total_reconciled
-                if ctx.max_ts is not None:
-                    ctx.tx["new_timestamp"] = ctx.max_ts
+                        for attr_name in (
+                            "_active_tx",
+                            "_active_state_provider",
+                            "_active_stream_name",
+                            "_active_study_key",
+                            "_active_form_domain_map",
+                        ):
+                            with contextlib.suppress(Exception):
+                                setattr(target_obj, attr_name, None)
+                        if hasattr(target_obj, "_synced_sdtm_session_id"):
+                            with contextlib.suppress(Exception):
+                                target_obj._synced_sdtm_session_id = None
+                        if stream_failed:
+                            for dict_attr in ("_seq_counters", "_record_seqs"):
+                                transient_map = getattr(target_obj, dict_attr, None)
+                                if isinstance(transient_map, dict):
+                                    transient_map.clear()
 
 
 def _make_form_sink_config(

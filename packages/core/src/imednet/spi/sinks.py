@@ -19,6 +19,7 @@ from imednet.integrations.sink_base import (
     AsyncExportSink,
     BoundedFormBufferRouter,
     ExportSink,
+    SdtmLineageSession,
     SinkConfig,
     StateProviderProtocol,
     _redact_uri,
@@ -81,6 +82,7 @@ __all__ = [
     "CentralizedMapper",
     "EnrichmentPipeline",
     "ExportSink",
+    "SdtmLineageSession",
     "SinkConfig",
     "StateProviderProtocol",
     "apply_quality_gate",
@@ -147,11 +149,22 @@ def build_sink_mapper(
     lineage_out: dict[str, dict[str, Any]] | None = None,
     record_seqs: dict[str, int] | None = None,
     preserve_record_id: bool | None = None,
+    lineage_session: SdtmLineageSession | None = None,
 ) -> CentralizedMapper:
     """Create a CentralizedMapper configured with SinkConfig PHI, SDTM, and naming rules."""
     extra = getattr(config, "extra", None)
     extra_dict = extra if isinstance(extra, dict) else {}
     effective_preserve_record_id = should_preserve_sdtm_record_id(config, preserve_record_id)
+    resolved_domain_counters = (
+        domain_seq_counters
+        if domain_seq_counters is not None
+        else (lineage_session.domain_seq_counters if lineage_session is not None else None)
+    )
+    resolved_seq_overrides = (
+        seq_overrides
+        if seq_overrides is not None
+        else (lineage_session.seq_overrides if lineage_session is not None else None)
+    )
     mapper = CentralizedMapper(
         mode=mode,
         post_processor=post_processor,
@@ -161,9 +174,9 @@ def build_sink_mapper(
         as_sdtm=resolve_effective_as_sdtm(config),
         sdtm_domain=getattr(config, "sdtm_domain", None),
         seq_counters=seq_counters,
-        domain_seq_counters=domain_seq_counters,
+        domain_seq_counters=resolved_domain_counters,
         form_domain_map=form_domain_map,
-        seq_overrides=seq_overrides,
+        seq_overrides=resolved_seq_overrides,
         lineage_out=lineage_out,
         record_seqs=record_seqs,
         preserve_record_id=effective_preserve_record_id,

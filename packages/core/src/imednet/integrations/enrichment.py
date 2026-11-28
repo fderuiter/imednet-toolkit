@@ -598,6 +598,34 @@ class CentralizedMapper:
         """Register an explicit enrichment pipeline for *study_key*."""
         self._pipeline_cache[study_key] = pipeline
 
+    def bind_sdtm_lineage(
+        self,
+        *,
+        domain_seq_counters: dict[str, dict[str, int]] | None = None,
+        seq_overrides: Mapping[str, int] | None = None,
+        seq_counters: dict[str, int] | None = None,
+    ) -> None:
+        """Bind live SDTM sequence counters and overrides without rebuilding the mapper."""
+        if (
+            self._domain_seq_counters is domain_seq_counters
+            and self._seq_overrides is seq_overrides
+            and (seq_counters is None or self._seq_counters is seq_counters)
+        ):
+            return
+        if seq_counters is not None:
+            self._explicit_seq_counters = True
+            self._seq_counters = seq_counters
+        if domain_seq_counters is not None:
+            self._domain_seq_counters = domain_seq_counters
+            if self.sdtm_domain is not None and self._explicit_seq_counters:
+                existing = self._domain_seq_counters.get(self.sdtm_domain)
+                if existing and existing is not self._seq_counters:
+                    for subj, seq_val in existing.items():
+                        self._seq_counters[subj] = max(self._seq_counters.get(subj, 0), seq_val)
+                self._domain_seq_counters[self.sdtm_domain] = self._seq_counters
+        if seq_overrides is not None or not self.as_sdtm:
+            self._seq_overrides = seq_overrides
+
     def _resolve_masked_meta_fields(
         self,
         active_pipeline: Any,

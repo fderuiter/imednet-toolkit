@@ -331,6 +331,7 @@ class _MongoDbSinkCoreMixin:
     _lineage_out_ref: dict[str, dict[str, Any]]
     _mapper: CentralizedMapper | None
     _mapper_key: tuple[Any, ...] | None
+    _synced_sdtm_session_id: int | None
 
     def _init_mongo_state(self, config: MongoDbSinkConfig) -> None:
         """Initialize shared MongoDB mapping and SDTM lineage state."""
@@ -347,6 +348,7 @@ class _MongoDbSinkCoreMixin:
         self._lineage_out_ref = {}
         self._mapper = None
         self._mapper_key = None
+        self._synced_sdtm_session_id = None
 
     def bind_stream_metadata(self, metadata: dict[str, Any]) -> None:
         """Hydrate and bind SDTM sequence counters into transactional stream metadata."""
@@ -356,7 +358,8 @@ class _MongoDbSinkCoreMixin:
     def _get_mapper(
         self,
         post_proc: Any,
-        seq_overrides: Mapping[str, int] | None,
+        seq_overrides: dict[str, int] | None,
+        domain_seq_counters: dict[str, dict[str, int]] | None = None,
     ) -> CentralizedMapper:
         """Return a reusable sink-scoped mapper synchronized for the active MongoDB batch."""
         doc_cfg = self.config
@@ -364,10 +367,16 @@ class _MongoDbSinkCoreMixin:
         active_map = getattr(self, "_active_form_domain_map", None)
         if isinstance(active_map, Mapping):
             self._form_domain_map_ref.update(active_map)
-        self._seq_overrides_ref.clear()
-        if seq_overrides:
-            self._seq_overrides_ref.update(seq_overrides)
+        if seq_overrides is not None and self._seq_overrides_ref is not seq_overrides:
+            self._seq_overrides_ref = seq_overrides
         self._lineage_out_ref.clear()
+
+        live_domain_counters = (
+            domain_seq_counters if domain_seq_counters is not None else self._domain_seq_counters
+        )
+        live_seq_counters = (
+            self._seq_counters if (not doc_cfg.as_sdtm or doc_cfg.sdtm_domain is not None) else None
+        )
 
         extra = doc_cfg.extra if isinstance(doc_cfg.extra, dict) else {}
         key = (
@@ -384,34 +393,41 @@ class _MongoDbSinkCoreMixin:
                 doc_cfg,
                 mode="document",
                 post_processor=post_proc,
-                seq_counters=(
-                    self._seq_counters
-                    if (not doc_cfg.as_sdtm or doc_cfg.sdtm_domain is not None)
-                    else None
-                ),
-                domain_seq_counters=self._domain_seq_counters if doc_cfg.as_sdtm else None,
+                seq_counters=live_seq_counters,
+                domain_seq_counters=live_domain_counters if doc_cfg.as_sdtm else None,
                 form_domain_map=self._form_domain_map_ref,
-                seq_overrides=self._seq_overrides_ref if doc_cfg.as_sdtm else None,
+                seq_overrides=seq_overrides if doc_cfg.as_sdtm else None,
                 lineage_out=self._lineage_out_ref if doc_cfg.as_sdtm else None,
                 record_seqs=self._record_seqs,
             )
             self._mapper_key = key
         else:
             self._mapper.post_processor = post_proc
+            if doc_cfg.as_sdtm:
+                self._mapper.bind_sdtm_lineage(
+                    domain_seq_counters=live_domain_counters,
+                    seq_overrides=seq_overrides,
+                    seq_counters=live_seq_counters,
+                )
         return self._mapper
 
     def _prepare_batch_mapper(self) -> tuple[CentralizedMapper, dict[str, dict[str, Any]], bool]:
         """Rehydrate SDTM lineage and return ``(mapper, lineage_out, is_incremental)``."""
+        domain_seq_counters: dict[str, dict[str, int]] | None = None
         seq_overrides: dict[str, int] | None = None
         if self.config.as_sdtm:
-            rehydrated_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
-            for dom_code, subj_map in rehydrated_counters.items():
-                local_map = self._domain_seq_counters.setdefault(dom_code, {})
-                for subj_key, wm_val in subj_map.items():
-                    local_map[subj_key] = max(local_map.get(subj_key, 0), wm_val)
+            domain_seq_counters, seq_overrides, _ = rehydrate_sdtm_lineage(self)
+            session_id = id(domain_seq_counters)
+            if self._synced_sdtm_session_id != session_id:
+                if self._domain_seq_counters:
+                    for dom_code, subj_map in self._domain_seq_counters.items():
+                        live_map = domain_seq_counters.setdefault(dom_code, {})
+                        for subj_key, wm_val in subj_map.items():
+                            live_map[subj_key] = max(live_map.get(subj_key, 0), wm_val)
+                self._synced_sdtm_session_id = session_id
 
         post_proc = None if self.config.as_sdtm else _post_process_document
-        mapper = self._get_mapper(post_proc, seq_overrides)
+        mapper = self._get_mapper(post_proc, seq_overrides, domain_seq_counters)
         is_incremental = bool(
             self.config.incremental
             or self.config.modified_since is not None
@@ -454,51 +470,58 @@ class _MongoDbSinkCoreMixin:
     ) -> tuple[dict[str, Any] | None, int, bool]:
         """Build ``(delete_query, expected_count, is_sdtm)`` for voided MongoDB documents."""
         if self.config.as_sdtm:
-            rids = [rid for r in records if (rid := extract_record_id(r)) is not None]
+            keyed_records = [r for r in records if extract_record_id(r) is not None]
+            unkeyed_records = [r for r in records if extract_record_id(r) is None]
+            rids = [rid for r in keyed_records if (rid := extract_record_id(r)) is not None]
             preserve_rid = should_preserve_sdtm_record_id(self.config)
             doc_ids = [_make_document_id(self._study_key, rid) for rid in rids]
             seen_doc_ids = set(doc_ids)
             may_include_dm = self.config.sdtm_domain in (None, "DM")
-            records_for_lineage = (
-                list(records)
-                if (not preserve_rid or may_include_dm)
-                else [r for r in records if extract_record_id(r) is None]
-            )
-            comp_filters: list[dict[str, Any]] = []
-            unkeyed_matched = 0
-            if records_for_lineage:
-                sdtm_entries = resolve_voided_sdtm_keys(
-                    records_for_lineage,
-                    self,
-                    study_key=getattr(self, "_active_study_key", None) or self._study_key,
-                    stream_name=getattr(self, "_active_stream_name", None)
-                    or self.config.stream_name,
-                    sdtm_domain=self.config.sdtm_domain,
-                    form_domain_map=getattr(self, "_active_form_domain_map", None),
+            resolve_kwargs: dict[str, Any] = {
+                "study_key": getattr(self, "_active_study_key", None) or self._study_key,
+                "stream_name": getattr(self, "_active_stream_name", None)
+                or self.config.stream_name,
+                "sdtm_domain": self.config.sdtm_domain,
+                "form_domain_map": getattr(self, "_active_form_domain_map", None),
+            }
+            tagged_entries: list[tuple[dict[str, Any], bool]] = []
+            if keyed_records and (not preserve_rid or may_include_dm):
+                tagged_entries.extend(
+                    (entry, True)
+                    for entry in resolve_voided_sdtm_keys(keyed_records, self, **resolve_kwargs)
                 )
-                for entry in sdtm_entries:
-                    dom_upper = (
-                        str(entry.get("domain") or entry.get("DOMAIN") or "").strip().upper()
-                    )
-                    study_id = str(
-                        entry.get("study_id") or entry.get("STUDYID") or self._study_key
-                    ).strip()
-                    usubjid = str(entry.get("usubjid") or entry.get("USUBJID") or "").strip()
-                    has_rid = entry.get("record_id") is not None
-                    if dom_upper == "DM" and study_id and usubjid:
-                        dm_id = f"{study_id}/DM/{usubjid}"
-                        if dm_id not in seen_doc_ids:
-                            seen_doc_ids.add(dm_id)
-                            doc_ids.append(dm_id)
-                        if preserve_rid and has_rid:
-                            continue
+            if unkeyed_records:
+                tagged_entries.extend(
+                    (entry, False)
+                    for entry in resolve_voided_sdtm_keys(unkeyed_records, self, **resolve_kwargs)
+                )
+            comp_filters: list[dict[str, Any]] = []
+            seen_comp_sigs: set[tuple[Any, ...]] = set()
+            unkeyed_matched = 0
+            for entry, has_rid in tagged_entries:
+                dom_upper = str(entry.get("domain") or entry.get("DOMAIN") or "").strip().upper()
+                study_id = str(
+                    entry.get("study_id") or entry.get("STUDYID") or self._study_key
+                ).strip()
+                usubjid = str(entry.get("usubjid") or entry.get("USUBJID") or "").strip()
+                sig = (study_id, dom_upper, usubjid, entry.get("seq_col"), entry.get("seq_val"))
+                if sig in seen_comp_sigs:
+                    continue
+                seen_comp_sigs.add(sig)
+                if dom_upper == "DM" and study_id and usubjid:
+                    dm_id = f"{study_id}/DM/{usubjid}"
+                    if dm_id not in seen_doc_ids:
+                        seen_doc_ids.add(dm_id)
+                        doc_ids.append(dm_id)
                     if preserve_rid and has_rid:
                         continue
-                    flt = _sdtm_composite_mongo_filter(entry)
-                    if flt is not None:
-                        comp_filters.append(flt)
-                        if not has_rid:
-                            unkeyed_matched += 1
+                if preserve_rid and has_rid:
+                    continue
+                flt = _sdtm_composite_mongo_filter(entry)
+                if flt is not None:
+                    comp_filters.append(flt)
+                    if not has_rid:
+                        unkeyed_matched += 1
             if self.config.sdtm_domain == "DM" and preserve_rid and doc_ids and rids:
                 # Filter out raw STUDY/rid IDs when DM IDs resolved cleanly so doc_ids stays minimal
                 dm_only_ids = [did for did in doc_ids if "/DM/" in did]
